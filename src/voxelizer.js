@@ -500,7 +500,8 @@ fn compute(
 
     // build instanced mesh
     const cube = new THREE.BoxGeometry(this.voxelSize, this.voxelSize, this.voxelSize);
-    const matM = new THREE.MeshStandardMaterial({ vertexColors:true });
+    // const matM = new THREE.MeshStandardMaterial({ vertexColors:true });
+    const matM = new THREE.MeshBasicMaterial({ vertexColors: true });
     const inst = new THREE.InstancedMesh(cube, matM, active);
     const M4   = new THREE.Matrix4();
     for (let i=0; i<active; ++i){

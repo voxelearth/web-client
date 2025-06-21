@@ -1,46 +1,94 @@
-import { Viewer } from './Viewer.js';
-import { UI } from './UI.js';
-import { voxelizeModel } from './voxelize-model.js';
+import { Viewer }          from './Viewer.js';
+import { UI }              from './UI.js';
+import { voxelizeModel }   from './voxelize-model.js';
+import { GUI }             from 'three/addons/libs/lil-gui.module.min.js';
 
-import { load } from '@loaders.gl/core';
-import { Tileset3D } from '@loaders.gl/tiles';
-import { Tiles3DLoader } from '@loaders.gl/3d-tiles';
+import { load }            from '@loaders.gl/core';
+import { Tileset3D }       from '@loaders.gl/tiles';
+import { Tiles3DLoader }   from '@loaders.gl/3d-tiles';
 import { WebMercatorViewport } from '@deck.gl/core';
 
-/* ------------------------------------------------------------------ */
-/* viewer & UI                                                         */
-/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------- */
+/* global UI + lil-gui                                           */
+/* ------------------------------------------------------------- */
 
-const ui = new UI();
+const ui  = new UI();
+const gui = new GUI({ width: 260 });
+
+/* voxel GUI state */
+const voxCtrl = {
+  resolution: 64,   // default; user can change
+  visible:    true
+};
+
+/* build the “Voxels” folder */
+const voxFolder = gui.addFolder('Voxels');
+voxFolder
+  .add(voxCtrl, 'resolution', 4, 512, 1)
+  .name('Voxel Resolution')
+  .onChange(async (val) => {
+    await buildVoxels(val);
+  });
+
+voxFolder
+  .add(voxCtrl, 'visible')
+  .name('Show Voxels')
+  .onChange((flag) => {
+    if (viewer.voxelMesh)       viewer.voxelMesh.visible      = flag;
+    if (viewer.tilesContainer)  viewer.tilesContainer.visible = !flag;
+  });
+voxFolder.open();
+
+/* ------------------------------------------------------------- */
+/* create viewer                                                 */
+/* ------------------------------------------------------------- */
 
 const viewer = new Viewer({
-  /** Runs once the 3-D-Tiles have been normalised, scaled, and added. */
-  onTilesReady: async ({ tilesContainer, renderer, scene }) => {
-    // Derive a voxel resolution – tweak however you like:
-    const resolution = ui.getScreenSpaceError() * 25 || 200;
-
-    ui.log(`Voxelising tiles (resolution ${resolution}) …`);
-    try {
-      const voxeliser = await voxelizeModel({
-        model:    tilesContainer,
-        renderer: renderer,
-        resolution,
-        scene
-      });
-
-      ui.log(
-        `✅ Voxelised — active voxels: ${voxeliser.activeVoxelCount.toLocaleString()}`
-      );
-    } catch (err) {
-      console.error(err);
-      ui.log(`⚠️ Voxelisation failed: ${err}`);
-    }
+  /* fired once the Google-3D-Tiles container is ready */
+  onTilesReady: async ({ tilesContainer }) => {
+    await buildVoxels(voxCtrl.resolution); // first build with slider’s value
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* UI callbacks                                                        */
-/* ------------------------------------------------------------------ */
+/* helper to (re)build voxels at given resolution */
+let voxelising = false;
+async function buildVoxels(res) {
+  if (voxelising || !viewer.tilesContainer) return;
+  voxelising = true;
+  ui.log(`Voxelising at resolution ${res} …`);
+
+  /* remove previous voxel mesh */
+  if (viewer.voxelMesh) {
+    viewer.scene.remove(viewer.voxelMesh);
+    viewer.voxelMesh.geometry.dispose();
+    viewer.voxelMesh.material.dispose();
+    viewer.voxelMesh = null;
+  }
+
+  try {
+    const vox = await voxelizeModel({
+      model:     viewer.tilesContainer,
+      renderer:  viewer.renderer,
+      resolution: res,
+      scene:     viewer.scene
+    });
+
+    viewer.voxelMesh             = vox.voxelMesh;
+    viewer.voxelMesh.visible     = voxCtrl.visible;
+    viewer.tilesContainer.visible = !voxCtrl.visible;
+
+    ui.log(`✅ voxels: ${vox.activeVoxelCount.toLocaleString()}`);
+  } catch (e) {
+    console.error(e);
+    ui.log(`⚠️ Voxelisation error: ${e}`);
+  } finally {
+    voxelising = false;
+  }
+}
+
+/* ------------------------------------------------------------- */
+/* UI callbacks already present                                  */
+/* ------------------------------------------------------------- */
 
 ui.onFetch = async () => {
   ui.clearLog();
@@ -53,7 +101,6 @@ ui.onFetch = async () => {
     console.error(e);
     ui.log(`Failed to fetch 3-D Tiles! Error: ${e}`);
   }
-
   ui.fetchTilesBtn.disabled = false;
 };
 
@@ -61,16 +108,13 @@ ui.onDownload = () => {
   viewer.generateCombineGltf();
 };
 
-ui.onTileSliderChange = (value) => {
-  for (let i = 0; i < viewer.gltfArray.length; i++) {
-    const gltf = viewer.gltfArray[i];
-    gltf.scene.visible = i <= value;
-  }
+ui.onTileSliderChange = (v) => {
+  viewer.gltfArray.forEach((gltf, i) => (gltf.scene.visible = i <= v));
 };
 
-/* ------------------------------------------------------------------ */
-/* 3-D-Tiles fetcher                                                   */
-/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------- */
+/* 3-D-Tiles fetcher                                             */
+/* ------------------------------------------------------------- */
 
 async function fetch3DTiles() {
   ui.setDebugSliderVisibility(false);
@@ -78,95 +122,55 @@ async function fetch3DTiles() {
   const { lat, lng, zoom } = ui.getLatLngZoom();
   const GOOGLE_API_KEY = ui.getGoogleAPIKey();
   const tilesetUrl =
-    'https://tile.googleapis.com/v1/3dtiles/root.json?key=' + GOOGLE_API_KEY;
+    `https://tile.googleapis.com/v1/3dtiles/root.json?key=${GOOGLE_API_KEY}`;
+  const targetSSE = ui.getScreenSpaceError();
 
-  const targetScreenSpaceError = ui.getScreenSpaceError();
+  ui.log(`Fetching tiles at (${lat}, ${lng}, z${zoom}, sse ${targetSSE})`);
 
-  ui.log(
-    `Fetching tiles at (${lat} ${lng}, ${zoom}, sse: ${targetScreenSpaceError})`
-  );
   const viewport = new WebMercatorViewport({
-    width: 230,
-    height: 175, // dimensions from the little map preview
-    latitude: lat,
+    width : 230,
+    height: 175,
+    latitude : lat,
     longitude: lng,
-    zoom: zoom
+    zoom
   });
 
-  const tileset = await load3DTileset(
-    tilesetUrl,
-    viewport,
-    targetScreenSpaceError
-  );
+  const tileset = await load3DTileset(tilesetUrl, viewport, targetSSE);
   const sessionKey = getSessionKey(tileset);
-  let tiles = tileset.tiles;
 
-  // sort tiles to have the most accurate tiles first
-  tiles = tiles.sort(
-    (tileA, tileB) => tileA.header.geometricError - tileB.header.geometricError
+  const tiles = [...tileset.tiles].sort(
+    (a, b) => a.header.geometricError - b.header.geometricError
   );
 
-  const glbUrls = [];
-  for (const tile of tiles) {
-    const errorDiff = Math.abs(
-      targetScreenSpaceError - tile.header.geometricError
-    );
-    if (errorDiff <= targetScreenSpaceError) {
-      const url = `${tile.contentUrl}?key=${GOOGLE_API_KEY}&session=${sessionKey}`;
-      glbUrls.push(url);
-    }
-    if (glbUrls.length > 100) {
-      ui.log('==== Exceeded maximum glTFs! Capping at 100 =====');
-      break;
+  const urls = [];
+  for (const t of tiles) {
+    if (Math.abs(targetSSE - t.header.geometricError) <= targetSSE) {
+      urls.push(`${t.contentUrl}?key=${GOOGLE_API_KEY}&session=${sessionKey}`);
+      if (urls.length >= 100) break;
     }
   }
 
-  if (glbUrls.length === 0) {
-    let firstSSEFound = null;
-    for (const tile of tiles) {
-      if (firstSSEFound == null)
-        firstSSEFound = Math.round(tile.header.geometricError);
-      const errorDiff = Math.abs(
-        targetScreenSpaceError - tile.header.geometricError
-      );
-      if (errorDiff <= firstSSEFound * 2) {
-        const url = `${tile.contentUrl}?key=${GOOGLE_API_KEY}&session=${sessionKey}`;
-        glbUrls.push(url);
-      }
-      if (glbUrls.length > 100) {
-        ui.log('==== Exceeded maximum glTFs! Capping at 100 =====');
-        break;
-      }
-    }
-    ui.log(
-      `==== No tiles found for screen-space error ${targetScreenSpaceError}. ` +
-        `Getting tiles that are within 2× of ${firstSSEFound} ===`
+  if (!urls.length) {
+    ui.log('No tiles matched SSE – fetching a few anyway …');
+    tiles.slice(0, 50).forEach(t =>
+      urls.push(`${t.contentUrl}?key=${GOOGLE_API_KEY}&session=${sessionKey}`)
     );
   }
 
-  viewer.loadGLTFTiles(glbUrls, ui.log);
+  viewer.loadGLTFTiles(urls, ui.log);
   ui.setDebugSliderVisibility(true);
-  ui.updateDebugSliderRange(glbUrls.length);
+  ui.updateDebugSliderRange(urls.length);
 }
 
-async function load3DTileset(tilesetUrl, viewport, screenSpaceError) {
-  const tilesetJson = await load(tilesetUrl, Tiles3DLoader, {
-    '3d-tiles': { loadGLTF: false }
-  });
-  const tileset3d = new Tileset3D(tilesetJson, {
-    throttleRequests: false,
-    maximumScreenSpaceError: screenSpaceError
-  });
+/* util helpers ------------------------------------------------ */
 
-  while (!tileset3d.isLoaded()) {
-    await tileset3d.selectTiles(viewport);
-  }
+async function load3DTileset(url, viewport, sse) {
+  const json   = await load(url, Tiles3DLoader, { '3d-tiles': { loadGLTF:false } });
+  const tiles3d = new Tileset3D(json, { maximumScreenSpaceError: sse, throttleRequests: false });
 
-  return tileset3d;
+  while (!tiles3d.isLoaded()) await tiles3d.selectTiles(viewport);
+  return tiles3d;
 }
-
 function getSessionKey(tileset) {
-  return new URL(`http://website.com?${tileset.queryParams}`).searchParams.get(
-    'session'
-  );
+  return new URL(`https://x?${tileset.queryParams}`).searchParams.get('session');
 }
