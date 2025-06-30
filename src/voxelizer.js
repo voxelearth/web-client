@@ -412,20 +412,16 @@ this._rasterWGSL = rasterWGSL;
 
 
 
-/* ──────────────────────────────── 7) CPU sample → instanced mesh ─────────────────────────────── */
-/* ────────────────────── 7) CPU sample → sparse-octree mesh (fixed) ───────────────────── */
-/* ─────────────────── 7) tiled GPU raster → sparse-octree mesh ─────────────────── */
-/* ───────────── 7) tiled GPU raster → exact-leaf instanced mesh ───────────── */
-/* ───────────── 7) tiled GPU raster → exact-leaf instanced mesh (parallel) ───────────── */
+// Replace the #buildInstancedMesh method with this more efficient approach
+// Replace the #buildInstancedMesh method with this more efficient and scalable approach
 async #buildInstancedMesh() {
-  // 1) Constants
   const MAX_GPU_BYTES   = 256 * 1024 * 1024;
   const BYTES_PER_VOXEL = 8.2;
   const TILE_EDGE       = Math.floor(Math.cbrt(MAX_GPU_BYTES / BYTES_PER_VOXEL));
+  const MAX_VERTICES_PER_MESH = 65536 * 4; // Stay well below array limits
 
-  // 2) Scene / pipeline handles
   const { grid, voxelSize: voxSz, bbox } = this;
-  const { x: NX, y: NY, z: NZ }          = grid;
+  const { x: NX, y: NY, z: NZ } = grid;
   const rend      = this.renderer;
   const clearWGSL = this._clearWGSL;
   const rastWGSL  = this._rasterWGSL;
@@ -433,14 +429,50 @@ async #buildInstancedMesh() {
   const idxBuf    = storage(this.idxBuf, 'u32',  this.idxBuf.count).toReadOnly();
   const { positions:posA, uvs:uvA, indices:idxA, triMats, palette, materials:mats } = this;
 
-  // 3) Scratch vectors for color sampling
+  // Scratch vectors for color sampling
   const v0=new THREE.Vector3(), v1=new THREE.Vector3(), v2=new THREE.Vector3();
   const uv0=new THREE.Vector2(), uv1=new THREE.Vector2(), uv2=new THREE.Vector2();
   const p = new THREE.Vector3(), e0=new THREE.Vector3(), e1=new THREE.Vector3(), ep=new THREE.Vector3();
 
-  // 4) Gather per-tile promises
+  // Face definitions for a cube
+  const faces = [
+    { // +X face
+      dir: [1, 0, 0],
+      vertices: [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]],
+      normal: [1, 0, 0]
+    },
+    { // -X face
+      dir: [-1, 0, 0],
+      vertices: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+      normal: [-1, 0, 0]
+    },
+    { // +Y face
+      dir: [0, 1, 0],
+      vertices: [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]],
+      normal: [0, 1, 0]
+    },
+    { // -Y face
+      dir: [0, -1, 0],
+      vertices: [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+      normal: [0, -1, 0]
+    },
+    { // +Z face
+      dir: [0, 0, 1],
+      vertices: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+      normal: [0, 0, 1]
+    },
+    { // -Z face
+      dir: [0, 0, -1],
+      vertices: [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+      normal: [0, 0, -1]
+    }
+  ];
+
+  // Collect all voxel data first
+  const voxelMap = new Map(); // key: "x,y,z" -> {color: THREE.Color}
   const tileTasks = [];
 
+  // Process tiles in parallel
   for (let oz = 0; oz < NZ; oz += TILE_EDGE) {
     const tz = Math.min(TILE_EDGE, NZ - oz);
     for (let oy = 0; oy < NY; oy += TILE_EDGE) {
@@ -450,23 +482,23 @@ async #buildInstancedMesh() {
         const tileVox  = tx * ty * tz;
         const bitWords = Math.ceil(tileVox / 32);
 
-        // Allocate fresh small buffers for this tile
+        // Allocate buffers
         const bitBuf  = new StorageBufferAttribute(new Uint32Array(bitWords), 1);
-        const triBuf  = new StorageBufferAttribute(new Uint32Array(tileVox),   1);
+        const triBuf  = new StorageBufferAttribute(new Uint32Array(tileVox), 1);
         const distArr = new Uint32Array(tileVox); distArr.fill(0x7f800000);
         const distBuf = new StorageBufferAttribute(distArr, 1);
 
-        // 4a) Enqueue clear compute
+        // Clear
         rend.computeAsync(
           clearWGSL({
             bits : storage(bitBuf, 'atomic<u32>', bitBuf.count),
-            tris : storage(triBuf, 'u32',         triBuf.count),
+            tris : storage(triBuf, 'u32', triBuf.count),
             dists: storage(distBuf,'atomic<u32>', distBuf.count),
             id   : instanceIndex
           }).compute(Math.max(bitWords, tileVox))
         );
 
-        // 4b) Enqueue raster compute
+        // Raster
         const tileMin = new THREE.Vector3(
           bbox.min.x + ox * voxSz,
           bbox.min.y + oy * voxSz,
@@ -478,7 +510,7 @@ async #buildInstancedMesh() {
             pos  : posBuf,
             ind  : idxBuf,
             bits : storage(bitBuf, 'atomic<u32>', bitBuf.count),
-            tris : storage(triBuf, 'u32',         triBuf.count),
+            tris : storage(triBuf, 'u32', triBuf.count),
             dists: storage(distBuf,'atomic<u32>', distBuf.count),
             gDim : uniform(gDim),
             bMin : uniform(tileMin),
@@ -487,17 +519,16 @@ async #buildInstancedMesh() {
           }).compute(this.indices.length / 3)
         );
 
-        // 4c) After raster, read back both buffers
+        // Read back and process
         const tileTask = rasterPromise.then(() => Promise.all([
           rend.getArrayBufferAsync(bitBuf),
           rend.getArrayBufferAsync(triBuf)
         ])).then(([bitsBuffer, trisBuffer]) => {
-          // Process this tile entirely on the CPU
           const bitsCPU = new Uint32Array(bitsBuffer);
           const trisCPU = new Uint32Array(trisBuffer);
           let flat = 0;
 
-          const localResults = { centers: [], rgba: [] };
+          const localVoxels = [];
 
           for (let wi = 0; wi < bitsCPU.length; ++wi) {
             let word = bitsCPU[wi];
@@ -510,19 +541,18 @@ async #buildInstancedMesh() {
               if (!raw) continue;
               const tId = raw - 1;
 
-              // local→global coords
+              // Convert to global coordinates
               const lz = (flat / (tx * ty)) | 0;
-              const rem=  flat % (tx * ty);
+              const rem = flat % (tx * ty);
               const ly = (rem / tx) | 0;
-              const lx =  rem % tx;
+              const lx = rem % tx;
               const gx = ox + lx, gy = oy + ly, gz = oz + lz;
 
-              // voxel center
+              // Sample color
               const cx = bbox.min.x + (gx + 0.5) * voxSz;
               const cy = bbox.min.y + (gy + 0.5) * voxSz;
               const cz = bbox.min.z + (gz + 0.5) * voxSz;
 
-              // sample color (same code as before)…
               v0.fromArray(posA, idxA[tId*3+0]*3);
               v1.fromArray(posA, idxA[tId*3+1]*3);
               v2.fromArray(posA, idxA[tId*3+2]*3);
@@ -572,6 +602,7 @@ async #buildInstancedMesh() {
               }
               if (alpha < 0.5) continue;
 
+              // Find nearest palette color
               let best=0, bestD=Infinity;
               for (let c=0; c<this.paletteSize; ++c) {
                 const dr = col.r - palette[c*3],
@@ -581,16 +612,16 @@ async #buildInstancedMesh() {
                 if (d < bestD) { bestD = d; best = c; }
               }
 
-              localResults.centers.push(cx, cy, cz);
-              localResults.rgba   .push(
-                palette[best*3],
-                palette[best*3+1],
-                palette[best*3+2]
-              );
+              localVoxels.push({
+                x: gx, y: gy, z: gz,
+                r: palette[best*3],
+                g: palette[best*3+1], 
+                b: palette[best*3+2]
+              });
             }
           }
 
-          return localResults;
+          return localVoxels;
         });
 
         tileTasks.push(tileTask);
@@ -598,13 +629,17 @@ async #buildInstancedMesh() {
     }
   }
 
-  // 5) Await *all* tiles in parallel
-  const results = await Promise.all(tileTasks);
+  // Wait for all tiles and collect voxels
+  const allVoxelArrays = await Promise.all(tileTasks);
+  
+  // Build voxel map for fast neighbor lookup
+  for (const voxelArray of allVoxelArrays) {
+    for (const voxel of voxelArray) {
+      voxelMap.set(`${voxel.x},${voxel.y},${voxel.z}`, voxel);
+    }
+  }
 
-  // 6) Flatten into typed arrays
-  let total = 0;
-  for (const r of results) total += r.centers.length / 3;
-  if (total === 0) {
+  if (voxelMap.size === 0) {
     this.voxelMesh = new THREE.Mesh(
       new THREE.BufferGeometry(),
       new THREE.MeshBasicMaterial()
@@ -612,39 +647,155 @@ async #buildInstancedMesh() {
     return;
   }
 
-  const centersA = new Float32Array(total * 3),
-        colorsA  = new Float32Array(total * 3);
+  // Helper function to check if a voxel exists at given position
+  const hasVoxel = (x, y, z) => {
+    // Boundary check to avoid out-of-bounds lookups
+    if (x < 0 || x >= NX || y < 0 || y >= NY || z < 0 || z >= NZ) return false;
+    return voxelMap.has(`${x},${y},${z}`);
+  };
 
-  let offC = 0, offR = 0;
-  for (const r of results) {
-    centersA.set(r.centers, offC);
-    colorsA .set(r.rgba,    offR);
-    offC += r.centers.length;
-    offR += r.rgba   .length;
+  // Pre-count visible faces for memory allocation
+  let totalFaces = 0;
+  for (const [key, voxel] of voxelMap) {
+    for (const face of faces) {
+      const nx = voxel.x + face.dir[0];
+      const ny = voxel.y + face.dir[1];
+      const nz = voxel.z + face.dir[2];
+      if (!hasVoxel(nx, ny, nz)) {
+        totalFaces++;
+      }
+    }
   }
 
-  // 7) Build instanced mesh
-  const geo  = new THREE.BoxGeometry(voxSz, voxSz, voxSz),
-        matM = new THREE.MeshBasicMaterial({ vertexColors: true }),
-        inst = new THREE.InstancedMesh(geo, matM, total),
-        M4   = new THREE.Matrix4();
+  const verticesPerFace = 4;
+  const indicesPerFace = 6;
+  const totalVertices = totalFaces * verticesPerFace;
+  const totalIndices = totalFaces * indicesPerFace;
 
-  for (let i = 0; i < total; ++i) {
-    M4.makeTranslation(
-      centersA[i*3+0],
-      centersA[i*3+1],
-      centersA[i*3+2]
-    );
-    inst.setMatrixAt(i, M4);
+  console.log(`Building mesh with ${totalFaces} faces, ${totalVertices} vertices`);
+
+  // Check if we need to split into multiple meshes
+  const meshes = [];
+  
+  if (totalVertices > MAX_VERTICES_PER_MESH) {
+    // Split voxels into chunks
+    const voxelEntries = Array.from(voxelMap.entries());
+    const chunksNeeded = Math.ceil(totalVertices / MAX_VERTICES_PER_MESH);
+    const voxelsPerChunk = Math.ceil(voxelEntries.length / chunksNeeded);
+    
+    for (let chunk = 0; chunk < chunksNeeded; chunk++) {
+      const start = chunk * voxelsPerChunk;
+      const end = Math.min(start + voxelsPerChunk, voxelEntries.length);
+      const chunkVoxels = new Map(voxelEntries.slice(start, end));
+      
+      const mesh = this.#buildMeshFromVoxels(chunkVoxels, voxelMap, hasVoxel, faces, voxSz, bbox);
+      if (mesh) meshes.push(mesh);
+    }
+    
+    // Create a group to hold all meshes
+    const group = new THREE.Group();
+    meshes.forEach(mesh => group.add(mesh));
+    this.voxelMesh = group;
+  } else {
+    // Build single mesh
+    const mesh = this.#buildMeshFromVoxels(voxelMap, voxelMap, hasVoxel, faces, voxSz, bbox);
+    this.voxelMesh = mesh;
   }
-  inst.instanceMatrix.needsUpdate = true;
-  inst.instanceColor = new THREE.InstancedBufferAttribute(colorsA, 3);
-  inst.instanceColor.needsUpdate  = true;
-  inst.frustumCulled = false;
-
-  this.voxelMesh = inst;
 }
 
+// Helper method to build a mesh from a subset of voxels
+#buildMeshFromVoxels(voxelSubset, fullVoxelMap, hasVoxel, faces, voxSz, bbox) {
+  // Pre-count faces for this subset
+  let faceCount = 0;
+  for (const [key, voxel] of voxelSubset) {
+    for (const face of faces) {
+      const nx = voxel.x + face.dir[0];
+      const ny = voxel.y + face.dir[1];
+      const nz = voxel.z + face.dir[2];
+      if (!hasVoxel(nx, ny, nz)) {
+        faceCount++;
+      }
+    }
+  }
+
+  if (faceCount === 0) return null;
+
+  // Pre-allocate typed arrays
+  const vertices = new Float32Array(faceCount * 4 * 3); // 4 vertices per face, 3 coords each
+  const colors = new Float32Array(faceCount * 4 * 3);   // 4 vertices per face, 3 color components
+  const normals = new Float32Array(faceCount * 4 * 3);  // 4 vertices per face, 3 normal components
+  const indices = new Uint32Array(faceCount * 6);       // 6 indices per face (2 triangles)
+
+  let vertexOffset = 0;
+  let indexOffset = 0;
+  let vertexIndex = 0;
+
+  // Build geometry with face culling
+  for (const [key, voxel] of voxelSubset) {
+    const baseX = bbox.min.x + voxel.x * voxSz;
+    const baseY = bbox.min.y + voxel.y * voxSz;
+    const baseZ = bbox.min.z + voxel.z * voxSz;
+
+    // Check each face
+    for (const face of faces) {
+      // Check if there's a neighbor in this direction
+      const neighborX = voxel.x + face.dir[0];
+      const neighborY = voxel.y + face.dir[1];
+      const neighborZ = voxel.z + face.dir[2];
+      
+      // Only create face if there's no neighbor
+      if (!hasVoxel(neighborX, neighborY, neighborZ)) {
+        // Add vertices for this face
+        for (let v = 0; v < 4; v++) {
+          const vertex = face.vertices[v];
+          const vIdx = vertexOffset * 3;
+          
+          vertices[vIdx] = baseX + vertex[0] * voxSz;
+          vertices[vIdx + 1] = baseY + vertex[1] * voxSz;
+          vertices[vIdx + 2] = baseZ + vertex[2] * voxSz;
+          
+          colors[vIdx] = voxel.r;
+          colors[vIdx + 1] = voxel.g;
+          colors[vIdx + 2] = voxel.b;
+          
+          normals[vIdx] = face.normal[0];
+          normals[vIdx + 1] = face.normal[1];
+          normals[vIdx + 2] = face.normal[2];
+          
+          vertexOffset++;
+        }
+
+        // Add indices (two triangles per face)
+        indices[indexOffset++] = vertexIndex;
+        indices[indexOffset++] = vertexIndex + 1;
+        indices[indexOffset++] = vertexIndex + 2;
+        indices[indexOffset++] = vertexIndex;
+        indices[indexOffset++] = vertexIndex + 2;
+        indices[indexOffset++] = vertexIndex + 3;
+        
+        vertexIndex += 4;
+      }
+    }
+  }
+
+  // Create geometry from typed arrays
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  geometry.computeBoundingSphere();
+
+  const material = new THREE.MeshBasicMaterial({ 
+    vertexColors: true,
+    side: THREE.FrontSide
+  });
+
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.frustumCulled = true;
+  
+  return mesh;
+}
 
 
 
