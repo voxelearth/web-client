@@ -187,13 +187,17 @@ export default class PaletteVoxelizer {
     this.voxelCount  = this.grid.x * this.grid.y * this.grid.z;
 
     // 4) Allocate bit, tri & distance grids
-    const bitWords = Math.ceil(this.voxelCount/32),
-          triWords = this.voxelCount;
-    this.bitGrid  = new StorageBufferAttribute(new Uint32Array(bitWords),1);
-    this.triGrid  = new StorageBufferAttribute(new Uint32Array(triWords),1);
-    const distInit = new Uint32Array(triWords);
-    distInit.fill(0x7f800000); // +Infinity for f32
-    this.distGrid = new StorageBufferAttribute(distInit,1);
+//     const bitWords = Math.ceil(this.voxelCount/32),
+//           triWords = this.voxelCount;
+//     this.bitGrid  = new StorageBufferAttribute(new Uint32Array(bitWords),1);
+//     this.triGrid  = new StorageBufferAttribute(new Uint32Array(triWords),1);
+//     const distInit = new Uint32Array(triWords);
+//     distInit.fill(0x7f800000); // +Infinity for f32
+//     this.distGrid = new StorageBufferAttribute(distInit,1);
+
+
+ this.bitGrid = this.triGrid = this.distGrid =
+   new StorageBufferAttribute(new Uint32Array(0), 1);
 
     // 5) Clear grids
     const clearWGSL = wgslFn(`
@@ -207,14 +211,14 @@ export default class PaletteVoxelizer {
         if (id < arrayLength(&*tris)) { tris[id] = 0u; }
         if (id < arrayLength(&*dists)) { atomicStore(&dists[id], 0x7f800000u); }
       }`);
-    await renderer.computeAsync(
-      clearWGSL({
-        bits: storage(this.bitGrid, 'atomic<u32>', this.bitGrid.count),
-        tris: storage(this.triGrid, 'u32', this.triGrid.count),
-        dists: storage(this.distGrid, 'atomic<u32>', this.distGrid.count),
-        id: instanceIndex
-      }).compute(Math.max(bitWords,triWords))
-    );
+//     await renderer.computeAsync(
+//       clearWGSL({
+//         bits: storage(this.bitGrid, 'atomic<u32>', this.bitGrid.count),
+//         tris: storage(this.triGrid, 'u32', this.triGrid.count),
+//         dists: storage(this.distGrid, 'atomic<u32>', this.distGrid.count),
+//         id: instanceIndex
+//       }).compute(Math.max(bitWords,triWords))
+//     );
 
     // 6) Raster kernel – keeps closest triangle per voxel (race‑free)
     const rasterWGSL = wgslFn(/* wgsl */`
@@ -382,169 +386,267 @@ fn compute(
 
 
     const triCount = this.indices.length / 3;
-    await renderer.computeAsync(
-      rasterWGSL({
-        pos:   storage(this.posBuf, 'vec3', this.posBuf.count).toReadOnly(),
-        ind:   storage(this.idxBuf, 'u32', this.idxBuf.count).toReadOnly(),
-        bits:  storage(this.bitGrid, 'atomic<u32>', this.bitGrid.count),
-        tris:  storage(this.triGrid, 'u32', this.triGrid.count),
-        dists: storage(this.distGrid, 'atomic<u32>', this.distGrid.count),
-        gDim:  uniform(this.grid),
-        bMin:  uniform(this.bbox.min),
-        vSz:   uniform(this.voxelSize),
-        triId: instanceIndex
-      }).compute(triCount)
-    );
+//     await renderer.computeAsync(
+//       rasterWGSL({
+//         pos:   storage(this.posBuf, 'vec3', this.posBuf.count).toReadOnly(),
+//         ind:   storage(this.idxBuf, 'u32', this.idxBuf.count).toReadOnly(),
+//         bits:  storage(this.bitGrid, 'atomic<u32>', this.bitGrid.count),
+//         tris:  storage(this.triGrid, 'u32', this.triGrid.count),
+//         dists: storage(this.distGrid, 'atomic<u32>', this.distGrid.count),
+//         gDim:  uniform(this.grid),
+//         bMin:  uniform(this.bbox.min),
+//         vSz:   uniform(this.voxelSize),
+//         triId: instanceIndex
+//       }).compute(triCount)
+//     );
+
+// keep them so the tiled CPU stage can re-use the same pipelines
+this._clearWGSL  = clearWGSL;
+this._rasterWGSL = rasterWGSL;
+
 
     // 7) CPU sample & build instanced mesh with affine UV + palette lookup
     await this.#buildInstancedMesh();
   }
 
+
+
+
 /* ──────────────────────────────── 7) CPU sample → instanced mesh ─────────────────────────────── */
+/* ────────────────────── 7) CPU sample → sparse-octree mesh (fixed) ───────────────────── */
+/* ─────────────────── 7) tiled GPU raster → sparse-octree mesh ─────────────────── */
+/* ───────────── 7) tiled GPU raster → exact-leaf instanced mesh ───────────── */
+/* ───────────── 7) tiled GPU raster → exact-leaf instanced mesh (parallel) ───────────── */
 async #buildInstancedMesh() {
+  // 1) Constants
+  const MAX_GPU_BYTES   = 256 * 1024 * 1024;
+  const BYTES_PER_VOXEL = 8.2;
+  const TILE_EDGE       = Math.floor(Math.cbrt(MAX_GPU_BYTES / BYTES_PER_VOXEL));
 
-  const bitsCPU = new Uint32Array(await this.renderer.getArrayBufferAsync(this.bitGrid));
-  const trisCPU = new Uint32Array(await this.renderer.getArrayBufferAsync(this.triGrid));
+  // 2) Scene / pipeline handles
+  const { grid, voxelSize: voxSz, bbox } = this;
+  const { x: NX, y: NY, z: NZ }          = grid;
+  const rend      = this.renderer;
+  const clearWGSL = this._clearWGSL;
+  const rastWGSL  = this._rasterWGSL;
+  const posBuf    = storage(this.posBuf, 'vec3', this.posBuf.count).toReadOnly();
+  const idxBuf    = storage(this.idxBuf, 'u32',  this.idxBuf.count).toReadOnly();
+  const { positions:posA, uvs:uvA, indices:idxA, triMats, palette, materials:mats } = this;
 
-  let maxVoxels = 0;
-  for (const w of bitsCPU) maxVoxels += popcnt32(w);
-
-  const centers = new Float32Array(maxVoxels * 3);
-  const colors  = new Float32Array(maxVoxels * 3);
-
-  const nx = this.grid.x, ny = this.grid.y;
-  const { positions: posA, uvs: uvA, indices: idxA, triMats, palette, materials: mats } = this;
-  let ptr = 0, cptr = 0, flat = 0;
+  // 3) Scratch vectors for color sampling
   const v0=new THREE.Vector3(), v1=new THREE.Vector3(), v2=new THREE.Vector3();
   const uv0=new THREE.Vector2(), uv1=new THREE.Vector2(), uv2=new THREE.Vector2();
-  const p=new THREE.Vector3(), e0=new THREE.Vector3(), e1=new THREE.Vector3(), ep=new THREE.Vector3();
+  const p = new THREE.Vector3(), e0=new THREE.Vector3(), e1=new THREE.Vector3(), ep=new THREE.Vector3();
 
+  // 4) Gather per-tile promises
+  const tileTasks = [];
 
-  for (let wIdx = 0; wIdx < bitsCPU.length; ++wIdx) {
-    let word = bitsCPU[wIdx];
-    if (word === 0) { flat += 32; continue; }
+  for (let oz = 0; oz < NZ; oz += TILE_EDGE) {
+    const tz = Math.min(TILE_EDGE, NZ - oz);
+    for (let oy = 0; oy < NY; oy += TILE_EDGE) {
+      const ty = Math.min(TILE_EDGE, NY - oy);
+      for (let ox = 0; ox < NX; ox += TILE_EDGE) {
+        const tx = Math.min(TILE_EDGE, NX - ox);
+        const tileVox  = tx * ty * tz;
+        const bitWords = Math.ceil(tileVox / 32);
 
-    for (let b = 0; b < 32 && flat < this.voxelCount; ++b, ++flat) {
-      if ((word & 1) === 0) { word >>>= 1; continue; }
-      word >>>= 1;
+        // Allocate fresh small buffers for this tile
+        const bitBuf  = new StorageBufferAttribute(new Uint32Array(bitWords), 1);
+        const triBuf  = new StorageBufferAttribute(new Uint32Array(tileVox),   1);
+        const distArr = new Uint32Array(tileVox); distArr.fill(0x7f800000);
+        const distBuf = new StorageBufferAttribute(distArr, 1);
 
-      const raw = trisCPU[flat];
-      if (raw === 0) continue; // No triangle was closest to this voxel
-      
-      const tId = raw - 1;
-      const i0 = idxA[tId*3], i1 = idxA[tId*3+1], i2 = idxA[tId*3+2];
+        // 4a) Enqueue clear compute
+        rend.computeAsync(
+          clearWGSL({
+            bits : storage(bitBuf, 'atomic<u32>', bitBuf.count),
+            tris : storage(triBuf, 'u32',         triBuf.count),
+            dists: storage(distBuf,'atomic<u32>', distBuf.count),
+            id   : instanceIndex
+          }).compute(Math.max(bitWords, tileVox))
+        );
 
-      const z = Math.floor(flat / (nx * ny)), rem = flat % (nx * ny);
-      const y = Math.floor(rem / nx), x = rem % nx;
-      p.set(
-        this.bbox.min.x + (x + 0.5) * this.voxelSize,
-        this.bbox.min.y + (y + 0.5) * this.voxelSize,
-        this.bbox.min.z + (z + 0.5) * this.voxelSize,
-      );
+        // 4b) Enqueue raster compute
+        const tileMin = new THREE.Vector3(
+          bbox.min.x + ox * voxSz,
+          bbox.min.y + oy * voxSz,
+          bbox.min.z + oz * voxSz
+        );
+        const gDim = new THREE.Vector3(tx, ty, tz);
+        const rasterPromise = rend.computeAsync(
+          rastWGSL({
+            pos  : posBuf,
+            ind  : idxBuf,
+            bits : storage(bitBuf, 'atomic<u32>', bitBuf.count),
+            tris : storage(triBuf, 'u32',         triBuf.count),
+            dists: storage(distBuf,'atomic<u32>', distBuf.count),
+            gDim : uniform(gDim),
+            bMin : uniform(tileMin),
+            vSz  : uniform(voxSz),
+            triId: instanceIndex
+          }).compute(this.indices.length / 3)
+        );
 
-      v0.fromArray(posA, i0*3); v1.fromArray(posA, i1*3); v2.fromArray(posA, i2*3);
-      uv0.fromArray(uvA, i0*2); uv1.fromArray(uvA, i1*2); uv2.fromArray(uvA, i2*2);
+        // 4c) After raster, read back both buffers
+        const tileTask = rasterPromise.then(() => Promise.all([
+          rend.getArrayBufferAsync(bitBuf),
+          rend.getArrayBufferAsync(triBuf)
+        ])).then(([bitsBuffer, trisBuffer]) => {
+          // Process this tile entirely on the CPU
+          const bitsCPU = new Uint32Array(bitsBuffer);
+          const trisCPU = new Uint32Array(trisBuffer);
+          let flat = 0;
 
-      // Barycentric calculation
-      e0.subVectors(v1, v0); e1.subVectors(v2, v0); ep.subVectors(p, v0);
-      const d00 = e0.dot(e0), d01 = e0.dot(e1), d11 = e1.dot(e1);
-      const d20 = ep.dot(e0), d21 = ep.dot(e1);
-      const invDenom = 1 / (d00 * d11 - d01 * d01);
-      let vv = (d11 * d20 - d01 * d21) * invDenom;
-      let ww = (d00 * d21 - d01 * d20) * invDenom;
-      let uu = 1 - vv - ww;
+          const localResults = { centers: [], rgba: [] };
 
-      // --- clamp the centre back *onto* the triangle if it fell outside ---
-      if (uu < 0.0 || vv < 0.0 || ww < 0.0) {
+          for (let wi = 0; wi < bitsCPU.length; ++wi) {
+            let word = bitsCPU[wi];
+            if (!word) { flat += 32; continue; }
+            for (let b = 0; b < 32 && flat < tileVox; ++b, ++flat) {
+              if ((word & 1) === 0) { word >>>= 1; continue; }
+              word >>>= 1;
 
-        const tmpTri   = new THREE.Triangle();
-const clampedP = new THREE.Vector3();   // reused to avoid GC
+              const raw = trisCPU[flat];
+              if (!raw) continue;
+              const tId = raw - 1;
 
-          // closest point on triangle in object-space
-          tmpTri.set( v0, v1, v2 );
-          tmpTri.closestPointToPoint( p, clampedP );   // result in clampedP
+              // local→global coords
+              const lz = (flat / (tx * ty)) | 0;
+              const rem=  flat % (tx * ty);
+              const ly = (rem / tx) | 0;
+              const lx =  rem % tx;
+              const gx = ox + lx, gy = oy + ly, gz = oz + lz;
 
-          // recompute barycentrics for that clamped point
-          ep.subVectors( clampedP, v0 );
-          const d20c = ep.dot( e0 ), d21c = ep.dot( e1 );
-          const vvc  = (d11 * d20c - d01 * d21c) * invDenom;
-          const wwc  = (d00 * d21c - d01 * d20c) * invDenom;
-          const uuc  = 1.0 - vvc - wwc;
+              // voxel center
+              const cx = bbox.min.x + (gx + 0.5) * voxSz;
+              const cy = bbox.min.y + (gy + 0.5) * voxSz;
+              const cz = bbox.min.z + (gz + 0.5) * voxSz;
 
-          uu = Math.max( 0.0, uuc );
-          vv = Math.max( 0.0, vvc );
-          ww = Math.max( 0.0, wwc );
-          const norm = uu + vv + ww;       // re-normalise
-          uu /= norm; vv /= norm; ww /= norm;
+              // sample color (same code as before)…
+              v0.fromArray(posA, idxA[tId*3+0]*3);
+              v1.fromArray(posA, idxA[tId*3+1]*3);
+              v2.fromArray(posA, idxA[tId*3+2]*3);
+
+              uv0.fromArray(uvA, idxA[tId*3+0]*2);
+              uv1.fromArray(uvA, idxA[tId*3+1]*2);
+              uv2.fromArray(uvA, idxA[tId*3+2]*2);
+
+              e0.subVectors(v1, v0);
+              e1.subVectors(v2, v0);
+              ep.set(cx, cy, cz).sub(v0);
+
+              const d00 = e0.dot(e0), d01 = e0.dot(e1), d11 = e1.dot(e1);
+              const d20 = ep.dot(e0), d21 = ep.dot(e1);
+              const inv = 1 / (d00*d11 - d01*d01);
+
+              let vv = (d11*d20 - d01*d21) * inv;
+              let ww = (d00*d21 - d01*d20) * inv;
+              let uu = 1 - vv - ww;
+              if (uu<0||vv<0||ww<0) {
+                const tri = new THREE.Triangle(v0, v1, v2);
+                const cp  = new THREE.Vector3();
+                tri.closestPointToPoint(ep.add(v0), cp);
+                ep.copy(cp).sub(v0);
+                const d20c = ep.dot(e0), d21c = ep.dot(e1);
+                vv = (d11*d20c - d01*d21c)*inv;
+                ww = (d00*d21c - d01*d20c)*inv;
+                uu = 1 - vv - ww;
+              }
+              const uvp = new THREE.Vector2(
+                uu*uv0.x + vv*uv1.x + ww*uv2.x,
+                uu*uv0.y + vv*uv1.y + ww*uv2.y
+              );
+
+              const mat = mats[triMats[tId]] || mats[0];
+              if (!mat) continue;
+              let col = mat.color?.clone() ?? new THREE.Color(1,1,1);
+              if (mat.emissive && mat.emissive.getHex()) col.add(mat.emissive);
+              for (const tex of allTextures(mat)) {
+                const s = getSampler(tex);
+                if (s) col.multiply(s(uvp));
+              }
+              let alpha = mat.opacity ?? 1;
+              if (mat.alphaMap) {
+                const s = getSampler(mat.alphaMap);
+                if (s) alpha *= s(uvp, true).a;
+              }
+              if (alpha < 0.5) continue;
+
+              let best=0, bestD=Infinity;
+              for (let c=0; c<this.paletteSize; ++c) {
+                const dr = col.r - palette[c*3],
+                      dg = col.g - palette[c*3+1],
+                      db = col.b - palette[c*3+2],
+                      d  = dr*dr + dg*dg + db*db;
+                if (d < bestD) { bestD = d; best = c; }
+              }
+
+              localResults.centers.push(cx, cy, cz);
+              localResults.rgba   .push(
+                palette[best*3],
+                palette[best*3+1],
+                palette[best*3+2]
+              );
+            }
+          }
+
+          return localResults;
+        });
+
+        tileTasks.push(tileTask);
       }
+    }
+  }
 
-      // final, seam-safe UV
-      const uvp = new THREE.Vector2(
-          uu * uv0.x + vv * uv1.x + ww * uv2.x,
-          uu * uv0.y + vv * uv1.y + ww * uv2.y
-      );
+  // 5) Await *all* tiles in parallel
+  const results = await Promise.all(tileTasks);
 
-      // Get material and sample final color (now in linear space)
-      let mat = mats[triMats[tId]] || mats[0];
-      if (!mat) continue; // Safety check
+  // 6) Flatten into typed arrays
+  let total = 0;
+  for (const r of results) total += r.centers.length / 3;
+  if (total === 0) {
+    this.voxelMesh = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial()
+    );
+    return;
+  }
 
-      let col = (mat.color ? mat.color.clone() : new THREE.Color(1,1,1));
-      if (mat.emissive && mat.emissive.getHSL({h:0,s:0,l:0}) > 0) {
-        col.add(mat.emissive);
-      }
-      let alpha = mat.opacity || 1.0;
+  const centersA = new Float32Array(total * 3),
+        colorsA  = new Float32Array(total * 3);
 
-      for (const tex of allTextures(mat)) {
-        const s = getSampler(tex);
-        if (s) col.multiply( s(uvp) );
-      }
-      if (mat.alphaMap) {
-        const s = getSampler(mat.alphaMap);
-        if (s) alpha *= s(uvp, true).a;
-      }
-      if (alpha < 0.5) continue; // Discard transparent voxels
+  let offC = 0, offR = 0;
+  for (const r of results) {
+    centersA.set(r.centers, offC);
+    colorsA .set(r.rgba,    offR);
+    offC += r.centers.length;
+    offR += r.rgba   .length;
+  }
 
-      centers[ptr++] = p.x; centers[ptr++] = p.y; centers[ptr++] = p.z;
+  // 7) Build instanced mesh
+  const geo  = new THREE.BoxGeometry(voxSz, voxSz, voxSz),
+        matM = new THREE.MeshBasicMaterial({ vertexColors: true }),
+        inst = new THREE.InstancedMesh(geo, matM, total),
+        M4   = new THREE.Matrix4();
 
-      // Palette lookup in linear space
-      let best = 0, bestD = Infinity;
-      for (let c = 0; c < this.paletteSize; ++c) {
-        const dr = col.r - palette[c*3], dg = col.g - palette[c*3+1], db = col.b - palette[c*3+2];
-        const d  = dr*dr + dg*dg + db*db;
-        if (d < bestD) { bestD = d; best = c; }
-      }
-      colors[cptr++] = palette[best*3];
-      colors[cptr++] = palette[best*3+1];
-      colors[cptr++] = palette[best*3+2];
-    }
-  }
+  for (let i = 0; i < total; ++i) {
+    M4.makeTranslation(
+      centersA[i*3+0],
+      centersA[i*3+1],
+      centersA[i*3+2]
+    );
+    inst.setMatrixAt(i, M4);
+  }
+  inst.instanceMatrix.needsUpdate = true;
+  inst.instanceColor = new THREE.InstancedBufferAttribute(colorsA, 3);
+  inst.instanceColor.needsUpdate  = true;
+  inst.frustumCulled = false;
 
-  const kept = ptr / 3;
-  if (kept === 0) {
-    this.voxelMesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial());
-    return;
-  }
-
-  const centersA = centers.subarray(0, kept * 3);
-  const colorsA  = colors.subarray(0, kept * 3);
-
-  const cube = new THREE.BoxGeometry(this.voxelSize, this.voxelSize, this.voxelSize);
-  const instMat = new THREE.MeshBasicMaterial({ vertexColors: true });
-  const inst = new THREE.InstancedMesh(cube, instMat, kept);
-  inst.name = "VoxelMesh";
-
-  const M4 = new THREE.Matrix4();
-  for (let i = 0; i < kept; ++i) {
-    M4.makeTranslation(centersA[i*3], centersA[i*3+1], centersA[i*3+2]);
-    inst.setMatrixAt(i, M4);
-  }
-  inst.instanceMatrix.needsUpdate = true;
-  inst.instanceColor = new THREE.InstancedBufferAttribute(colorsA, 3);
-  inst.instanceColor.needsUpdate  = true;
-  inst.frustumCulled = false;
-
-  this.voxelMesh = inst;
+  this.voxelMesh = inst;
 }
+
+
+
 
 
   /* bake+merge → positions, uvs, indices, triMats, palette, materials */
