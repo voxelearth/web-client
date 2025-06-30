@@ -24,7 +24,7 @@ const voxCtrl = {
 /* build the “Voxels” folder */
 const voxFolder = gui.addFolder('Voxels');
 voxFolder
-  .add(voxCtrl, 'resolution', 4, 512, 1)
+  .add(voxCtrl, 'resolution', 4, 2000, 1)
   .name('Voxel Resolution')
   .onChange(async (val) => {
     await buildVoxels(val);
@@ -66,6 +66,7 @@ async function buildVoxels(res) {
   }
 
   try {
+    const start = performance.now();
     const vox = await voxelizeModel({
       model:     viewer.tilesContainer,
       renderer:  viewer.renderer,
@@ -77,7 +78,9 @@ async function buildVoxels(res) {
     viewer.voxelMesh.visible     = voxCtrl.visible;
     viewer.tilesContainer.visible = !voxCtrl.visible;
 
-    ui.log(`✅ voxels: ${vox.activeVoxelCount.toLocaleString()}`);
+    const elapsed = performance.now() - start;
+    ui.log(`✅ Voxelisation done in ${elapsed.toFixed(2)} ms`);
+    ui.log(`✅ voxels: ${vox.voxelCount.toLocaleString()}`);
   } catch (e) {
     console.error(e);
     ui.log(`⚠️ Voxelisation error: ${e}`);
