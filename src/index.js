@@ -39,6 +39,47 @@ voxFolder
   });
 voxFolder.open();
 
+function disposeVoxelMesh(voxelizer) {
+  if (!voxelizer || !voxelizer.voxelMesh) return;
+  
+  const mesh = voxelizer.voxelMesh;
+  
+  // Remove from scene first
+  if (mesh.parent) {
+    mesh.parent.remove(mesh);
+  }
+  
+  // Helper function to dispose a single mesh
+  const disposeMesh = (object) => {
+    if (object.geometry) {
+      object.geometry.dispose();
+    }
+    if (object.material) {
+      if (Array.isArray(object.material)) {
+        object.material.forEach(mat => mat.dispose());
+      } else {
+        object.material.dispose();
+      }
+    }
+  };
+  
+  // Check if it's a group or a single mesh
+  if (mesh.isGroup) {
+    // Traverse all children and dispose them
+    mesh.traverse((child) => {
+      if (child.isMesh) {
+        disposeMesh(child);
+      }
+    });
+    // Clear the group's children array
+    mesh.clear();
+  } else if (mesh.isMesh) {
+    // Single mesh
+    disposeMesh(mesh);
+  }
+}
+
+
 /* ------------------------------------------------------------- */
 /* create viewer                                                 */
 /* ------------------------------------------------------------- */
@@ -59,10 +100,11 @@ async function buildVoxels(res) {
 
   /* remove previous voxel mesh */
   if (viewer.voxelMesh) {
-    viewer.scene.remove(viewer.voxelMesh);
-    viewer.voxelMesh.geometry.dispose();
-    viewer.voxelMesh.material.dispose();
-    viewer.voxelMesh = null;
+    // viewer.scene.remove(viewer.voxelMesh);
+    // viewer.voxelMesh.geometry.dispose();
+    // viewer.voxelMesh.material.dispose();
+    // viewer.voxelMesh = null;
+    disposeVoxelMesh(viewer);
   }
 
   try {
