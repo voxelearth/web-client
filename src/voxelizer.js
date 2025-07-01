@@ -696,10 +696,70 @@ async #buildInstancedMesh() {
     const group = new THREE.Group();
     meshes.forEach(mesh => group.add(mesh));
     this.voxelMesh = group;
+
+    /* -----------------------------------------------
+   *  Back-channel data for assignToBlocksForGLB.js
+   * --------------------------------------------- */
+  const tot = NX * NY * NZ;
+  const voxelColors = new Float32Array(tot * 4);  // r,g,b,a
+  const voxelCounts = new Uint32Array(tot);       // hit count per voxel
+
+  const idxXYZ = (x, y, z) => x + NX * (y + NY * z);
+
+  for (const voxel of voxelMap.values()) {
+    const i = idxXYZ(voxel.x, voxel.y, voxel.z);
+
+    voxelCounts[i] = 1;          // just one sample – fast & small
+    voxelColors[i * 4 + 0] = voxel.r;
+    voxelColors[i * 4 + 1] = voxel.g;
+    voxelColors[i * 4 + 2] = voxel.b;
+    voxelColors[i * 4 + 3] = 1;  // opaque
+  }
+
+  /* expose everything assignToBlocksForGLB needs */
+  this._voxelGrid = {
+    gridSize: this.grid.clone ? this.grid.clone() : this.grid,
+    unit    : new THREE.Vector3(voxSz, voxSz, voxSz),
+    bbox    : this.bbox.clone ? this.bbox.clone() : this.bbox,
+    voxelColors,
+    voxelCounts
+  };
+
+
   } else {
     // Build single mesh
     const mesh = this.#buildMeshFromVoxels(voxelMap, voxelMap, hasVoxel, faces, voxSz, bbox);
     this.voxelMesh = mesh;
+
+    /* -----------------------------------------------
+   *  Back-channel data for assignToBlocksForGLB.js
+   * --------------------------------------------- */
+  const tot = NX * NY * NZ;
+  const voxelColors = new Float32Array(tot * 4);  // r,g,b,a
+  const voxelCounts = new Uint32Array(tot);       // hit count per voxel
+
+  const idxXYZ = (x, y, z) => x + NX * (y + NY * z);
+
+  for (const voxel of voxelMap.values()) {
+    const i = idxXYZ(voxel.x, voxel.y, voxel.z);
+
+    voxelCounts[i] = 1;          // just one sample – fast & small
+    voxelColors[i * 4 + 0] = voxel.r;
+    voxelColors[i * 4 + 1] = voxel.g;
+    voxelColors[i * 4 + 2] = voxel.b;
+    voxelColors[i * 4 + 3] = 1;  // opaque
+  }
+
+  /* expose everything assignToBlocksForGLB needs */
+  this._voxelGrid = {
+    gridSize: this.grid.clone ? this.grid.clone() : this.grid,
+    unit    : new THREE.Vector3(voxSz, voxSz, voxSz),
+    bbox    : this.bbox.clone ? this.bbox.clone() : this.bbox,
+    voxelColors,
+    voxelCounts
+  };
+
+
   }
 }
 
