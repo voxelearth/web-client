@@ -1,0 +1,6 @@
+{
+  "parent": "minecraft:block/shulker_box",
+  "textures": {
+    "particle": "entity/shulker/shulker_pink"
+  }
+}
