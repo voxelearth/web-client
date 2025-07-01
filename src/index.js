@@ -1,19 +1,22 @@
-/* index.js – viewer / voxeliser / Minecraft-toggle coordinator */
+/* index.js – viewer / voxeliser / Minecraft‑toggle coordinator + schematic exporter */
 
-import { Viewer }                       from './Viewer.js';
-import { UI }                           from './UI.js';
-import { voxelizeModel }                from './voxelize-model.js';
-import { GUI }                          from 'three/addons/libs/lil-gui.module.min.js';
-import { load }                         from '@loaders.gl/core';
-import { Tileset3D }                    from '@loaders.gl/tiles';
-import { Tiles3DLoader }                from '@loaders.gl/3d-tiles';
-import { WebMercatorViewport }          from '@deck.gl/core';
-import { initBlockData,
-         assignVoxelsToBlocks }         from './assignToBlocksForGLB.js';
-import * as THREE                       from 'three';
+import { Viewer }               from './Viewer.js';
+import { UI }                   from './UI.js';
+import { voxelizeModel }        from './voxelize-model.js';
+import { GUI }                  from 'three/addons/libs/lil-gui.module.min.js';
+import { load }                 from '@loaders.gl/core';
+import { Tileset3D }            from '@loaders.gl/tiles';
+import { Tiles3DLoader }        from '@loaders.gl/3d-tiles';
+import { WebMercatorViewport }  from '@deck.gl/core';
+import { initBlockData, assignVoxelsToBlocks } from './assignToBlocksForGLB.js';
+import * as BlockLib            from './assignToBlocksForGLB.js';
+import * as THREE               from 'three';
+
+/* heavy schematic libs will be lazy‑loaded */
+let exportToSchematicFn = null;
 
 /* ------------------------------------------------------------------ */
-/* UI set-up                                                          */
+/* UI set‑up                                                          */
 /* ------------------------------------------------------------------ */
 const ui  = new UI();
 const gui = new GUI({ width: 260 });
@@ -34,17 +37,23 @@ voxFolder
   .add(voxCtrl, 'visible')
   .name('Show Voxels')
   .onChange(flag => {
-    if (viewer.colorMesh   ) viewer.colorMesh.visible   = flag && !voxCtrl.minecraft;
-    if (viewer.mcGroup     ) viewer.mcGroup.visible     = flag &&  voxCtrl.minecraft;
-    if (viewer.tilesContainer) viewer.tilesContainer.visible = !flag;
+    if (viewer.colorMesh      ) viewer.colorMesh.visible      = flag && !voxCtrl.minecraft;
+    if (viewer.mcGroup        ) viewer.mcGroup.visible        = flag &&  voxCtrl.minecraft;
+    if (viewer.tilesContainer ) viewer.tilesContainer.visible = !flag;
   });
 
 voxFolder
   .add(voxCtrl, 'minecraft')
   .name('Minecraft Textures')
   .onChange(handleMinecraftToggle);
-
 voxFolder.open();
+
+/* Extra UI – export schematic button -------------------------------- */
+const actionFolder = gui.addFolder('Export');
+actionFolder
+  .add({ exportSchematic : exportCurrentSchematic }, 'exportSchematic')
+  .name('Export .schem');
+actionFolder.open();
 
 /* ------------------------------------------------------------------ */
 /* viewer                                                             */
@@ -56,7 +65,7 @@ const viewer = new Viewer({
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
-function disposeMesh(obj) {
+function disposeMesh (obj) {
   if (!obj) return;
   obj.traverse(o => {
     if (o.isMesh) {
@@ -83,7 +92,7 @@ async function buildVoxels (res) {
 
   ui.log(`Voxelising at resolution ${res} …`);
 
-  /* clean previous meshes ----------------------------------------- */
+  /* clean previous meshes */
   disposeMesh(viewer.colorMesh);
   disposeMesh(viewer.mcGroup);
   viewer.colorMesh = viewer.mcGroup = null;
@@ -106,9 +115,8 @@ async function buildVoxels (res) {
 
     ui.log(`✅ Voxelised (${vox.voxelCount.toLocaleString()} voxels) in ${(performance.now()-t0).toFixed(1)} ms`);
 
-    /* if MC toggle already on – regenerate block mesh ------------- */
+    /* if MC toggle already on – regenerate block mesh */
     if (voxCtrl.minecraft) await handleMinecraftToggle(true, /*clearOnly=*/false);
-
   } catch (e) {
     console.error(e);
     ui.log(`⚠️ ${e}`);
@@ -128,29 +136,24 @@ async function handleMinecraftToggle (enabled, clearOnly = false) {
     return;
   }
 
-  /* always remove any existing MC group first --------------------- */
+  /* remove any existing MC group first */
   disposeMesh(viewer.mcGroup);
   viewer.mcGroup = null;
   if (!enabled || clearOnly) {
-    /* just revert to coloured mesh */
     if (viewer.colorMesh) viewer.colorMesh.visible = voxCtrl.visible;
     return;
   }
 
   ui.log('⛏️ Converting to Minecraft textures …');
-
   await initBlockData();
 
-  /* give assignVoxelsToBlocks an object that looks like a “GLB display”
-     but still points at our THREE.Scene so add()/remove() work            */
+  /* hand scene to helper */
   const sceneWrapper = viewer.scene;
   sceneWrapper._voxelGrid = viewer.voxelizer._voxelGrid;
-  /* the helper sometimes calls .editor.update(); provide a stub         */
   if (!sceneWrapper.editor) sceneWrapper.editor = { update (){} };
 
   await assignVoxelsToBlocks(sceneWrapper);
 
-  /* grab the freshly created group */
   viewer.mcGroup = sceneWrapper.getObjectByName('voxelGroup');
   if (!viewer.mcGroup) {
     ui.log('⚠️ Minecraft conversion failed');
@@ -159,15 +162,39 @@ async function handleMinecraftToggle (enabled, clearOnly = false) {
     return;
   }
 
-  /* final visibility setup */
   viewer.mcGroup.visible   = voxCtrl.visible;
   if (viewer.colorMesh) viewer.colorMesh.visible = false;
-
   ui.log('✅ Minecraft conversion done');
 }
 
 /* ------------------------------------------------------------------ */
-/* GOOGLE 3-D-TILES fetcher (unchanged)                               */
+/* Export current voxel grid → Sponge .schem                          */
+/* ------------------------------------------------------------------ */
+async function exportCurrentSchematic () {
+  if (!viewer.voxelizer || !viewer.voxelizer._voxelGrid) {
+    ui.log('Voxelise first!');
+    return;
+  }
+
+  await initBlockData();
+
+  if (!exportToSchematicFn) {
+    const mod = await import(/* @vite-ignore */ './exportToSchematic.js');
+    exportToSchematicFn = mod.exportToSchematic;
+  }
+
+  try {
+    ui.log('💾 Exporting .schem …');
+    await exportToSchematicFn(viewer.voxelizer._voxelGrid, BlockLib.BLOCKS);
+    ui.log('✅ Schematic saved');
+  } catch (e) {
+    console.error(e);
+    ui.log(`⚠️ ${e}`);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* GOOGLE 3‑D‑TILES fetcher                                           */
 /* ------------------------------------------------------------------ */
 async function fetch3DTiles () {
   ui.setDebugSliderVisibility(false);
@@ -176,7 +203,6 @@ async function fetch3DTiles () {
 
   const tilesetUrl = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${GOOGLE_API_KEY}`;
   const targetSSE  = ui.getScreenSpaceError();
-
   ui.log(`Fetching tiles at (${lat},${lng},z${zoom},sse ${targetSSE})`);
 
   const viewport = new WebMercatorViewport({ width:230,height:175, latitude:lat, longitude:lng, zoom });
@@ -207,6 +233,7 @@ async function fetch3DTiles () {
 /* ------------------------------------------------------------------ */
 /* UI callbacks                                                      */
 /* ------------------------------------------------------------------ */
-ui.onFetch           = fetch3DTiles;
-ui.onDownload        = () => viewer.generateCombineGltf();
-ui.onTileSliderChange= v => viewer.gltfArray.forEach((gltf,i)=>gltf.scene.visible = i<=v);
+ui.onFetch             = fetch3DTiles;
+ui.onDownload          = () => viewer.generateCombineGltf();
+ui.onTileSliderChange  = v => viewer.gltfArray.forEach((gltf,i)=>gltf.scene.visible = i<=v);
+ui.onExportSchematic   = exportCurrentSchematic;
