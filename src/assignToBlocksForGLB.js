@@ -390,4 +390,8 @@ export async function assignVoxelsToBlocks(glbDisplay) {
   glbDisplay.editor.update();
 
   console.log("Voxel mesh rebuilt with real textures. #mesh in group:", voxelGroup.children.length);
+
+  voxelGrid.assigned = assigned;
 }
+
+export { BLOCKS };                 // make it importable
