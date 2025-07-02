@@ -1,22 +1,22 @@
 /* ====================================================================
- *  map.js – Google Photorealistic 3D-tiles ⇄ on-demand voxel / MC view
+ * map.js – Google Photorealistic 3D-tiles ⇄ on-demand voxel / MC view
  * ===================================================================*/
 
-import * as THREE                       from 'three';
-import { OrbitControls }                from 'three/examples/jsm/controls/OrbitControls.js';
-import { WebGPURenderer }               from 'three/webgpu';
+import * as THREE                   from 'three';
+import { OrbitControls }            from 'three/examples/jsm/controls/OrbitControls.js';
+import { WebGPURenderer }           from 'three/webgpu';
 
-import { TilesRenderer }                from '3d-tiles-renderer';
+import { TilesRenderer }            from '3d-tiles-renderer';
 import { TileCompressionPlugin,
          TilesFadePlugin,
-         GLTFExtensionsPlugin          } from '3d-tiles-renderer/plugins';
-import { DRACOLoader                   } from 'three/examples/jsm/loaders/DRACOLoader.js';
+         GLTFExtensionsPlugin       } from '3d-tiles-renderer/plugins';
+import { DRACOLoader                } from 'three/examples/jsm/loaders/DRACOLoader.js';
 
-import { voxelizeModel                 } from './voxelize-model.js';
+import { voxelizeModel              } from './voxelize-model.js';
 import { initBlockData,
-         assignVoxelsToBlocks          } from './assignToBlocksForGLB.js';
+         assignVoxelsToBlocks       } from './assignToBlocksForGLB.js';
 
-import { GUI                           } from 'three/addons/libs/lil-gui.module.min.js';
+import { GUI                        } from 'three/addons/libs/lil-gui.module.min.js';
 
 /* ───────────────────────────────── HUD + mini-map ────────────────── */
 class HUD {
@@ -48,10 +48,10 @@ class HUD {
     this.key.onchange  =()=>localStorage.setItem('token',this.key.value);
     this.fetch.onclick =()=>this.onFetch?.();
   }
-  getKey()        {return this.key.value.trim();}
-  getSSE()        {return +this.sse.value;}
-  getLatLon()     {return this.coords.value.split(',').map(Number);}
-  log(m)          {this.logEl.textContent+=m+'\n';}
+  getKey()       {return this.key.value.trim();}
+  getSSE()       {return +this.sse.value;}
+  getLatLon()    {return this.coords.value.split(',').map(Number);}
+  log(m)         {this.logEl.textContent+=m+'\n';}
 }
 const ui=new HUD();
 
@@ -60,7 +60,7 @@ let scene,camera,controls,renderer,tiles=null;
 
 (async()=>{
   if('gpu' in navigator){
-    renderer=new WebGPURenderer({antialias:true});      // WebGPU first
+    renderer=new WebGPURenderer({antialias:true});       // WebGPU first
     await renderer.init();
   }else{
     renderer=new THREE.WebGLRenderer({antialias:true});
@@ -106,7 +106,7 @@ function spawnTiles(root,key,latDeg,lonDeg){
     const url=new URL(u,'https://tile.googleapis.com');
     if(url.searchParams.has('session')) sessionId=url.searchParams.get('session');
     if(sessionId && !url.searchParams.has('session')) url.searchParams.set('session',sessionId);
-    if(!url.searchParams.has('key'))    url.searchParams.set('key',key);
+    if(!url.searchParams.has('key'))     url.searchParams.set('key',key);
     return url.toString();
   };
 
@@ -126,93 +126,61 @@ function spawnTiles(root,key,latDeg,lonDeg){
       controls.update(); 
       framed=true;
     }
-    
-    // If vox mode is on, prepare for immediate voxelization
-    if(state.vox) {
-      lastVoxelUpdateTime = 0;
-    }
   });
 
-  tiles.addEventListener('load-model',   onTileLoad);
-  tiles.addEventListener('dispose-model',onTileDispose);
-  
-  // Listen for various tile events to ensure voxelization happens
-  tiles.addEventListener('load-content', () => {
-    if(state.vox) {
-      // Defer to next frame to ensure tiles are ready
-      requestAnimationFrame(() => updateVis());
-    }
-  });
-  
-  // Also listen for tile visibility changes
-  tiles.addEventListener('tile-visibility-change', ({tile, visible}) => {
-    if(state.vox && visible && tile && !tile._voxMesh && !voxelizingTiles.has(tile)) {
-      buildVoxelFor(tile);
-    }
-  });
-  
-  // Listen for when tile loading completes
-  tiles.addEventListener('tiles-load-end', () => {
-    if(state.vox) {
-      // Process any remaining tiles that need voxelization
-      updateVis();
-    }
-  });
+  // Event Handlers
+  tiles.addEventListener('load-model', onTileLoad);
+  tiles.addEventListener('dispose-model', onTileDispose);
 
+  // This is the key handler for managing LOD changes. When the renderer
+  // determines a tile is no longer visible (e.g., because it's been
+  // refined into higher-resolution children), we clean up its voxel mesh.
+  // When it becomes visible, we can trigger voxelization.
+  tiles.addEventListener('tile-visibility-change', ({ tile, visible }) => {
+    // 'tile' is the renderer's internal tile object.
+    // The actual three.js mesh group is in 'tile.cached.scene'.
+    const tileGroup = tile.cached.scene;
+    if (!tileGroup) return; // Group not loaded yet.
+
+    if (visible) {
+      // If voxel mode is on and this tile becomes visible, build its voxel mesh.
+      if(state.vox && !tileGroup._voxMesh && !voxelizingTiles.has(tileGroup)) {
+        buildVoxelFor(tileGroup);
+      }
+    } else {
+      // If the tile becomes invisible, it's likely replaced by children (higher LOD)
+      // or the camera moved away. We must clean up our custom voxel meshes.
+      cleanupTileVoxels(tileGroup);
+    }
+    // After any change, re-evaluate what should be visible (original vs. voxel).
+    applyVis(tileGroup);
+  });
+  
   scene.add(tiles.group);
 }
 
 /* ─────────────────────────────────── GUI & state ──────────────────── */
 const state={resolution:64, vox:false, mc:false};
-let lastVoxelUpdateTime = 0; // Track when we last checked for voxelization
+let lastVoxelUpdateTime = 0;
 
 function buildGUI(){
   const g=new GUI({width:260});
   g.add(state,'resolution',4,1024,1).name('Voxel Res').onFinishChange(rebuildAll);
-  g.add(state,'vox').name('Show Voxels').onChange((value) => {
-    // Immediately update visibility
+  g.add(state,'vox').name('Show Voxels').onChange(() => {
+    // When toggling voxel mode, update everything.
+    // updateVis will handle creating/hiding voxels as needed.
     updateVis();
-    
-    if(value && tiles && tiles.group) {
-      // Reset the update timer to trigger immediate voxelization
-      lastVoxelUpdateTime = 0;
-      
-      // Force immediate voxelization of visible tiles
-      let voxelizeCount = 0;
-      const tilesToVoxelize = [];
-      
-      if(tiles.group.children) {
-        tiles.group.children.forEach(tile => {
-          if(tile && tile.type === 'Group' && tile.visible && 
-             !tile._voxMesh && !voxelizingTiles.has(tile)) {
-            tilesToVoxelize.push(tile);
-            voxelizeCount++;
-          }
-        });
-      }
-      
-      // Voxelize collected tiles
-      tilesToVoxelize.forEach(tile => buildVoxelFor(tile));
-      
-      if(voxelizeCount > 0) {
-        ui.log(`Voxelizing ${voxelizeCount} tiles...`);
-      }
-    }
   });
   g.add(state,'mc').name('Minecraft Textures').onChange(async (value) => {
     if(value && state.vox && tiles && tiles.group) {
-      // Convert existing voxels to Minecraft
       const tilesToConvert = [];
-      
       if(tiles.group.children) {
         tiles.group.children.forEach(tile => {
-          if(tile && tile._voxMesh && !tile._mcMesh) {
+          if(tile && tile.type === 'Group' && tile._voxMesh && !tile._mcMesh) {
             tilesToConvert.push(tile);
           }
         });
       }
-      
-      // Convert all at once
       for(const tile of tilesToConvert) {
         await buildMinecraftFor(tile);
       }
@@ -224,8 +192,6 @@ function buildGUI(){
 /* ───────────────────── helper to dispose THREE objects ───────────── */
 function dispose(o){
   if(!o) return;
-  
-  // If it's a voxel or MC mesh, remove its tile reference
   if(o.userData && o.userData.sourceTile) {
     const tile = o.userData.sourceTile;
     if(tile._voxMesh === o) delete tile._voxMesh;
@@ -233,7 +199,6 @@ function dispose(o){
     delete o.userData.sourceTile;
   }
   
-  // Use traverse if available, otherwise try to dispose directly
   if(o.traverse && typeof o.traverse === 'function') {
     o.traverse(n=>{
       if(n.isMesh){
@@ -248,7 +213,6 @@ function dispose(o){
       }
     });
   } else if(o.isMesh) {
-    // Direct disposal for single mesh
     o.geometry?.dispose();
     (Array.isArray(o.material)?o.material:[o.material])
       .forEach(m=>{
@@ -258,66 +222,35 @@ function dispose(o){
         }
       });
   }
-  
   o.parent?.remove(o);
 }
 
 /* ───────────────────── per-tile voxel / MC logic ──────────────────── */
 
-/* Track voxelization status to prevent duplicate work */
 const voxelizingTiles = new Set();
 const disposingTiles = new Set();
 
-/* 2. create voxel mesh maintaining proper world transforms */
 async function buildVoxelFor(tile){
-  // Check if already voxelizing, voxelized, or being disposed
-  if(!tile || tile._voxMesh || voxelizingTiles.has(tile) || 
-     disposingTiles.has(tile) || !tile.visible) return;
-  
-  // Verify tile is still in the scene
+  if(!tile || tile._voxMesh || voxelizingTiles.has(tile) || disposingTiles.has(tile) || !tile.visible) return;
   if(!tile.parent || tile.parent !== tiles.group) return;
   
-  // Check if tile has any meshes to voxelize
   let hasMeshes = false;
-  if(tile.traverse && typeof tile.traverse === 'function') {
-    tile.traverse(n => {
-      if(n.isMesh && n.geometry) {
-        hasMeshes = true;
-      }
-    });
-  } else {
-    // If traverse isn't available, skip this tile
-    return;
-  }
-  
+  tile.traverse(n => { if(n.isMesh && n.geometry) hasMeshes = true; });
   if(!hasMeshes) return;
   
   voxelizingTiles.add(tile);
-  
   try{
-    // Ensure tile has updated world matrix
     tile.updateMatrixWorld(true);
-    
-    // Create a temporary container to hold the tile at its world position
     const tempContainer = new THREE.Group();
     tempContainer.applyMatrix4(tile.matrixWorld);
-    
-    // Clone the tile into the container
     const clone = tile.clone(true);
     clone.position.set(0, 0, 0);
     clone.rotation.set(0, 0, 0);
     clone.scale.set(1, 1, 1);
     tempContainer.add(clone);
     
-    // Voxelize the container (which includes world transform)
-    const vox = await voxelizeModel({
-      model: tempContainer,
-      renderer,
-      scene,
-      resolution: state.resolution
-    });
+    const vox = await voxelizeModel({ model: tempContainer, renderer, scene, resolution: state.resolution });
     
-    // Check if tile still exists and not being disposed after async operation
     if(!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
       dispose(vox.voxelMesh);
       dispose(tempContainer);
@@ -326,21 +259,15 @@ async function buildVoxelFor(tile){
 
     const vMesh = vox.voxelMesh;
     vMesh.matrixAutoUpdate = false;
-    
-    // Store tile reference for cleanup
     vMesh.userData.sourceTile = tile;
-    
     scene.add(vMesh);
 
     tile._voxMesh = vMesh;
     tile._voxelizer = vox;
-    tile._tempContainer = tempContainer; // Keep reference for MC conversion
+    tile._tempContainer = tempContainer;
 
     if(state.mc) await buildMinecraftFor(tile);
     applyVis(tile);
-    
-    // Debug log
-    console.log(`Voxelized tile at resolution ${state.resolution}, voxels: ${vox.voxelCount}`);
   }catch(e){ 
     console.warn('voxelise failed',e);
   } finally {
@@ -349,23 +276,16 @@ async function buildVoxelFor(tile){
 }
 
 async function buildMinecraftFor(tile){
-  if(!tile || tile._mcMesh || !tile._voxelizer || !tile._tempContainer || 
-     disposingTiles.has(tile)) return;
-  
-  // Verify tile is still in the scene
+  if(!tile || tile._mcMesh || !tile._voxelizer || !tile._tempContainer || disposingTiles.has(tile)) return;
   if(!tile.parent || tile.parent !== tiles.group) return;
   
   try {
     await initBlockData();
-    
-    // Use the temporary container that has the voxel data
     const container = tile._tempContainer;
     container._voxelGrid = tile._voxelizer._voxelGrid;
     if(!container.editor) container.editor = {update(){}};
-    
     await assignVoxelsToBlocks(container);
 
-    // Check if tile still exists and not being disposed after async operation
     if(!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
       const mc = container.getObjectByName('voxelGroup');
       if(mc) dispose(mc);
@@ -377,8 +297,6 @@ async function buildMinecraftFor(tile){
       mc.matrixAutoUpdate = false;
       scene.add(mc);
       tile._mcMesh = mc;
-      
-      // Store reference for cleanup
       mc.userData.sourceTile = tile;
     }
     applyVis(tile);
@@ -387,25 +305,18 @@ async function buildMinecraftFor(tile){
   }
 }
 
+// The 'scene' from the event is the THREE.Group for the tile.
 function onTileLoad({scene:tile}){
-  // Skip if tile is invalid, not a direct child, or doesn't have proper structure
   if(!tile || !tile.parent || tile.parent !== tiles.group || tile.type !== 'Group') return;
-  
-  // Ensure the tile has its world matrix updated
-  if(tile.updateMatrixWorld && typeof tile.updateMatrixWorld === 'function') {
-    tile.updateMatrixWorld(true);
-  }
-  
-  // Clean up any existing voxels for tiles at the same location
-  // This handles tile replacement when higher resolution tiles load
-  cleanupOverlappingVoxels(tile);
-  
+  tile.updateMatrixWorld(true);
+
+  // The complex 'cleanupOverlappingVoxels' is no longer needed.
+  // The 'tile-visibility-change' event now handles removing voxels from
+  // parent tiles when children (higher LODs) are loaded.
   applyVis(tile);
   
-  // Automatically voxelize if vox mode is on - do it immediately, don't wait
+  // Automatically voxelize if vox mode is on.
   if(state.vox && tile.visible && !tile._voxMesh && !voxelizingTiles.has(tile)) {
-    console.log('Tile loaded, queuing for voxelization');
-    // Queue for next frame to ensure tile is fully loaded
     requestAnimationFrame(() => {
       if(tile.parent && tile.visible && !tile._voxMesh && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
         buildVoxelFor(tile);
@@ -414,8 +325,8 @@ function onTileLoad({scene:tile}){
   }
 }
 
+// The 'scene' from the event is the THREE.Group for the tile.
 function onTileDispose({scene:tile}){
-  // Mark tile as being disposed
   if(tile) {
     disposingTiles.add(tile);
     cleanupTileVoxels(tile);
@@ -426,15 +337,12 @@ function onTileDispose({scene:tile}){
 function cleanupTileVoxels(tile){
   if(!tile) return;
   
-  // Mark this tile as being cleaned up to prevent new voxelization
   disposingTiles.add(tile);
-  
   try {
     dispose(tile._voxMesh); 
     dispose(tile._mcMesh);
     dispose(tile._tempContainer);
     
-    // Remove from voxelizing set if present
     voxelizingTiles.delete(tile);
     
     delete tile._voxMesh;
@@ -442,149 +350,58 @@ function cleanupTileVoxels(tile){
     delete tile._voxelizer;
     delete tile._tempContainer;
   } finally {
-    // Always remove from disposing set
     disposingTiles.delete(tile);
   }
 }
 
-function cleanupOverlappingVoxels(newTile){
-  // Don't check if tiles system isn't ready
-  if(!tiles || !tiles.group || !newTile) return;
-  
-  // Verify newTile has proper methods
-  if(!newTile.getWorldPosition || typeof newTile.getWorldPosition !== 'function') return;
-  
-  // For Google 3D tiles, we can use the tile's built-in bounds if available
-  const tilesToClean = [];
-  
-  // Use children array instead of traverse to avoid errors
-  if(tiles.group.children && Array.isArray(tiles.group.children)) {
-    tiles.group.children.forEach(child => {
-      // Skip if it's the new tile, or doesn't have voxels
-      if(!child || child === newTile || !child._voxMesh) return;
-      
-      // Skip if child doesn't have proper methods
-      if(!child.getWorldPosition || typeof child.getWorldPosition !== 'function') return;
-      
-      // Simple heuristic: if tiles are very close in the hierarchy, they likely overlap
-      // Google 3D tiles typically replace tiles at the same location with higher detail
-      // We can check if the tiles share similar world position
-      try {
-        const newPos = new THREE.Vector3();
-        const existingPos = new THREE.Vector3();
-        
-        newTile.getWorldPosition(newPos);
-        child.getWorldPosition(existingPos);
-        
-        const distance = newPos.distanceTo(existingPos);
-        
-        // Google 3D tiles are typically around 100-200 units in size
-        // If tiles are within 50 units, they're likely the same location at different detail levels
-        if(distance < 50) {
-          tilesToClean.push(child);
-        }
-      } catch(e) {
-        // Skip if position can't be determined
-      }
-    });
-  }
-  
-  // Clean up identified overlapping tiles
-  tilesToClean.forEach(tile => cleanupTileVoxels(tile));
-}
-
 /* ─────────────────────── visibility resolver ─────────────────────── */
 function applyVis(tile){
-  // Skip if not a valid tile
-  if(!tile || !tiles || !tiles.group) return;
-  
-  // Verify tile is a valid Three.js object
-  if(typeof tile.type !== 'string' || tile.visible === undefined) return;
-  
-  // Only apply to direct children of tiles.group
-  if(tile.parent !== tiles.group) return;
+  if(!tile || !tile.parent || tile.parent !== tiles.group || typeof tile.type !== 'string' || tile.visible === undefined) return;
   
   const showV = state.vox && !state.mc;
   const showM = state.vox &&  state.mc;
   const hasVoxelVersion = tile._voxMesh || tile._mcMesh;
   
-  // Hide original tile if voxel version exists and vox mode is on
+  // The visibility of the tile itself is controlled by the renderer for LOD.
+  // When in voxel mode, we hide the original tile IF a voxel version exists,
+  // letting the voxel mesh be visible instead.
   tile.visible = state.vox ? !hasVoxelVersion : true;
 
-  if(tile._voxMesh && tile._voxMesh.visible !== undefined) {
-    tile._voxMesh.visible = showV;
-  }
-  if(tile._mcMesh && tile._mcMesh.visible !== undefined) {
-    tile._mcMesh.visible = showM;
-  }
+  if(tile._voxMesh) tile._voxMesh.visible = showV;
+  if(tile._mcMesh) tile._mcMesh.visible = showM;
 }
 
 function updateVis(){
-  if(!scene || !tiles || !tiles.group) return;
+  if(!tiles || !tiles.group) return;
   
-  // Update visibility for all tiles - use children array instead of traverse to avoid errors
-  const tilesToProcess = [];
-  if(tiles.group.children) {
-    tiles.group.children.forEach(child => {
-      if(child && child.type === 'Group') {
-        tilesToProcess.push(child);
+  if (tiles.group.children) {
+    tiles.group.children.forEach(tile => {
+      if (tile && tile.type === 'Group') {
+        // If we're turning voxel mode on, and a tile is visible but
+        // not voxelized yet, build it.
+        if (state.vox && tile.visible && !tile._voxMesh && !voxelizingTiles.has(tile)) {
+          buildVoxelFor(tile);
+        }
+        // Apply the latest visibility rules to the tile and its voxel meshes.
+        applyVis(tile);
       }
     });
   }
-  
-  // Process collected tiles
-  tilesToProcess.forEach(tile => {
-    applyVis(tile);
-    
-    // If vox mode is on and tile doesn't have voxels, create them
-    if(state.vox && !tile._voxMesh && !voxelizingTiles.has(tile) && tile.visible) {
-      buildVoxelFor(tile);
-    }
-  });
-  
-  // Also update any standalone voxel meshes
-  const meshesToUpdate = [];
-  scene.children.forEach(child => {
-    if(child && child.userData && child.userData.sourceTile) {
-      meshesToUpdate.push(child);
-    }
-  });
-  
-  meshesToUpdate.forEach(mesh => {
-    const tile = mesh.userData.sourceTile;
-    if(tile) {
-      if(tile._voxMesh === mesh) {
-        mesh.visible = state.vox && !state.mc;
-      } else if(tile._mcMesh === mesh) {
-        mesh.visible = state.vox && state.mc;
-      }
-    }
-  });
 }
 
 function rebuildAll(){
-  if(!scene || !tiles || !tiles.group) return;
+  if(!tiles || !tiles.group) return;
   
-  // Clean up all voxel data - use children array to avoid traverse errors
-  const tilesToClean = [];
-  if(tiles.group.children) {
-    tiles.group.children.forEach(child => {
-      if(child && (child._voxMesh || child._mcMesh || child._tempContainer)) {
-        tilesToClean.push(child);
-      }
-    });
+  if (tiles.group.children) {
+    const tilesToClean = tiles.group.children.filter(child =>
+      child && (child._voxMesh || child._mcMesh)
+    );
+    tilesToClean.forEach(cleanupTileVoxels);
   }
   
-  // Clean up collected tiles
-  tilesToClean.forEach(tile => {
-    cleanupTileVoxels(tile);
-  });
-  
-  // Clear the tracking sets
   voxelizingTiles.clear();
   disposingTiles.clear();
   
-  // Trigger visibility update which will recreate voxels if needed
   updateVis();
 }
 
@@ -596,15 +413,10 @@ ui.onFetch=()=>{
   const root=`https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
   spawnTiles(root,key,lat,lon);
   ui.log(`🌍 streaming ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
-  
-  // If vox mode is already on, prepare for immediate voxelization
-  if(state.vox) {
-    lastVoxelUpdateTime = 0; // Reset timer to trigger immediate checks
-  }
 };
 
 /* ───────────────────────── render loop ───────────────────────────── */
-const VOXEL_UPDATE_INTERVAL = 100; // Check more frequently for smoother updates
+const VOXEL_UPDATE_INTERVAL = 100;
 
 function loop(){
   requestAnimationFrame(loop);
@@ -614,24 +426,21 @@ function loop(){
     camera.updateMatrixWorld(); 
     tiles.update();
     
-    // Periodically check for new tiles to voxelize
+    // This periodic check is a good fallback to catch any visible tiles
+    // that slipped through the event-based voxelization.
     const now = performance.now();
     if(state.vox && now - lastVoxelUpdateTime > VOXEL_UPDATE_INTERVAL) {
       lastVoxelUpdateTime = now;
       
-      // Check for tiles that need voxelization
       if(tiles.group && tiles.group.children) {
         const tilesToVoxelize = [];
-        
         tiles.group.children.forEach(tile => {
-          if(tile && tile.type === 'Group' && tile.visible && 
-             !tile._voxMesh && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
+          if (tile && tile.type === 'Group' && tile.visible && !tile._voxMesh && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
             tilesToVoxelize.push(tile);
           }
         });
         
-        // Sort by distance from camera for better prioritization
-        if(tilesToVoxelize.length > 0) {
+        if (tilesToVoxelize.length > 0) {
           const camPos = camera.position;
           tilesToVoxelize.sort((a, b) => {
             const aPos = new THREE.Vector3();
@@ -641,7 +450,6 @@ function loop(){
             return aPos.distanceToSquared(camPos) - bPos.distanceToSquared(camPos);
           });
           
-          // Voxelize up to 3 tiles at a time to avoid blocking
           tilesToVoxelize.slice(0, 3).forEach(tile => buildVoxelFor(tile));
         }
       }
