@@ -1,9 +1,17 @@
 import { defineConfig }  from 'vite'
 import { nodePolyfills } from 'vite-plugin-node-polyfills'
 import pathBrowserify    from 'path-browserify'
+import { resolve }       from 'path'
 
 export default defineConfig({
-  build: { target: 'es2020' },
+  build: { target: 'es2020',
+        rollupOptions: {
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        map:  resolve(__dirname, 'map.html')
+      }
+    }
+   },
 
   plugins: [ nodePolyfills() ],
 
@@ -16,5 +24,9 @@ export default defineConfig({
 
   optimizeDeps: {
     esbuildOptions: { target: 'es2020' }
-  }
+  },
+
+server: {
+  allowedHosts: true
+}
 })
