@@ -121,7 +121,7 @@ class WorkerVoxelizer {
 
         this.#cpuRasterize();
         this.filledVoxelCount = this.voxelTris.size;
-        const result = this.#buildMesh();
+        const result = this.#buildGreedyMeshChunks();   // NEW
         const voxelGridData = this.#getVoxelGridData();
 
         return {
@@ -342,122 +342,341 @@ class WorkerVoxelizer {
         }
     }
 
-    #buildMesh() {
-        const voxelMap = new Map();
-        const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
-        const uv0 = new THREE.Vector2(), uv1 = new THREE.Vector2(), uv2 = new THREE.Vector2();
-        const center = new THREE.Vector3(), uvp = new THREE.Vector2();
-        const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(), ep = new THREE.Vector3();
+    // Greedy meshing + chunked output (à la OptiFine/Sodium)
+    #buildGreedyMeshChunks() {
+      const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
+      const total = NX * NY * NZ;
 
-        for (const [key, triId] of this.voxelTris.entries()) {
-            const [gx, gy, gz] = key.split(',').map(Number);
-            center.set(gx + 0.5, gy + 0.5, gz + 0.5).multiplyScalar(this.voxelSize).add(this.bbox.min);
-            
-            const i0 = this.indices[triId*3], i1 = this.indices[triId*3+1], i2 = this.indices[triId*3+2];
-            v0.fromArray(this.positions, i0 * 3); v1.fromArray(this.positions, i1 * 3); v2.fromArray(this.positions, i2 * 3);
-            uv0.fromArray(this.uvs, i0 * 2); uv1.fromArray(this.uvs, i1 * 2); uv2.fromArray(this.uvs, i2 * 2);
+      // 1) Build a compact grid of palette indices (+1, 0 = empty)
+      const grid = new Uint16Array(total); // palette index + 1
+      const idx = (x,y,z) => x + NX * (y + NY * z);
+      const v = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
+      const uv0 = new THREE.Vector2(), uv1 = new THREE.Vector2(), uv2 = new THREE.Vector2();
+      const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(), ep = new THREE.Vector3();
 
-            e0.subVectors(v1, v0); e1.subVectors(v2, v0); ep.subVectors(center, v0);
-            const d00 = e0.dot(e0), d01 = e0.dot(e1), d11 = e1.dot(e1);
-            const d20 = ep.dot(e0), d21 = ep.dot(e1);
-            const denom = d00 * d11 - d01 * d01;
+      for (const [key, triId] of this.voxelTris.entries()) {
+        const [gx, gy, gz] = key.split(',').map(n => n|0);
 
-            if (Math.abs(denom) < 1e-9) continue; 
+        // sample color for voxel center using triangle triId
+        const i0 = this.indices[triId*3], i1 = this.indices[triId*3+1], i2 = this.indices[triId*3+2];
+        v .fromArray(this.positions, i0*3);
+        v1.fromArray(this.positions, i1*3);
+        v2.fromArray(this.positions, i2*3);
+        uv0.fromArray(this.uvs, i0*2);
+        uv1.fromArray(this.uvs, i1*2);
+        uv2.fromArray(this.uvs, i2*2);
 
-            const invDenom = 1.0 / denom;
-            let v_bary = (d11 * d20 - d01 * d21) * invDenom;
-            let w_bary = (d00 * d21 - d01 * d20) * invDenom;
-            let u_bary = 1.0 - v_bary - w_bary;
-            
-            if (u_bary < 0 || v_bary < 0 || w_bary < 0) {
-                const tri = new THREE.Triangle(v0, v1, v2);
-                const closestPoint = tri.closestPointToPoint(center, new THREE.Vector3());
-                ep.subVectors(closestPoint, v0);
-                const d20c = ep.dot(e0), d21c = ep.dot(e1);
-                v_bary = (d11 * d20c - d01 * d21c) * invDenom;
-                w_bary = (d00 * d21c - d01 * d20c) * invDenom;
-                u_bary = 1.0 - v_bary - w_bary;
-            }
-            uvp.set(0,0).addScaledVector(uv0, u_bary).addScaledVector(uv1, v_bary).addScaledVector(uv2, w_bary);
+        const center = new THREE.Vector3(
+          this.bbox.min.x + (gx + 0.5) * this.voxelSize,
+          this.bbox.min.y + (gy + 0.5) * this.voxelSize,
+          this.bbox.min.z + (gz + 0.5) * this.voxelSize
+        );
 
-            const mat = this.materials[this.triMats[triId]] || this.materials[0];
-            if (!mat) continue;
-
-            let col = mat.color.clone();
-            if (mat.emissive && mat.emissive.getHSL({ h: 0, s: 0, l: 0 }) > 0) col.add(mat.emissive);
-            for (const tex of allTextures(mat)) {
-                const s = getSampler(tex, this.imageDatas);
-                if (s) col.multiply(s(uvp));
-            }
-
-            let best=0, bestD=Infinity;
-            for (let c=0; c<this.paletteSize; ++c) {
-                const dr=col.r-this.palette[c*3], dg=col.g-this.palette[c*3+1], db=col.b-this.palette[c*3+2];
-                const d = dr*dr+dg*dg+db*db;
-                if (d < bestD) { bestD = d; best = c; }
-            }
-            voxelMap.set(key, { x: gx, y: gy, z: gz, r: this.palette[best*3], g: this.palette[best*3+1], b: this.palette[best*3+2] });
+        // barycentric at center (fallback to closest point)
+        e0.subVectors(v1, v);
+        e1.subVectors(v2, v);
+        ep.subVectors(center, v);
+        const d00 = e0.dot(e0), d01 = e0.dot(e1), d11 = e1.dot(e1);
+        const d20 = ep.dot(e0), d21 = ep.dot(e1);
+        const denom = d00 * d11 - d01 * d01;
+        let u_b = 0.33, v_b = 0.33, w_b = 0.34;
+        if (Math.abs(denom) > 1e-9) {
+          const inv = 1.0 / denom;
+          v_b = (d11 * d20 - d01 * d21) * inv;
+          w_b = (d00 * d21 - d01 * d20) * inv;
+          u_b = 1.0 - v_b - w_b;
+          if (u_b < 0 || v_b < 0 || w_b < 0) {
+            const tri = new THREE.Triangle(v, v1, v2);
+            const cp = tri.closestPointToPoint(center, new THREE.Vector3());
+            ep.subVectors(cp, v);
+            const d20c = ep.dot(e0), d21c = ep.dot(e1);
+            v_b = (d11 * d20c - d01 * d21c) * inv;
+            w_b = (d00 * d21c - d01 * d20c) * inv;
+            u_b = 1.0 - v_b - w_b;
+          }
         }
-        
-        this.voxelMap = voxelMap;
-        this.filledVoxelCount = voxelMap.size;
 
-        const faces = [
-            { dir: [ 1, 0, 0], v: [[1,0,0],[1,1,0],[1,1,1],[1,0,1]] }, { dir: [-1, 0, 0], v: [[0,0,0],[0,0,1],[0,1,1],[0,1,0]] },
-            { dir: [ 0, 1, 0], v: [[0,1,0],[0,1,1],[1,1,1],[1,1,0]] }, { dir: [ 0,-1, 0], v: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]] },
-            { dir: [ 0, 0, 1], v: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]] }, { dir: [ 0, 0,-1], v: [[0,0,0],[0,1,0],[1,1,0],[1,0,0]] }
-        ];
-        
-        const hasVoxel = (x, y, z) => voxelMap.has(`${x},${y},${z}`);
-        let faceCount = 0;
-        for (const voxel of voxelMap.values()) {
-            for (const face of faces) if (!hasVoxel(voxel.x+face.dir[0], voxel.y+face.dir[1], voxel.z+face.dir[2])) faceCount++;
+        const uvp = new THREE.Vector2(0,0)
+          .addScaledVector(uv0, u_b)
+          .addScaledVector(uv1, v_b)
+          .addScaledVector(uv2, w_b);
+
+        const mat = this.materials[this.triMats[triId]] || this.materials[0];
+        let col = (mat && mat.color) ? mat.color.clone() : new THREE.Color(1,1,1);
+        if (mat && mat.emissive) col.add(mat.emissive);
+        if (mat) {
+          for (const tex of allTextures(mat)) {
+            const s = getSampler(tex, this.imageDatas);
+            if (s) col.multiply(s(uvp));
+          }
         }
-        
-        const p = new Float32Array(faceCount * 12), c = new Float32Array(faceCount * 12), n = new Float32Array(faceCount * 12);
-        const ind = new Uint32Array(faceCount * 6);
-        let vOff = 0, iOff = 0, vIdx = 0;
 
-        for (const voxel of voxelMap.values()) {
-            const bx = this.bbox.min.x + voxel.x * this.voxelSize, by = this.bbox.min.y + voxel.y * this.voxelSize, bz = this.bbox.min.z + voxel.z * this.voxelSize;
-            for (const face of faces) {
-                if (!hasVoxel(voxel.x + face.dir[0], voxel.y + face.dir[1], voxel.z + face.dir[2])) {
-                    const norm = face.dir;
-                    for (const vert of face.v) {
-                        p[vOff*3+0] = bx + vert[0] * this.voxelSize; p[vOff*3+1] = by + vert[1] * this.voxelSize; p[vOff*3+2] = bz + vert[2] * this.voxelSize;
-                        c[vOff*3+0] = voxel.r; c[vOff*3+1] = voxel.g; c[vOff*3+2] = voxel.b;
-                        n[vOff*3+0] = norm[0]; n[vOff*3+1] = norm[1]; n[vOff*3+2] = norm[2];
-                        vOff++;
-                    }
-                    ind[iOff++] = vIdx; ind[iOff++] = vIdx+1; ind[iOff++] = vIdx+2;
-                    ind[iOff++] = vIdx; ind[iOff++] = vIdx+2; ind[iOff++] = vIdx+3;
-                    vIdx += 4;
+        // choose nearest palette entry
+        let best = 0, bestD = Infinity;
+        for (let c = 0; c < this.paletteSize; ++c) {
+          const dr = col.r - this.palette[c*3], dg = col.g - this.palette[c*3+1], db = col.b - this.palette[c*3+2];
+          const d2 = dr*dr + dg*dg + db*db;
+          if (d2 < bestD) { bestD = d2; best = c; }
+        }
+        grid[idx(gx,gy,gz)] = best + 1; // store +1 to distinguish 0 = empty
+      }
+
+      // 2) Greedy mesh per CHUNK (greatly reduces triangles & allows culling)
+      const CHUNK = 32;
+      const chunks = [];
+      const bx = this.bbox.min.x, by = this.bbox.min.y, bz = this.bbox.min.z;
+      const vs = this.voxelSize;
+
+      const sample = (x,y,z) => {
+        if (x < 0 || y < 0 || z < 0 || x >= NX || y >= NY || z >= NZ) return 0;
+        return grid[idx(x,y,z)];
+      };
+
+      // helper to emit a quad into arrays with correct winding
+      function pushQuad(out, p, q, r, s, nrm, colorIdx) {
+        const base = out.positions.length / 3;
+        // positions
+        out.positions.push(
+          p[0], p[1], p[2],
+          q[0], q[1], q[2],
+          r[0], r[1], r[2],
+          s[0], s[1], s[2]
+        );
+        // normals
+        out.normals.push(
+          nrm[0], nrm[1], nrm[2],
+          nrm[0], nrm[1], nrm[2],
+          nrm[0], nrm[1], nrm[2],
+          nrm[0], nrm[1], nrm[2]
+        );
+        // colors (Float32; main thread will pack to RGBA8)
+        const rC = this.palette[(colorIdx)*3+0];
+        const gC = this.palette[(colorIdx)*3+1];
+        const bC = this.palette[(colorIdx)*3+2];
+        out.colors.push(
+          rC,gC,bC, rC,gC,bC, rC,gC,bC, rC,gC,bC
+        );
+        
+        // Check winding order and emit triangles with correct CCW orientation
+        // Calculate face cross product to determine if we need to flip
+        const ax = q[0] - p[0], ay = q[1] - p[1], az = q[2] - p[2]; // edge p->q
+        const bx = r[0] - p[0], by = r[1] - p[1], bz = r[2] - p[2]; // edge p->r
+        
+        // cross = (q - p) × (r - p)
+        const cx = ay * bz - az * by;
+        const cy = az * bx - ax * bz;
+        const cz = ax * by - ay * bx;
+        
+        // dot with intended outward normal
+        const dot = cx * nrm[0] + cy * nrm[1] + cz * nrm[2];
+        
+        if (dot >= 0) {
+          // CCW already → keep original order
+          out.indices.push(base+0, base+1, base+2, base+0, base+2, base+3);
+        } else {
+          // flip winding to make CCW
+          out.indices.push(base+0, base+2, base+1, base+0, base+3, base+2);
+        }
+      }
+
+      // Run greedy meshing within a chunk
+      const meshChunk = (cx0, cx1, cy0, cy1, cz0, cz1) => {
+        const out = { positions: [], colors: [], normals: [], indices: [] };
+        // mask buffer for merging faces on each slice
+        const mask = [];
+
+        // axis loop: 0=X,1=Y,2=Z (like Mikola Lysenko's algorithm)
+        for (let d = 0; d < 3; d++) {
+          const u = (d + 1) % 3;
+          const v = (d + 2) % 3;
+
+          const r0 = [cx0, cy0, cz0];
+          const r1 = [cx1, cy1, cz1];
+
+          const minD = (d===0?cx0:(d===1?cy0:cz0));
+          const maxD = (d===0?cx1:(d===1?cy1:cz1));
+
+          const minU = (u===0?cx0:(u===1?cy0:cz0));
+          const maxU = (u===0?cx1:(u===1?cy1:cz1));
+
+          const minV = (v===0?cx0:(v===1?cy0:cz0));
+          const maxV = (v===0?cx1:(v===1?cy1:cz1));
+
+          for (let x = minD; x <= maxD; x++) { // note <= because we compare between x-1 and x
+            const nu = (maxU - minU);
+            const nv = (maxV - minV);
+            if (nu === 0 || nv === 0) continue;
+
+            // build the face mask
+            let n = 0;
+            for (let j = minV; j < maxV; j++) {
+              for (let i = minU; i < maxU; i++) {
+                // get voxel on both sides of the plane
+                const a = (d===0) ? sample(x-1, i, j)
+                          : (d===1) ? sample(i, x-1, j)
+                                    : sample(i, j, x-1);
+                const b = (d===0) ? sample(x, i, j)
+                          : (d===1) ? sample(i, x, j)
+                                    : sample(i, j, x);
+                let id = 0;
+                if ((a !== 0) !== (b !== 0)) {
+                  // sign encodes which side is solid; magnitude encodes color id
+                  id = (b !== 0 ? +1 : -1) * (b !== 0 ? b : a);
                 }
+                mask[n++] = id;
+              }
             }
+
+            // greedy merge rectangles in mask
+            n = 0;
+            for (let j = 0; j < nv; j++) {
+              for (let i = 0; i < nu; ) {
+                const c = mask[n];
+                if (c) {
+                  // compute width
+                  let w = 1;
+                  while (i + w < nu && mask[n + w] === c) w++;
+
+                  // compute height
+                  let h = 1, k;
+                  outer: for (; j + h < nv; h++) {
+                    for (k = 0; k < w; k++) {
+                      if (mask[n + k + h * nu] !== c) break outer;
+                    }
+                  }
+
+                  // emit quad for rectangle (i..i+w-1, j..j+h-1)
+                  const side = Math.sign(c);            // +1 or -1
+                  const colId = Math.abs(c) - 1;       // palette index
+
+                  // corners in voxel grid coords
+                  const xPlane = x;                     // face lies on plane 'x' (between x-1 and x)
+                  const iu0 = minU + i, iu1 = iu0 + w;
+                  const iv0 = minV + j, iv1 = iv0 + h;
+
+                  // build 4 corners in [x,y,z] integer space
+                  let p = [0,0,0], q = [0,0,0], r = [0,0,0], s = [0,0,0];
+                  if (d === 0) { // X
+                    p = [xPlane, iu0, iv0]; q = [xPlane, iu1, iv0];
+                    r = [xPlane, iu1, iv1]; s = [xPlane, iu0, iv1];
+                  } else if (d === 1) { // Y
+                    p = [iu0, xPlane, iv0]; q = [iu1, xPlane, iv0];
+                    r = [iu1, xPlane, iv1]; s = [iu0, xPlane, iv1];
+                  } else { // Z
+                    p = [iu0, iv0, xPlane]; q = [iu1, iv0, xPlane];
+                    r = [iu1, iv1, xPlane]; s = [iu0, iv1, xPlane];
+                  }
+
+                  // scale to world space
+                  const P = [bx + p[0]*vs, by + p[1]*vs, bz + p[2]*vs];
+                  const Q = [bx + q[0]*vs, by + q[1]*vs, bz + q[2]*vs];
+                  const R = [bx + r[0]*vs, by + r[1]*vs, bz + r[2]*vs];
+                  const S = [bx + s[0]*vs, by + s[1]*vs, bz + s[2]*vs];
+
+                  // normals & winding (so they point outward from solid)
+                  let nrm = [0,0,0];
+                  if (d === 0) { nrm = [ -side, 0, 0]; }  // outward = opposite of solid side
+                  if (d === 1) { nrm = [ 0, -side, 0]; }
+                  if (d === 2) { nrm = [ 0, 0, -side]; }
+
+                  // Always emit in consistent order - pushQuad will handle winding correction
+                  pushQuad.call(this, out, P,Q,R,S, nrm, colId);
+
+                  // zero out the mask we just consumed
+                  for (let jj = 0; jj < h; jj++) {
+                    for (let ii = 0; ii < w; ii++) {
+                      mask[n + ii + jj * nu] = 0;
+                    }
+                  }
+                  i += w; n += w;
+                } else {
+                  i++; n++;
+                }
+              }
+            } // end sweep over mask rows
+          } // end sweep along axis d
+        } // end axis loop
+
+        // pack to typed arrays
+        const positions = new Float32Array(out.positions);
+        const colors    = new Float32Array(out.colors);
+        const normals   = new Float32Array(out.normals);
+        const indices   = positions.length/3 > 65535 ? new Uint32Array(out.indices) : new Uint16Array(out.indices);
+
+        // chunk bounds in world space (for frustum culling on the main thread)
+        const bounds = {
+          min: [bx + cx0*vs, by + cy0*vs, bz + cz0*vs],
+          max: [bx + cx1*vs, by + cy1*vs, bz + cz1*vs],
+        };
+
+        return { positions, colors, normals, indices, bounds };
+      };
+
+      // iterate chunks
+      const geometries = [];
+      for (let z0 = 0; z0 < NZ; z0 += CHUNK) {
+        for (let y0 = 0; y0 < NY; y0 += CHUNK) {
+          for (let x0 = 0; x0 < NX; x0 += CHUNK) {
+            const x1 = Math.min(NX, x0 + CHUNK);
+            const y1 = Math.min(NY, y0 + CHUNK);
+            const z1 = Math.min(NZ, z0 + CHUNK);
+
+            const g = meshChunk(x0, x1, y0, y1, z0, z1);
+            if (g.indices.length) geometries.push(g);
+          }
         }
-        return { geometries: [{ positions: p, colors: c, normals: n, indices: ind }] };
+      }
+
+      // store palette grid for export (keep reference for voxel grid data)
+      this.gridPalette = grid;
+      return { geometries };
     }
     
     #getVoxelGridData() {
-        if (!this.voxelMap) return null;
-        const { x: NX, y: NY, z: NZ } = this.grid;
+        const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const tot = NX * NY * NZ;
         const voxelColors = new Float32Array(tot * 4);
         const voxelCounts = new Uint32Array(tot);
-        const idxXYZ = (x,y,z) => x + NX * (y + NY * z);
 
-        for (const [key, voxel] of this.voxelMap.entries()) {
-            const i = idxXYZ(voxel.x, voxel.y, voxel.z);
-            voxelCounts[i] = 1;
-            voxelColors[i * 4 + 0] = voxel.r;
-            voxelColors[i * 4 + 1] = voxel.g;
-            voxelColors[i * 4 + 2] = voxel.b;
-            voxelColors[i * 4 + 3] = 1.0;
+        if (this.gridPalette) {
+            // Export from palette grid (greedy meshing path)
+            const pal = this.palette; // Float32Array [r,g,b]*K
+            for (let i = 0; i < tot; i++) {
+                const idxp = this.gridPalette[i]; // 0 = empty, >0 = paletteIndex+1
+                if (idxp) {
+                    const c = (idxp - 1) * 3;
+                    voxelCounts[i] = 1;
+                    voxelColors[i*4 + 0] = pal[c + 0];
+                    voxelColors[i*4 + 1] = pal[c + 1];
+                    voxelColors[i*4 + 2] = pal[c + 2];
+                    voxelColors[i*4 + 3] = 1.0;
+                }
+            }
+        } else if (this.voxelMap) {
+            // Fallback (pre-greedy path)
+            const idxXYZ = (x,y,z) => x + NX * (y + NY * z);
+            for (const [key, voxel] of this.voxelMap.entries()) {
+                const [x,y,z] = key.split(',').map(Number);
+                const i = idxXYZ(x,y,z);
+                voxelCounts[i] = 1;
+                voxelColors[i * 4 + 0] = voxel.r;
+                voxelColors[i * 4 + 1] = voxel.g;
+                voxelColors[i * 4 + 2] = voxel.b;
+                voxelColors[i * 4 + 3] = 1.0;
+            }
+        } else {
+            // Nothing to export
+            return null;
         }
+
         return {
             gridSize: { x: NX, y: NY, z: NZ },
             unit: { x: this.voxelSize, y: this.voxelSize, z: this.voxelSize },
-            bbox: { min: this.bbox.min, max: this.bbox.max },
+            // IMPORTANT: send arrays, not Vector3 objects
+            bbox: { 
+                min: [this.bbox.min.x, this.bbox.min.y, this.bbox.min.z],
+                max: [this.bbox.max.x, this.bbox.max.y, this.bbox.max.z] 
+            },
             voxelColors: voxelColors,
             voxelCounts: voxelCounts
         };
@@ -481,10 +700,11 @@ self.onmessage = async (event) => {
         const voxelizer = new WorkerVoxelizer();
         const result = await voxelizer.init({ modelData, voxelSize });
         
-        const transferList = [
-            result.voxelGrid.voxelColors.buffer,
-            result.voxelGrid.voxelCounts.buffer,
-        ];
+        const transferList = [];
+        if (result.voxelGrid) {
+            if (result.voxelGrid.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);
+            if (result.voxelGrid.voxelCounts) transferList.push(result.voxelGrid.voxelCounts.buffer);
+        }
         result.geometries.forEach(g => {
             transferList.push(g.positions.buffer, g.colors.buffer, g.normals.buffer, g.indices.buffer);
         });
