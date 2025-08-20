@@ -124,15 +124,40 @@ export function voxelizeModel({ model, resolution = 200 }) {
         return reject(new Error(message));
       }
 
-      /* rebuild THREE geometries */
+      /* rebuild THREE geometries with chunk bounds for frustum culling */
       const group = new THREE.Group();
       for (const g of result.geometries) {
         const geom = new THREE.BufferGeometry();
         geom.setAttribute('position', new THREE.BufferAttribute(g.positions, 3));
-        geom.setAttribute('color',    new THREE.BufferAttribute(g.colors,    3));
-        geom.setAttribute('normal',   new THREE.BufferAttribute(g.normals,   3));
+        
+        // NEW: RGBA8 (4 bytes) -> arrayStride = 4 (legal on WebGPU)
+        const vertCount = g.colors.length / 3;
+        const c8 = new Uint8Array(vertCount * 4);
+        for (let v = 0; v < vertCount; v++) {
+          const r = Math.max(0, Math.min(255, (g.colors[v*3+0] * 255) | 0));
+          const gC= Math.max(0, Math.min(255, (g.colors[v*3+1] * 255) | 0));
+          const b = Math.max(0, Math.min(255, (g.colors[v*3+2] * 255) | 0));
+          c8[v*4+0] = r; c8[v*4+1] = gC; c8[v*4+2] = b; c8[v*4+3] = 255; // alpha pad
+        }
+        geom.setAttribute('color', new THREE.BufferAttribute(c8, 4, true));
+        
+        // normals are required by the WebGPU pipeline three builds for MeshBasicMaterial
+        geom.setAttribute('normal', new THREE.BufferAttribute(g.normals, 3));
+        
         geom.setIndex      (new THREE.BufferAttribute(g.indices, 1));
-        group.add(new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors:true })));
+        geom.computeBoundingSphere();
+        
+        const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors:true }));
+        
+        // Store chunk bounds for frustum culling (if available from greedy meshing)
+        if (g.bounds) {
+          mesh.userData.chunkBounds = {
+            min: new THREE.Vector3(g.bounds.min[0], g.bounds.min[1], g.bounds.min[2]),
+            max: new THREE.Vector3(g.bounds.max[0], g.bounds.max[1], g.bounds.max[2])
+          };
+        }
+        
+        group.add(mesh);
       }
 
       resolve({

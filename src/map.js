@@ -57,14 +57,18 @@ const ui=new HUD();
 
 /* ───────────────────────────────  Three.js set-up ─────────────────── */
 let scene,camera,controls,renderer,tiles=null;
+let isInteracting = false;
 
-(async()=>{
-  if('gpu' in navigator){
-    renderer=new WebGPURenderer({antialias:true});       // WebGPU first
-    await renderer.init();
-  }else{
-    renderer=new THREE.WebGLRenderer({antialias:true});
-  }
+/* ─────────────────────────────────── GUI & state ──────────────────── */
+const state={resolution:64, vox:false, mc:false};
+let lastVoxelUpdateTime = 0;
+
+(() => {
+  // Stable, zero-stutter baseline: WebGL. Re-enable WebGPU later if desired.
+  renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    powerPreference: 'high-performance'
+  });
   document.body.appendChild(renderer.domElement);
 
   scene=new THREE.Scene();
@@ -74,6 +78,16 @@ let scene,camera,controls,renderer,tiles=null;
   camera=new THREE.PerspectiveCamera(60,1,100,1_600_000);
   controls=new OrbitControls(camera,renderer.domElement);
   controls.enableDamping=true; controls.maxDistance=3e4;
+
+  controls.addEventListener('start', () => {
+    isInteracting = true;
+    // Keep consistent LOD while moving - voxel caching handles performance now
+  });
+  
+  controls.addEventListener('end', () => {
+    isInteracting = false;
+    // No need to restore errorTarget since we don't change it
+  });
 
   window.addEventListener('resize',resize); resize();
 
@@ -85,7 +99,7 @@ function resize(){
   const w=innerWidth,h=innerHeight;
   camera.aspect=w/h; camera.updateProjectionMatrix();
   renderer.setSize(w,h);
-  renderer.setPixelRatio?.(devicePixelRatio);
+  renderer.setPixelRatio(Math.min(1.25, window.devicePixelRatio));
 }
 
 /* ───────────────────────────── TilesRenderer factory ──────────────── */
@@ -110,8 +124,11 @@ function spawnTiles(root,key,latDeg,lonDeg){
     return url.toString();
   };
 
-  tiles.setLatLonToYUp(latDeg*THREE.MathUtils.DEG2RAD,
-                       lonDeg*THREE.MathUtils.DEG2RAD);
+  // Simple & reliable: use the (deprecated) method on TilesRenderer for now
+  tiles.setLatLonToYUp(
+    latDeg * THREE.MathUtils.DEG2RAD,
+    lonDeg * THREE.MathUtils.DEG2RAD
+  );
   tiles.errorTarget=ui.getSSE();
   tiles.setCamera(camera);
   tiles.setResolutionFromRenderer(camera,renderer);
@@ -144,13 +161,16 @@ function spawnTiles(root,key,latDeg,lonDeg){
 
     if (visible) {
       // If voxel mode is on and this tile becomes visible, build its voxel mesh.
-      if(state.vox && !tileGroup._voxMesh && !voxelizingTiles.has(tileGroup)) {
+      if (state.vox && !isInteracting && 
+          !tileGroup._voxMesh && !tileGroup._mcMesh &&
+          !voxelizingTiles.has(tileGroup) && !disposingTiles.has(tileGroup)) {
         buildVoxelFor(tileGroup);
       }
     } else {
-      // If the tile becomes invisible, it's likely replaced by children (higher LOD)
-      // or the camera moved away. We must clean up our custom voxel meshes.
-      cleanupTileVoxels(tileGroup);
+      // Just hide voxels when tile becomes invisible - keep them cached for instant return
+      // Only dispose in onTileDispose when the tile is actually removed from cache
+      if (tileGroup._voxMesh) tileGroup._voxMesh.visible = false;
+      if (tileGroup._mcMesh) tileGroup._mcMesh.visible = false;
     }
     // After any change, re-evaluate what should be visible (original vs. voxel).
     applyVis(tileGroup);
@@ -158,10 +178,6 @@ function spawnTiles(root,key,latDeg,lonDeg){
   
   scene.add(tiles.group);
 }
-
-/* ─────────────────────────────────── GUI & state ──────────────────── */
-const state={resolution:64, vox:false, mc:false};
-let lastVoxelUpdateTime = 0;
 
 function buildGUI(){
   const g=new GUI({width:260});
@@ -230,13 +246,44 @@ function dispose(o){
 const voxelizingTiles = new Set();
 const disposingTiles = new Set();
 
+// --- New: distance-aware resolution & concurrency budget ---
+const MAX_CONCURRENT_VOXELIZERS = 1;     // was effectively 3; lower = calmer UI
+const TARGET_PX_PER_VOXEL       = 3;     // tweak to taste (2..4 is a good band)
+
+function screenRadiusForObject(obj) {
+  // estimate object radius in world units
+  const box = new THREE.Box3().setFromObject(obj);
+  const sphere = new THREE.Sphere();
+  box.getBoundingSphere(sphere);
+
+  const dist = camera.position.distanceTo(sphere.center);
+  const vFov = THREE.MathUtils.degToRad(camera.fov);
+  const pxPerUnit = renderer.domElement.height / (2 * Math.tan(vFov / 2));
+  return (sphere.radius * pxPerUnit) / Math.max(1e-3, dist); // pixels
+}
+
+function resolutionForTile(tile) {
+  const pxRadius = screenRadiusForObject(tile);
+  // translate pixels → voxels; clamp to GUI slider as an upper bound
+  const r = Math.round(pxRadius / TARGET_PX_PER_VOXEL);
+  return THREE.MathUtils.clamp(r, 8, state.resolution);
+}
+
 async function buildVoxelFor(tile){
-  if(!tile || tile._voxMesh || voxelizingTiles.has(tile) || disposingTiles.has(tile) || !tile.visible) return;
+  if(!tile || tile._voxMesh || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile) || !tile.visible) return;
   if(!tile.parent || tile.parent !== tiles.group) return;
   
   let hasMeshes = false;
   tile.traverse(n => { if(n.isMesh && n.geometry) hasMeshes = true; });
   if(!hasMeshes) return;
+  
+  // Skip giant parent tiles when we're close (they'll refine into children)
+  const s = new THREE.Sphere();
+  tile.getWorldPosition(s.center);
+  tile.getWorldScale(s);           // crude scale proxy
+  const approxRadius = tile.boundingSphere?.radius || Math.max(s.x, s.y, s.z) * 50;
+  const dist2 = camera.position.distanceToSquared(s.center);
+  if (approxRadius * approxRadius > dist2 * 0.6) return;
   
   voxelizingTiles.add(tile);
   try{
@@ -249,7 +296,8 @@ async function buildVoxelFor(tile){
     clone.scale.set(1, 1, 1);
     tempContainer.add(clone);
     
-    const vox = await voxelizeModel({ model: tempContainer, renderer, scene, resolution: state.resolution });
+    const perTileResolution = resolutionForTile(tile);
+    const vox = await voxelizeModel({ model: tempContainer, renderer, scene, resolution: perTileResolution });
     
     if(!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
       dispose(vox.voxelMesh);
@@ -270,6 +318,7 @@ async function buildVoxelFor(tile){
     applyVis(tile);
   }catch(e){ 
     console.warn('voxelise failed',e);
+    tile._voxError = true; // prevent infinite retry spam this session
   } finally {
     voxelizingTiles.delete(tile);
   }
@@ -316,9 +365,9 @@ function onTileLoad({scene:tile}){
   applyVis(tile);
   
   // Automatically voxelize if vox mode is on.
-  if(state.vox && tile.visible && !tile._voxMesh && !voxelizingTiles.has(tile)) {
+  if(state.vox && !isInteracting && tile.visible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
     requestAnimationFrame(() => {
-      if(tile.parent && tile.visible && !tile._voxMesh && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
+      if(!isInteracting && tile.parent && tile.visible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
         buildVoxelFor(tile);
       }
     });
@@ -349,6 +398,7 @@ function cleanupTileVoxels(tile){
     delete tile._mcMesh;
     delete tile._voxelizer;
     delete tile._tempContainer;
+    delete tile._voxError;  // allow retry after cleanup
   } finally {
     disposingTiles.delete(tile);
   }
@@ -358,14 +408,17 @@ function cleanupTileVoxels(tile){
 function applyVis(tile){
   if(!tile || !tile.parent || tile.parent !== tiles.group || typeof tile.type !== 'string' || tile.visible === undefined) return;
   
+  // Note: We no longer hide voxels during interaction - they stay visible for smoother experience
+  // Only new voxelization builds are paused during interaction
+
   const showV = state.vox && !state.mc;
   const showM = state.vox &&  state.mc;
+  const building = voxelizingTiles.has(tile);
   const hasVoxelVersion = tile._voxMesh || tile._mcMesh;
-  
   // The visibility of the tile itself is controlled by the renderer for LOD.
   // When in voxel mode, we hide the original tile IF a voxel version exists,
   // letting the voxel mesh be visible instead.
-  tile.visible = state.vox ? !hasVoxelVersion : true;
+  tile.visible = state.vox ? (building || !hasVoxelVersion) : true;
 
   if(tile._voxMesh) tile._voxMesh.visible = showV;
   if(tile._mcMesh) tile._mcMesh.visible = showM;
@@ -379,7 +432,7 @@ function updateVis(){
       if (tile && tile.type === 'Group') {
         // If we're turning voxel mode on, and a tile is visible but
         // not voxelized yet, build it.
-        if (state.vox && tile.visible && !tile._voxMesh && !voxelizingTiles.has(tile)) {
+        if (state.vox && tile.visible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
           buildVoxelFor(tile);
         }
         // Apply the latest visibility rules to the tile and its voxel meshes.
@@ -416,7 +469,7 @@ ui.onFetch=()=>{
 };
 
 /* ───────────────────────── render loop ───────────────────────────── */
-const VOXEL_UPDATE_INTERVAL = 100;
+const VOXEL_UPDATE_INTERVAL = 300;
 
 function loop(){
   requestAnimationFrame(loop);
@@ -429,13 +482,13 @@ function loop(){
     // This periodic check is a good fallback to catch any visible tiles
     // that slipped through the event-based voxelization.
     const now = performance.now();
-    if(state.vox && now - lastVoxelUpdateTime > VOXEL_UPDATE_INTERVAL) {
+    if(state.vox && !isInteracting && now - lastVoxelUpdateTime > VOXEL_UPDATE_INTERVAL) {
       lastVoxelUpdateTime = now;
       
       if(tiles.group && tiles.group.children) {
         const tilesToVoxelize = [];
         tiles.group.children.forEach(tile => {
-          if (tile && tile.type === 'Group' && tile.visible && !tile._voxMesh && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
+          if (tile && tile.type === 'Group' && tile.visible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
             tilesToVoxelize.push(tile);
           }
         });
@@ -450,7 +503,8 @@ function loop(){
             return aPos.distanceToSquared(camPos) - bPos.distanceToSquared(camPos);
           });
           
-          tilesToVoxelize.slice(0, 3).forEach(tile => buildVoxelFor(tile));
+          const budget = Math.max(0, MAX_CONCURRENT_VOXELIZERS - voxelizingTiles.size);
+          tilesToVoxelize.slice(0, budget).forEach(tile => buildVoxelFor(tile));
         }
       }
     }
