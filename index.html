@@ -1,69 +1,173 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="stylesheet" type="text/css" href="//fonts.googleapis.com/css?family=Quicksand" />
-    <link rel="stylesheet" type="text/css" href="./style.css">
-     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-     integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-     crossorigin=""/>
-      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-     crossorigin=""></script>
-    <title>Google Earth as glTF</title>
-    
-  </head>
-  <body>
-    <div id="settings">
-      <div id="centered-container">
-        <label>Google API Key</label>
-        <input id="google-api-key" type="text"/>
+<head>
+  <meta charset="utf-8" />
+  <title>World-Voxel Map</title>
 
-        <label>Lat,Lng</label>
-        <input id="lat-lng" type="text" value="40.6891,-74.0446"/>
+  <!-- Tailwind + Inter + Material Symbols -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Material+Symbols+Rounded:wght@300&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['Inter','system-ui','sans-serif'] } } }
+    }
+  </script>
 
-        <label>Screen space error</label>
-        <input type="number" value="8" id="sse">
+  <style>
+    html,body { margin:0; height:100%; overflow:hidden; background:#0b0e11 }
+    canvas { position:fixed; inset:0 }
+    .glass { backdrop-filter: blur(14px); background: rgba(21,24,28,.55) }
+    .elev { box-shadow: 0 10px 30px rgba(0,0,0,.28), 0 1px 0 rgba(255,255,255,.04) }
+    .material-symbols-rounded { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24 }
+    .material-bold { font-variation-settings: 'FILL' 0, 'wght' 600, 'GRAD' 0, 'opsz' 24 }
+    .scrollbar-hide { scrollbar-width: none; -ms-overflow-style: none; }
+    .scrollbar-hide::-webkit-scrollbar { display: none; }
+    .composer { max-width:min(820px, 92vw) }
+  </style>
+</head>
+<body class="text-white font-sans selection:bg-white/20">
 
-        <label>Zoom: <span id="zoom">16</span></label>
+  <!-- Settings menu popup -->
+  <div id="settings-menu" class="hidden fixed bottom-[80px] left-4 z-50">
+    <div class="glass elev rounded-2xl p-4 w-[320px] max-w-[90vw] space-y-4">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
+          <span class="material-symbols-rounded">tune</span> Options
+        </div>
+        <button id="menu-close" class="w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
+          <span class="material-symbols-rounded text-lg">close</span>
+        </button>
+      </div>
 
-        <div id="map-container">
-          <div id="map"></div>
+      <div class="space-y-4">
+        <div>
+          <div class="text-sm font-medium opacity-80 mb-2">Voxels</div>
+          <label class="inline-flex items-center cursor-pointer">
+            <div class="relative">
+              <input id="toggle-vox" type="checkbox" class="sr-only peer" checked>
+              <div class="w-11 h-6 bg-white/10 peer-checked:bg-blue-500/80 rounded-full relative transition"></div>
+              <div class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5"></div>
+            </div>
+            <span class="ml-3 text-sm opacity-85">Show voxels (default on)</span>
+          </label>
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between">
+            <div class="text-sm font-medium opacity-80">Minecraft textures</div>
+            <label class="inline-flex items-center cursor-pointer">
+              <div class="relative">
+                <input id="toggle-mc" type="checkbox" class="sr-only peer" disabled>
+                <div class="w-11 h-6 bg-white/10 peer-checked:bg-green-500/80 peer-disabled:opacity-50 rounded-full relative transition"></div>
+                <div class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5"></div>
+              </div>
+            </label>
+          </div>
+          <div class="text-xs opacity-60 mt-1">Enable after voxels are on.</div>
+        </div>
+
+        <div>
+          <div class="text-sm font-medium opacity-80 mb-2">Voxel resolution</div>
+          <div class="grid grid-cols-4 gap-1 bg-white/5 rounded-xl p-1">
+            <button class="res-pill rounded-lg py-1.5 text-sm opacity-80 hover:bg-white/10" data-res="32">Low</button>
+            <button class="res-pill rounded-lg py-1.5 text-sm opacity-80 hover:bg-white/10" data-res="64">Med</button>
+            <button class="res-pill rounded-lg py-1.5 text-sm opacity-80 hover:bg-white/10" data-res="128">High</button>
+            <button class="res-pill rounded-lg py-1.5 text-sm opacity-80 hover:bg-white/10" data-res="256">Ultra</button>
+          </div>
+          <input id="res-fine" type="range" min="8" max="512" value="64" class="w-full accent-white/80 mt-2">
+          <div class="text-xs opacity-60 -mt-1">Drag to fine-tune</div>
+        </div>
+
+        <div>
+          <div class="flex items-center gap-2 text-sm font-semibold opacity-90 mb-2">
+            <span class="material-symbols-rounded">key</span> API Key
+          </div>
+          <div class="relative">
+            <input id="google-api-key" class="w-full rounded-xl bg-white/10 px-3 py-2 pr-16 outline-none"
+                   placeholder="Google Photoreal Tiles API key"/>
+            <button id="save-settings" class="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg bg-white/10 hover:bg-white/20 px-3 py-1 text-xs">Save</button>
+          </div>
+          <div class="text-[11px] opacity-60 leading-4 mt-1">Stored locally in this browser.</div>
         </div>
       </div>
-      <button id="fetch">Fetch tiles</button>
-      <div id="debug-slider-container">
-        <label>Tile debug slider (<span id="tile-count"></span>)</label>
-        <input id="debug-slider" type="range" min="-1" max="100" value="100">
+    </div>
+  </div>
+
+  <!-- Suggestions (like ChatGPT prompt suggestions) -->
+  <div id="suggestions"
+       class="pointer-events-none fixed inset-x-0 bottom-[100px] flex justify-center z-30">
+    <div class="pointer-events-auto composer glass elev rounded-2xl px-3 py-2 flex flex-nowrap gap-1 overflow-x-auto scrollbar-hide">
+      <!-- Filled by JS -->
+    </div>
+  </div>
+
+  <!-- Search results popup -->
+  <div id="search-results" class="hidden fixed inset-x-0 bottom-[100px] flex justify-center z-50">
+    <div class="composer glass elev rounded-2xl overflow-hidden divide-y divide-white/5"></div>
+  </div>
+
+  <!-- Bottom composer bar -->
+  <footer class="pointer-events-none fixed left-0 right-0 bottom-0 z-40">
+    <div class="pointer-events-auto composer mx-auto px-3 pb-4">
+      <div class="glass elev rounded-2xl px-3 py-2.5 flex items-center gap-2">
+        <button id="composer-plus" class="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors" title="Options">
+          <span class="material-symbols-rounded material-bold text-lg">add</span>
+        </button>
+        <input id="place-search" class="flex-1 bg-transparent outline-none text-[15px] placeholder-white/60"
+               placeholder="Search places (e.g., Eiffel Tower) or paste 'lat,lon'"/>
+        <button id="composer-send" class="w-9 h-9 rounded-full flex items-center justify-center bg-white/5 text-white/40 cursor-not-allowed transition-all" title="Go" disabled>
+          <span class="material-symbols-rounded material-bold text-lg">arrow_upward</span>
+        </button>
       </div>
-      <pre id="fetch-log" class="log"></pre>
-      <button id="download">Download combined glTF</button>
-
-      <br/><br/><a href="https://github.com/OmarShehata/google-earth-as-gltf#google-earth-as-gltf-models" target="_blank" class="settings-link">About</a><br/><br/>
+      <div id="composer-hint" class="text-center text-[11px] opacity-60 mt-2">
+        © Google Earth imagery
+      </div>
     </div>
+  </footer>
 
-    <div id="instructions">
-      <center>
-        <p>
-          This app demonstrates fetching & rendering Google Earth 3D Tiles in ThreeJS
-        </p>
-      </center>
-      <ol>
-        <li>Get a <a href="https://developers.google.com/maps/documentation/tile/get-api-key" target="_blank">Google "Map Tiles"</a> API key </li>
-        <li>
-          Paste it in the settings top left 
-        </li>
-        <li>
-          Click <span id="fetch-tiles-instruction-text">fetch tiles</span>
-        </li>
-      </ol>
-      <center>
-        <p><a href="https://github.com/OmarShehata/google-earth-as-gltf#google-earth-as-gltf-models" target="_blank">Learn more</a> </p>
-      </center>
+  <!-- Status chip (very bottom right) -->
+  <div id="status-chip"
+       class="fixed right-4 bottom-2 glass elev rounded-full px-3 py-1.5 text-xs opacity-80 z-30 pointer-events-none">
+    Ready
+  </div>
+
+  <!-- Hidden compat fields expected by map.js -->
+  <input id="lat-lng" type="hidden" value="37.7749,-122.4194">
+  <input id="sse" type="hidden" value="20">
+  <button id="fetch" class="hidden"></button>
+  <pre id="fetch-log" class="hidden"></pre>
+  <button id="download" class="hidden"></button>
+
+  <script type="module" src="/src/map.js"></script>
+</body>
+</html>
+
+  <!-- Settings drawer -->
+  <div id="settings" class="hidden fixed top-[120px] right-4 z-30 w-[360px]">
+    <div class="glass rounded-2xl elev-3 p-4 space-y-3">
+      <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
+        <span class="material-symbols-rounded">key</span> API Settings
+      </div>
+      <label class="text-xs opacity-70">Google Photoreal Tiles API Key</label>
+      <input id="google-api-key" class="w-full rounded-xl bg-white/10 px-3 py-2 outline-none"
+             placeholder="Paste your Google API key"/>
+      <div class="flex gap-2">
+        <button id="save-settings" class="rounded-xl bg-white/10 hover:bg-white/20 px-3 py-2 text-sm">Save</button>
+        <button id="close-settings" class="rounded-xl bg-white/10 hover:bg-white/20 px-3 py-2 text-sm">Close</button>
+      </div>
+      <div class="text-[11px] opacity-60 leading-4">Stored locally in this browser.</div>
     </div>
+  </div>
 
-    <script type="module" src="/src/index.js"></script>
+  <!-- Hidden compatibility elements expected by map.js -->
+  <input id="lat-lng" type="hidden" value="37.7749,-122.4194">
+  <input id="sse" type="hidden" value="20">
+  <button id="fetch" class="hidden"></button>
+  <pre id="fetch-log" class="hidden"></pre>
+  <button id="download" class="hidden"></button>
 
-  </body>
+  <script type="module" src="/src/map.js"></script>
+</body>
 </html>

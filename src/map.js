@@ -16,51 +16,411 @@ import { voxelizeModel              } from './voxelize-model.js';
 import { initBlockData,
          assignVoxelsToBlocks       } from './assignToBlocksForGLB.js';
 
-import { GUI                        } from 'three/addons/libs/lil-gui.module.min.js';
-
-/* ───────────────────────────────── HUD + mini-map ────────────────── */
+/* ─────────────────────────── ChatGPT-style HUD ───────────────────────── */
 class HUD {
   constructor() {
-    this.key   = document.querySelector('#google-api-key');
-    this.coords= document.querySelector('#lat-lng');
-    this.sse   = document.querySelector('#sse');
-    this.logEl = document.querySelector('#fetch-log');
-    this.fetch = document.querySelector('#fetch');
+    // Debug: check what elements we can find
+    console.log('DOM ready state:', document.readyState);
+    console.log('Body children:', document.body?.children?.length);
+    
+    // Settings menu popup
+    const menu         = document.querySelector('#settings-menu');
+    const composerPlus = document.querySelector('#composer-plus');
+    const closeMenu    = document.querySelector('#menu-close');
 
-    this.key.value    = localStorage.getItem('token')  ?? '';
-    this.coords.value = localStorage.getItem('coords') ?? '37.7749,-122.4194';
+    console.log('Elements found:', { menu: !!menu, composerPlus: !!composerPlus, closeMenu: !!closeMenu });
 
-    const mb =
-      'REMOVED';
-    this.map = L.map('map',{zoomControl:false})
-                .setView(this.coords.value.split(',').map(Number),15);
-    L.tileLayer(
-      `https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/256/{z}/{x}/{y}?access_token=${mb}`,
-      {maxZoom:19}
-    ).addTo(this.map);
+    if (!menu || !composerPlus || !closeMenu) {
+      console.error('Missing menu elements:', { menu, composerPlus, closeMenu });
+      // Let's try to continue without menu functionality
+      this._initializeBasicElements();
+      return;
+    }
 
-    this.map.on('moveend',()=>{
-      const c=this.map.getCenter();
-      this.coords.value=`${c.lat.toFixed(4)},${c.lng.toFixed(4)}`;
-      localStorage.setItem('coords',this.coords.value);
+    const openMenu   = () => { 
+      console.log('Opening menu');
+      menu.classList.remove('hidden'); 
+    };
+    const hideMenu   = () => { 
+      console.log('Closing menu');
+      menu.classList.add('hidden'); 
+    };
+    
+    // Add event listeners with proper event handling
+    composerPlus.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      console.log('Plus button clicked');
+      if (menu.classList.contains('hidden')) {
+        openMenu();
+      } else {
+        hideMenu();
+      }
+    });
+    
+    closeMenu.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      hideMenu();
     });
 
-    this.key.onchange  =()=>localStorage.setItem('token',this.key.value);
-    this.fetch.onclick =()=>this.onFetch?.();
+    // Close menu when clicking outside (but not on the plus button)
+    document.addEventListener('click', (e) => {
+      if (!menu.contains(e.target) && e.target !== composerPlus && !composerPlus.contains(e.target)) {
+        hideMenu();
+      }
+    });
+
+    // Prevent menu from closing when interacting with form elements inside
+    menu.addEventListener('click', (e) => {
+      e.stopPropagation();
+    });
+
+    this._initializeBasicElements();
   }
-  getKey()       {return this.key.value.trim();}
-  getSSE()       {return +this.sse.value;}
-  getLatLon()    {return this.coords.value.split(',').map(Number);}
-  log(m)         {this.logEl.textContent+=m+'\n';}
+
+  _initializeBasicElements() {
+    // Elements
+    this.keyInput   = document.querySelector('#google-api-key');
+    if (this.keyInput) {
+      this.keyInput.value = localStorage.getItem('token') ?? '';
+    }
+    const saveBtn = document.querySelector('#save-settings');
+    if (saveBtn) {
+      saveBtn.onclick = () => {
+        if (this.keyInput) {
+          localStorage.setItem('token', this.keyInput.value.trim());
+          toast('Saved API key');
+        }
+      };
+    }
+
+    this.coordsEl   = document.querySelector('#lat-lng');
+    this.sseEl      = document.querySelector('#sse');
+    this.status     = document.querySelector('#status-chip');
+    this.footerHint = document.querySelector('#composer-hint');
+
+    // Composer
+    this.search     = document.querySelector('#place-search');
+    this.sendBtn    = document.querySelector('#composer-send');
+
+    // Suggestions + search results  
+    this.suggestions = document.querySelector('#suggestions .composer');
+    this.resultsWrap = document.querySelector('#search-results');
+    this.resultsList = this.resultsWrap?.firstElementChild;
+
+    // Vox controls (in drawer)
+    this.toggleVox = document.querySelector('#toggle-vox');
+    this.toggleMC  = document.querySelector('#toggle-mc');
+    this.resPills  = [...document.querySelectorAll('.res-pill')];
+    this.resFine   = document.querySelector('#res-fine');
+
+    // Load saved coords
+    const saved = localStorage.getItem('coords');
+    if (saved && this.coordsEl) this.coordsEl.value = saved;
+
+    // Wire up UI (only if elements exist)
+    if (this.suggestions) this._renderSuggestions();
+    if (this.search && this.sendBtn) this._wireComposer();
+    if (this.search) this._wireSearch();
+    if (this.toggleVox) this._wireVoxUI();
+
+    this.setStatus('Ready');
+  }
+
+  getKey()    { return this.keyInput ? this.keyInput.value.trim() : ''; }
+  getSSE()    { return this.sseEl ? +this.sseEl.value : 20; }
+  getLatLon() { 
+    return this.coordsEl ? this.coordsEl.value.split(',').map(Number) : [37.7749, -122.4194]; 
+  }
+  log()       {}
+  setLatLon([lat, lon]) {
+    if (this.coordsEl) {
+      this.coordsEl.value = `${lat.toFixed(4)},${lon.toFixed(4)}`;
+      localStorage.setItem('coords', this.coordsEl.value);
+    }
+  }
+  setStatus(t) { 
+    if (this.status) this.status.textContent = t; 
+    
+    // Update footer citation based on status
+    if (this.footerHint) {
+      if (t.includes('Loading') || t.includes('Streaming')) {
+        this.footerHint.textContent = '© Google Earth imagery';
+      } else if (t.includes('API key')) {
+        this.footerHint.textContent = 'Using free geocoder (Open-Meteo, fallback Nominatim)';
+      } else {
+        this.footerHint.textContent = '© Google Earth imagery';
+      }
+    }
+  }
+  onFetch = null;
+
+  /* ─── Voxels panel ───────────────────────────────────────────── */
+  _wireVoxUI() {
+    const highlightResPill = (val) => {
+      document.querySelectorAll('.res-pill').forEach(b => {
+        b.classList.remove('bg-white','text-neutral-900');
+        b.classList.add('opacity-80');
+      });
+      const active = document.querySelector(`.res-pill[data-res="${val}"]`);
+      if (active) {
+        active.classList.remove('opacity-80');
+        active.classList.add('bg-white','text-neutral-900');
+      }
+    };
+
+    // Set initial state - voxels ON by default
+    state.vox = true;
+    if (this.toggleVox) {
+      this.toggleVox.checked = true;
+    }
+    if (this.toggleMC) {
+      this.toggleMC.disabled = false;
+    }
+    highlightResPill(state.resolution);
+
+    if (this.toggleVox) {
+      this.toggleVox.addEventListener('change', e => {
+        state.vox = e.target.checked;
+        if (this.toggleMC) {
+          this.toggleMC.disabled = !state.vox;
+          if (!state.vox) {
+            this.toggleMC.checked = false;
+            state.mc = false;
+          }
+        }
+        updateVis();
+      });
+    }
+
+    if (this.toggleMC) {
+      this.toggleMC.addEventListener('change', e => {
+        state.mc = e.target.checked;
+        updateVis();
+      });
+    }
+
+    this.resPills.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const r = parseInt(btn.dataset.res, 10);
+        state.resolution = r;
+        if (this.resFine) this.resFine.value = r;
+        highlightResPill(r);
+        rebuildAll();
+      });
+    });
+
+    if (this.resFine) {
+      this.resFine.addEventListener('change', e => {
+        const r = parseInt(e.target.value, 10);
+        state.resolution = r;
+        highlightResPill(r);
+        rebuildAll();
+      });
+    }
+  }
+
+  /* ─── Suggestions (chips above composer) ─────────────────────── */
+  _renderSuggestions() {
+    const PICKS = [
+      { label:'Paris',        lat:48.8584, lon:2.2945 },
+      { label:'New York',     lat:40.7580, lon:-73.9855 },
+      { label:'Tokyo',        lat:35.6762, lon:139.6503 },
+      { label:'Sydney',       lat:-33.8568, lon:151.2153 },
+      { label:'Cairo',        lat:29.9792, lon:31.1342 },
+      { label:'Rio',          lat:-22.9519, lon:-43.2105 },
+      { label:'Grand Canyon', lat:36.1069, lon:-112.1129 },
+      { label:'Mount Fuji',   lat:35.3606, lon:138.7274 },
+    ];
+    this.suggestions.innerHTML = '';
+    for (const p of PICKS) {
+      const b = document.createElement('button');
+      b.className = 'flex-shrink-0 rounded-lg bg-white/5 hover:bg-white/10 px-2 py-1 text-xs text-nowrap transition-all';
+      b.textContent = p.label;
+      b.onclick = () => this._goTo(p.lat, p.lon);
+      this.suggestions.appendChild(b);
+    }
+  }
+
+  /* ─── Bottom composer behavior ───────────────────────────────── */
+  _wireComposer() {
+    const tryLatLon = (s) => {
+      const m = s.trim().match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+      return m ? [parseFloat(m[1]), parseFloat(m[2])] : null;
+    };
+
+    // Update send button state based on input text
+    const updateSendButton = () => {
+      const hasText = this.search.value.trim().length > 0;
+      if (hasText) {
+        this.sendBtn.disabled = false;
+        this.sendBtn.className = 'w-9 h-9 rounded-full flex items-center justify-center bg-white text-black hover:bg-white/90 transition-all cursor-pointer';
+        this.sendBtn.querySelector('span').className = 'material-symbols-rounded material-bold text-lg';
+      } else {
+        this.sendBtn.disabled = true;
+        this.sendBtn.className = 'w-9 h-9 rounded-full flex items-center justify-center bg-white/5 text-white/40 cursor-not-allowed transition-all';
+        this.sendBtn.querySelector('span').className = 'material-symbols-rounded material-bold text-lg';
+      }
+    };
+
+    // Initial state
+    updateSendButton();
+
+    // Update button state as user types
+    this.search.addEventListener('input', updateSendButton);
+
+    this.sendBtn.addEventListener('click', (e) => {
+      if (this.sendBtn.disabled) {
+        e.preventDefault();
+        return;
+      }
+
+      const text = this.search.value.trim();
+      if (!text) return;
+
+      const maybe = tryLatLon(text);
+      if (maybe) {
+        this._goTo(maybe[0], maybe[1]);
+      } else {
+        // trigger geocode flow
+        this._geocode(text, true);
+      }
+    });
+
+    this.search.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !this.sendBtn.disabled) {
+        this.sendBtn.click();
+      }
+    });
+  }
+
+  /* ─── Geocoder + results popup ───────────────────────────────── */
+  _wireSearch() {
+    const outsideClick = (e) => {
+      const wrap = this.resultsWrap;
+      if (!wrap.classList.contains('hidden') && !wrap.contains(e.target) && e.target !== this.search) {
+        this._showResults(false);
+      }
+    };
+    document.addEventListener('click', outsideClick);
+
+    const deb = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
+    this.search.addEventListener('input', deb(() => {
+      const q = this.search.value.trim();
+      if (q.length < 3) return this._showResults(false);
+      this._geocode(q, false);
+    }, 250));
+  }
+
+  async _geocode(q, autoGo) {
+    const render = (items) => {
+      const list = this.resultsList;
+      list.innerHTML = '';
+      if (!items || !items.length) return this._showResults(false);
+      for (const it of items) {
+        const el = document.createElement('button');
+        el.className = 'w-full text-left px-3 py-2 hover:bg-white/5 text-sm';
+        el.innerHTML = `<div class="font-medium">${it.name}</div>
+                        <div class="text-xs opacity-70">${it.addr}</div>`;
+        el.onclick = () => { this._goTo(it.lat, it.lon); this._showResults(false); };
+        list.appendChild(el);
+      }
+      this._showResults(true);
+      if (autoGo) list.firstElementChild?.click();
+    };
+
+    // 1) Open-Meteo (free)
+    try {
+      const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=6&language=en&format=json`);
+      if (r.ok) {
+        const j = await r.json();
+        if (j?.results?.length) {
+          return render(j.results.map(f => ({
+            name:f.name, addr:[f.admin1,f.country].filter(Boolean).join(', '),
+            lat:f.latitude, lon:f.longitude
+          })));
+        }
+      }
+    } catch {}
+
+    // 2) OSM Nominatim (fallback)
+    try {
+      const r2 = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=6&addressdetails=1`);
+      if (r2.ok) {
+        const j2 = await r2.json();
+        return render(j2.map(f => ({
+          name:f.display_name.split(',')[0],
+          addr:f.display_name,
+          lat: parseFloat(f.lat),
+          lon: parseFloat(f.lon)
+        })));
+      }
+    } catch {}
+
+    render([]);
+  }
+
+  _showResults(on) {
+    document.querySelector('#search-results').classList.toggle('hidden', !on);
+  }
+
+  _goTo(lat, lon) {
+    this.setLatLon([lat, lon]);
+    this.onFetch?.();
+  }
 }
-const ui=new HUD();
+
+/* helpers */
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'fixed top-4 right-4 glass elev rounded-xl px-3 py-2 text-sm z-[60]';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 1400);
+}
+
+// Initialize everything when DOM is ready
+let ui;
+function initializeApp() {
+  // Add a small delay to ensure all DOM elements are fully rendered
+  setTimeout(() => {
+    ui = new HUD();
+    
+    // Set up UI callbacks after UI is ready
+    if (ui && ui.getKey()) {
+      console.log('got key from localStorage; spawning initial tiles');
+      const [lat, lon] = ui.getLatLon();
+      ui.setStatus('Loading tiles...');
+      spawnTiles(`https://tile.googleapis.com/v1/3dtiles/root.json`, ui.getKey(), lat, lon);
+    }
+
+    if (ui) {
+      ui.onFetch = () => {
+        const key = ui.getKey();
+        if (!key) { ui.setStatus('🔑 API key required'); toast('Add your Google API key in Settings'); return; }
+        const [lat, lon] = ui.getLatLon();
+
+        scene.clear(); scene.add(camera); // wipe old
+        ui.setStatus(`Streaming ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
+        spawnTiles(`https://tile.googleapis.com/v1/3dtiles/root.json`, key, lat, lon);
+      };
+    }
+  }, 100);
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeApp);
+} else {
+  initializeApp();
+}
 
 /* ───────────────────────────────  Three.js set-up ─────────────────── */
 let scene,camera,controls,renderer,tiles=null;
 let isInteracting = false;
 
 /* ─────────────────────────────────── GUI & state ──────────────────── */
-const state={resolution:64, vox:false, mc:false};
+const state = { resolution: 64, vox: true, mc: false };
 let lastVoxelUpdateTime = 0;
 
 (() => {
@@ -90,8 +450,7 @@ let lastVoxelUpdateTime = 0;
   });
 
   window.addEventListener('resize',resize); resize();
-
-  buildGUI();
+  
   requestAnimationFrame(loop);
 })();
 
@@ -129,7 +488,7 @@ function spawnTiles(root,key,latDeg,lonDeg){
     latDeg * THREE.MathUtils.DEG2RAD,
     lonDeg * THREE.MathUtils.DEG2RAD
   );
-  tiles.errorTarget=ui.getSSE();
+  tiles.errorTarget = ui ? ui.getSSE() : 20;
   tiles.setCamera(camera);
   tiles.setResolutionFromRenderer(camera,renderer);
 
@@ -139,7 +498,9 @@ function spawnTiles(root,key,latDeg,lonDeg){
     const s=new THREE.Sphere();
     if(tiles.getBoundingSphere(s)){
       controls.target.copy(s.center);
-      camera.position.copy(s.center).add(new THREE.Vector3(0,0,s.radius*2.5));
+      // Position camera above the area looking down at an angle
+      const height = Math.max(s.radius * 1.5, 500); // Ensure minimum height
+      camera.position.set(s.center.x, s.center.y + height, s.center.z + height * 0.3);
       controls.update(); 
       framed=true;
     }
@@ -177,32 +538,6 @@ function spawnTiles(root,key,latDeg,lonDeg){
   });
   
   scene.add(tiles.group);
-}
-
-function buildGUI(){
-  const g=new GUI({width:260});
-  g.add(state,'resolution',4,1024,1).name('Voxel Res').onFinishChange(rebuildAll);
-  g.add(state,'vox').name('Show Voxels').onChange(() => {
-    // When toggling voxel mode, update everything.
-    // updateVis will handle creating/hiding voxels as needed.
-    updateVis();
-  });
-  g.add(state,'mc').name('Minecraft Textures').onChange(async (value) => {
-    if(value && state.vox && tiles && tiles.group) {
-      const tilesToConvert = [];
-      if(tiles.group.children) {
-        tiles.group.children.forEach(tile => {
-          if(tile && tile.type === 'Group' && tile._voxMesh && !tile._mcMesh) {
-            tilesToConvert.push(tile);
-          }
-        });
-      }
-      for(const tile of tilesToConvert) {
-        await buildMinecraftFor(tile);
-      }
-    }
-    updateVis();
-  });
 }
 
 /* ───────────────────── helper to dispose THREE objects ───────────── */
@@ -457,16 +792,6 @@ function rebuildAll(){
   
   updateVis();
 }
-
-/* ─────────────────────── HUD fetch callback ──────────────────────── */
-ui.onFetch=()=>{
-  const key=ui.getKey(); 
-  if(!key){ui.log('🔑 API key required');return;}
-  const [lat,lon]=ui.getLatLon();
-  const root=`https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
-  spawnTiles(root,key,lat,lon);
-  ui.log(`🌍 streaming ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
-};
 
 /* ───────────────────────── render loop ───────────────────────────── */
 const VOXEL_UPDATE_INTERVAL = 300;
