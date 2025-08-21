@@ -124,6 +124,7 @@ class HUD {
     if (this.search && this.sendBtn) this._wireComposer();
     if (this.search) this._wireSearch();
     if (this.toggleVox) this._wireVoxUI();
+    this._wireCameraControls();
 
     this.setStatus('Ready');
   }
@@ -224,21 +225,21 @@ class HUD {
   /* ─── Suggestions (chips above composer) ─────────────────────── */
   _renderSuggestions() {
     const PICKS = [
-      { label:'Paris',        lat:48.8584, lon:2.2945 },
-      { label:'New York',     lat:40.7580, lon:-73.9855 },
-      { label:'Tokyo',        lat:35.6762, lon:139.6503 },
-      { label:'Sydney',       lat:-33.8568, lon:151.2153 },
-      { label:'Cairo',        lat:29.9792, lon:31.1342 },
-      { label:'Rio',          lat:-22.9519, lon:-43.2105 },
-      { label:'Grand Canyon', lat:36.1069, lon:-112.1129 },
-      { label:'Mount Fuji',   lat:35.3606, lon:138.7274 },
+      { label:'Paris',         lat:48.85837, lon:2.29448, view:{height:360, tilt:45, heading:220} },
+      { label:'New York',      lat:40.75800, lon:-73.98550, view:{height:360, tilt:48, heading: 30} },
+      { label:'Tokyo',         lat:35.65858, lon:139.74543, view:{height:340, tilt:47, heading:-20} },
+      { label:'Sydney',        lat:-33.85678, lon:151.21530, view:{height:360, tilt:43, heading:120} },
+      { label:'Cairo',         lat:29.97923, lon:31.13420,  view:{height:420, tilt:38, heading:-140} },
+      { label:'Rio de Janeiro',lat:-22.95192, lon:-43.21049,view:{height:340, tilt:43, heading:-20} },
+      { label:'San Francisco', lat:37.81993, lon:-122.47825,view:{height:420, tilt:41, heading:  0} },
+      { label:'London',        lat:51.50073, lon:-0.12463,  view:{height:340, tilt:46, heading:210} },
     ];
     this.suggestions.innerHTML = '';
     for (const p of PICKS) {
       const b = document.createElement('button');
       b.className = 'flex-shrink-0 rounded-lg bg-white/5 hover:bg-white/10 px-2 py-1 text-xs text-nowrap transition-all';
       b.textContent = p.label;
-      b.onclick = () => this._goTo(p.lat, p.lon);
+      b.onclick = () => this._goTo(p.lat, p.lon, p.view);
       this.suggestions.appendChild(b);
     }
   }
@@ -365,9 +366,326 @@ class HUD {
     document.querySelector('#search-results').classList.toggle('hidden', !on);
   }
 
-  _goTo(lat, lon) {
+  _goTo(lat, lon, view) {
     this.setLatLon([lat, lon]);
+    window.__desiredView = view || null; // add this line
     this.onFetch?.();
+  }
+
+  /* ─── Camera Controls ─────────────────────────────────────────── */
+  _wireCameraControls() {
+    let cameraMode = 'orbit'; // 'orbit' or 'freecam'
+    let freecamKeys = { w: false, a: false, s: false, d: false, shift: false, space: false };
+    let freecamSpeed = 100; // units per second
+    let lastFrameTime = performance.now();
+    
+    // Mouse look variables for freecam
+    let isMouseLocked = false;
+    let mouseSensitivity = 0.002; // radians per pixel
+    let yaw = 0; // horizontal rotation
+    let pitch = 0; // vertical rotation
+    let maxPitch = Math.PI / 2 - 0.1; // prevent gimbal lock
+    
+    // Get control elements
+    const cameraModeBtn = document.querySelector('#camera-mode-btn');
+    const compassBtn = document.querySelector('#compass-btn');
+    const compassNeedle = document.querySelector('#compass-needle');
+    const zoomInBtn = document.querySelector('#zoom-in-btn');
+    const zoomOutBtn = document.querySelector('#zoom-out-btn');
+    const tiltUpBtn = document.querySelector('#tilt-up-btn');
+    const tiltDownBtn = document.querySelector('#tilt-down-btn');
+
+    // Pointer lock for freecam mouse look
+    const canvas = renderer.domElement;
+    
+    const requestPointerLock = () => {
+      if (cameraMode === 'freecam' && !isMouseLocked) {
+        canvas.requestPointerLock();
+      }
+    };
+
+    const onPointerLockChange = () => {
+      isMouseLocked = document.pointerLockElement === canvas;
+    };
+
+    const onMouseMove = (e) => {
+      if (!isMouseLocked || cameraMode !== 'freecam') return;
+
+      // Update yaw and pitch based on mouse movement
+      yaw -= e.movementX * mouseSensitivity;
+      pitch -= e.movementY * mouseSensitivity;
+      pitch = Math.max(-maxPitch, Math.min(maxPitch, pitch));
+
+      // Apply rotation to camera immediately
+      if (camera) {
+        camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+        
+        // Update controls target to maintain orbit mode compatibility
+        if (controls) {
+          const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+          controls.target.copy(camera.position).add(direction.multiplyScalar(100));
+        }
+      }
+    };
+
+    // Add mouse event listeners
+    canvas.addEventListener('click', requestPointerLock);
+    document.addEventListener('pointerlockchange', onPointerLockChange);
+    document.addEventListener('mousemove', onMouseMove);
+
+    // Exit pointer lock when switching to orbit mode
+    const exitPointerLock = () => {
+      if (document.pointerLockElement) {
+        document.exitPointerLock();
+      }
+    };
+
+    // Freecam keyboard controls
+    const handleKeyDown = (e) => {
+      if (cameraMode !== 'freecam') return;
+      const key = e.key.toLowerCase();
+      if (key === 'w') freecamKeys.w = true;
+      if (key === 'a') freecamKeys.a = true;
+      if (key === 's') freecamKeys.s = true;
+      if (key === 'd') freecamKeys.d = true;
+      if (key === 'shift') freecamKeys.shift = true;
+      if (key === ' ') { freecamKeys.space = true; e.preventDefault(); }
+      if (key === 'escape') exitPointerLock();
+    };
+
+    const handleKeyUp = (e) => {
+      if (cameraMode !== 'freecam') return;
+      const key = e.key.toLowerCase();
+      if (key === 'w') freecamKeys.w = false;
+      if (key === 'a') freecamKeys.a = false;
+      if (key === 's') freecamKeys.s = false;
+      if (key === 'd') freecamKeys.d = false;
+      if (key === 'shift') freecamKeys.shift = false;
+      if (key === ' ') freecamKeys.space = false;
+    };
+
+    // Add keyboard event listeners
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('keyup', handleKeyUp);
+
+    // Freecam movement update (runs continuously in render loop)
+    const updateFreecam = () => {
+      if (cameraMode !== 'freecam' || !camera) return;
+
+      const currentTime = performance.now();
+      const deltaTime = (currentTime - lastFrameTime) / 1000;
+      lastFrameTime = currentTime;
+
+      // Check if any movement keys are pressed
+      const hasMovement = freecamKeys.w || freecamKeys.a || freecamKeys.s || freecamKeys.d || freecamKeys.shift || freecamKeys.space;
+      
+      if (hasMovement) {
+        const speed = freecamSpeed * deltaTime * (freecamKeys.shift ? 3 : 1);
+        
+        // Get camera direction vectors
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+        const up = new THREE.Vector3(0, 1, 0);
+
+        // Calculate movement
+        const movement = new THREE.Vector3();
+        if (freecamKeys.w) movement.add(forward.clone().multiplyScalar(speed));
+        if (freecamKeys.s) movement.add(forward.clone().multiplyScalar(-speed));
+        if (freecamKeys.d) movement.add(right.clone().multiplyScalar(speed));
+        if (freecamKeys.a) movement.add(right.clone().multiplyScalar(-speed));
+        if (freecamKeys.space) movement.add(up.clone().multiplyScalar(speed));
+        if (freecamKeys.shift && !freecamKeys.space) movement.add(up.clone().multiplyScalar(-speed/3));
+
+        // Apply movement
+        camera.position.add(movement);
+        
+        // Update controls target to maintain orbit mode compatibility
+        if (controls) {
+          const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+          controls.target.copy(camera.position).add(direction.multiplyScalar(100));
+        }
+      }
+    };
+
+    // Update compass needle rotation based on camera
+    const updateCompass = () => {
+      if (compassNeedle && camera) {
+        const forward = new THREE.Vector3(0, 0, -1);
+        forward.applyQuaternion(camera.quaternion);
+        const angle = Math.atan2(forward.x, forward.z);
+        const degrees = THREE.MathUtils.radToDeg(angle);
+        compassNeedle.style.transform = `rotate(${-degrees}deg)`;
+      }
+    };
+
+    // Update compass during camera movement and freecam
+    if (controls) {
+      controls.addEventListener('change', updateCompass);
+    }
+
+    // Add freecam update to render loop
+    window.freecamUpdateFn = updateFreecam;
+
+    // Camera Mode Toggle
+    if (cameraModeBtn) {
+      cameraModeBtn.addEventListener('click', () => {
+        if (cameraMode === 'orbit') {
+          // Switch to freecam mode
+          cameraMode = 'freecam';
+          if (controls) {
+            controls.enabled = false; // Disable orbit controls
+          }
+          
+          // Initialize freecam rotation from current camera orientation
+          const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+          yaw = euler.y;
+          pitch = euler.x;
+          
+          cameraModeBtn.querySelector('span').textContent = 'videocam';
+          cameraModeBtn.title = 'Switch to Orbit Mode (Click canvas for mouse look)';
+        } else {
+          // Switch to orbit mode
+          cameraMode = 'orbit';
+          exitPointerLock(); // Exit pointer lock when switching to orbit
+          
+          if (controls) {
+            controls.enabled = true;
+            controls.enablePan = true;
+            controls.screenSpacePanning = false;
+            controls.mouseButtons = {
+              LEFT: THREE.MOUSE.ROTATE,
+              MIDDLE: THREE.MOUSE.DOLLY,
+              RIGHT: THREE.MOUSE.PAN
+            };
+            // Update controls target to current camera look-at point
+            const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+            controls.target.copy(camera.position).add(direction.multiplyScalar(100));
+          }
+          cameraModeBtn.querySelector('span').textContent = '360';
+          cameraModeBtn.title = 'Switch to Freecam Mode (WASD + Mouse)';
+        }
+      });
+    }
+
+    // Compass Reset
+    if (compassBtn) {
+      compassBtn.addEventListener('click', () => {
+        if (!camera) return;
+        
+        if (cameraMode === 'freecam') {
+          // In freecam, just reset camera rotation to face north
+          const currentPos = camera.position.clone();
+          camera.position.copy(currentPos);
+          camera.lookAt(currentPos.x, currentPos.y, currentPos.z - 100);
+        } else if (controls) {
+          // In orbit mode, reset to face north from current distance
+          const currentPosition = camera.position.clone();
+          const target = controls.target.clone();
+          const distance = currentPosition.distanceTo(target);
+          
+          const newPosition = target.clone();
+          newPosition.add(new THREE.Vector3(0, currentPosition.y - target.y, distance));
+          
+          // Smooth animation
+          const startPos = currentPosition.clone();
+          const startTime = performance.now();
+          const duration = 500;
+          
+          const animate = (time) => {
+            const elapsed = time - startTime;
+            const progress = Math.min(elapsed / duration, 1);
+            const eased = 1 - Math.pow(1 - progress, 3);
+            
+            camera.position.lerpVectors(startPos, newPosition, eased);
+            camera.lookAt(target);
+            controls.update();
+            updateCompass();
+            
+            if (progress < 1) {
+              requestAnimationFrame(animate);
+            }
+          };
+          requestAnimationFrame(animate);
+        }
+      });
+    }
+
+    // Zoom Controls
+    if (zoomInBtn) {
+      zoomInBtn.addEventListener('click', () => {
+        if (cameraMode === 'freecam') {
+          freecamSpeed = Math.min(freecamSpeed * 1.25, 1000);
+        } else if (controls) {
+          const factor = 0.8;
+          const distance = camera.position.distanceTo(controls.target);
+          const newDistance = Math.max(distance * factor, controls.minDistance);
+          
+          const direction = camera.position.clone().sub(controls.target).normalize();
+          camera.position.copy(controls.target).add(direction.multiplyScalar(newDistance));
+          controls.update();
+        }
+      });
+    }
+
+    if (zoomOutBtn) {
+      zoomOutBtn.addEventListener('click', () => {
+        if (cameraMode === 'freecam') {
+          freecamSpeed = Math.max(freecamSpeed * 0.8, 10);
+        } else if (controls) {
+          const factor = 1.25;
+          const distance = camera.position.distanceTo(controls.target);
+          const newDistance = Math.min(distance * factor, controls.maxDistance);
+          
+          const direction = camera.position.clone().sub(controls.target).normalize();
+          camera.position.copy(controls.target).add(direction.multiplyScalar(newDistance));
+          controls.update();
+        }
+      });
+    }
+
+    // Tilt Controls
+    if (tiltUpBtn) {
+      tiltUpBtn.addEventListener('click', () => {
+        if (cameraMode === 'freecam') {
+          camera.rotateX(-0.1);
+        } else if (controls && camera) {
+          const target = controls.target;
+          const position = camera.position.clone();
+          const direction = position.sub(target);
+          
+          const axis = new THREE.Vector3().crossVectors(direction, camera.up).normalize();
+          const angle = -0.2;
+          direction.applyAxisAngle(axis, angle);
+          
+          camera.position.copy(target).add(direction);
+          camera.lookAt(target);
+          controls.update();
+        }
+      });
+    }
+
+    if (tiltDownBtn) {
+      tiltDownBtn.addEventListener('click', () => {
+        if (cameraMode === 'freecam') {
+          camera.rotateX(0.1);
+        } else if (controls && camera) {
+          const target = controls.target;
+          const position = camera.position.clone();
+          const direction = position.sub(target);
+          
+          const axis = new THREE.Vector3().crossVectors(direction, camera.up).normalize();
+          const angle = 0.2;
+          direction.applyAxisAngle(axis, angle);
+          
+          camera.position.copy(target).add(direction);
+          camera.lookAt(target);
+          controls.update();
+        }
+      });
+    }
+
+    // Initial compass update
+    updateCompass();
   }
 }
 
@@ -378,6 +696,28 @@ function toast(msg) {
   t.textContent = msg;
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 1400);
+}
+
+async function updateAttributionFromTileset(rootUrl) {
+  try {
+    const res = await fetch(rootUrl);
+    const json = await res.json();
+    const credit =
+      json?.asset?.extras?.copyright ||
+      json?.asset?.copyright ||
+      json?.copyright ||
+      '© Google';
+
+    // simple sanitization; then show with links to Google Maps Platform terms
+    const safe = String(credit).replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const html = `${safe} · <a href="https://maps.google.com/help/terms_maps"
+                 target="_blank" rel="noopener noreferrer" class="underline opacity-80 hover:opacity-100">Terms</a>`;
+    const hint = document.querySelector('#composer-hint');
+    if (hint) hint.innerHTML = html;
+  } catch {
+    const hint = document.querySelector('#composer-hint');
+    if (hint) hint.innerHTML = `© Google · <a href="https://maps.google.com/help/terms_maps" target="_blank" rel="noopener noreferrer" class="underline opacity-80 hover:opacity-100">Terms</a>`;
+  }
 }
 
 // Initialize everything when DOM is ready
@@ -391,8 +731,11 @@ function initializeApp() {
     if (ui && ui.getKey()) {
       console.log('got key from localStorage; spawning initial tiles');
       const [lat, lon] = ui.getLatLon();
+      const key = ui.getKey();
+      const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
       ui.setStatus('Loading tiles...');
-      spawnTiles(`https://tile.googleapis.com/v1/3dtiles/root.json`, ui.getKey(), lat, lon);
+      updateAttributionFromTileset(root);
+      spawnTiles(root, key, lat, lon);
     }
 
     if (ui) {
@@ -400,10 +743,12 @@ function initializeApp() {
         const key = ui.getKey();
         if (!key) { ui.setStatus('🔑 API key required'); toast('Add your Google API key in Settings'); return; }
         const [lat, lon] = ui.getLatLon();
+        const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
 
         scene.clear(); scene.add(camera); // wipe old
         ui.setStatus(`Streaming ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
-        spawnTiles(`https://tile.googleapis.com/v1/3dtiles/root.json`, key, lat, lon);
+        updateAttributionFromTileset(root);        // add this
+        spawnTiles(root, key, lat, lon);
       };
     }
   }, 100);
@@ -418,6 +763,8 @@ if (document.readyState === 'loading') {
 /* ───────────────────────────────  Three.js set-up ─────────────────── */
 let scene,camera,controls,renderer,tiles=null;
 let isInteracting = false;
+let __desiredView = null; // populated by HUD._goTo
+let freecamUpdateFn = null; // Will be set by camera controls
 
 /* ─────────────────────────────────── GUI & state ──────────────────── */
 const state = { resolution: 64, vox: true, mc: false };
@@ -435,7 +782,7 @@ let lastVoxelUpdateTime = 0;
   scene.background=new THREE.Color(0x151c1f);
   scene.add(new THREE.HemisphereLight(0xffffff,0x202020,1));
 
-  camera=new THREE.PerspectiveCamera(60,1,100,1_600_000);
+  camera=new THREE.PerspectiveCamera(60,1,0.1,1_600_000);
   controls=new OrbitControls(camera,renderer.domElement);
   controls.enableDamping=true; controls.maxDistance=3e4;
 
@@ -495,15 +842,28 @@ function spawnTiles(root,key,latDeg,lonDeg){
   let framed=false;
   tiles.addEventListener('load-tile-set', ()=>{
     if(framed) return;
-    const s=new THREE.Sphere();
-    if(tiles.getBoundingSphere(s)){
-      controls.target.copy(s.center);
-      // Position camera above the area looking down at an angle
-      const height = Math.max(s.radius * 1.5, 500); // Ensure minimum height
-      camera.position.set(s.center.x, s.center.y + height, s.center.z + height * 0.3);
-      controls.update(); 
-      framed=true;
-    }
+
+    // Put the target (the chosen lat/lon) at the origin and fly camera near it.
+    const view = (window.__desiredView || __desiredView) || { height: 360, tilt: 60, heading: 0 };
+    const tilt    = THREE.MathUtils.degToRad(view.tilt    ?? 60);     // 0 = level, 90 = straight down
+    const heading = THREE.MathUtils.degToRad(view.heading ?? 0);      // degrees around target
+    const r       = view.height ?? 360;                                // meters-ish in local frame
+
+    // Orbit camera around (0,0,0) with Y-up
+    const horiz = Math.cos(tilt) * r;
+    const up    = Math.sin(tilt) * r;
+    const x     = Math.cos(heading) * horiz;
+    const z     = Math.sin(heading) * horiz;
+
+    controls.target.set(0, 0, 0);
+    camera.position.set(x, up, z);
+    controls.minDistance = 10;
+    controls.maxDistance = 30000;
+    controls.update();
+
+    // clear desired view so subsequent pans don't keep snapping
+    window.__desiredView = __desiredView = null;
+    framed=true;
   });
 
   // Event Handlers
@@ -798,6 +1158,12 @@ const VOXEL_UPDATE_INTERVAL = 300;
 
 function loop(){
   requestAnimationFrame(loop);
+  
+  // Update freecam if enabled
+  if (window.freecamUpdateFn) {
+    window.freecamUpdateFn();
+  }
+  
   controls.update();
   
   if(tiles){ 
