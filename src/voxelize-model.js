@@ -111,7 +111,7 @@ function serializeModel(model) {
 /* --------------------------------------------------------------- */
 /* 2️⃣  send to worker, receive voxel mesh back                     */
 /* --------------------------------------------------------------- */
-export function voxelizeModel({ model, resolution = 200, needGrid = false, onStart }) {
+export function voxelizeModel({ model, resolution = 200, needGrid = false, method = '2.5d-scan', onStart }) {
   return new Promise((resolve, reject) => {
 
     const worker = new Worker(
@@ -207,6 +207,6 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, onSta
     });
     payload.imageDatas.forEach(([uuid, idata]) => transfers.push(idata.data.buffer));
 
-    worker.postMessage({ modelData: payload, resolution, needGrid }, transfers);
+        worker.postMessage({ modelData: payload, resolution, needGrid, method }, transfers);
   });
 }
