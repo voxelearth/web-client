@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
   <title>World-Voxel Map</title>
 
   <!-- Tailwind + Inter + Material Symbols -->
@@ -16,7 +17,7 @@
   </script>
 
   <style>
-    html,body { margin:0; height:100%; overflow:hidden; background:#0b0e11 }
+    html,body { margin:0; height:100%; overflow:hidden; background:#0b0e11; touch-action: none; }
     canvas { position:fixed; inset:0 }
     .glass { backdrop-filter: blur(14px); background: rgba(21,24,28,.55) }
     .elev { box-shadow: 0 10px 30px rgba(0,0,0,.28), 0 1px 0 rgba(255,255,255,.04) }
@@ -24,19 +25,32 @@
     .material-bold { font-variation-settings: 'FILL' 0, 'wght' 600, 'GRAD' 0, 'opsz' 24 }
     .scrollbar-hide { scrollbar-width: none; -ms-overflow-style: none; }
     .scrollbar-hide::-webkit-scrollbar { display: none; }
-    .composer { max-width:min(820px, 92vw) }
+    .composer { max-width:min(820px, 96vw) }
+    
+    /* Mobile optimizations */
+    @media (max-width: 768px) {
+      .composer { max-width: 96vw; }
+      .mobile-bottom { bottom: 80px; }
+      .mobile-safe { padding-bottom: env(safe-area-inset-bottom, 20px); }
+      .mobile-compact { padding: 0.75rem; }
+      .mobile-text { font-size: 0.875rem; }
+      .mobile-button { min-height: 44px; min-width: 44px; }
+    }
+    
+    /* Touch targets */
+    button, input[type="range"], label { touch-action: manipulation; }
   </style>
 </head>
 <body class="text-white font-sans selection:bg-white/20">
 
   <!-- Settings menu popup -->
-  <div id="settings-menu" class="hidden fixed bottom-[80px] left-4 z-50">
-    <div class="glass elev rounded-2xl p-4 w-[320px] max-w-[90vw] space-y-4">
+  <div id="settings-menu" class="hidden fixed bottom-[80px] md:bottom-[80px] left-4 right-4 md:left-4 md:right-auto z-50">
+    <div class="glass elev rounded-2xl p-4 mobile-compact w-full md:w-[320px] max-w-[90vw] space-y-4">
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
           <span class="material-symbols-rounded">tune</span> Options
         </div>
-        <button id="menu-close" class="w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
+        <button id="menu-close" class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
           <span class="material-symbols-rounded text-lg">close</span>
         </button>
       </div>
@@ -44,7 +58,7 @@
       <div class="space-y-4">
         <div>
           <div class="text-sm font-medium opacity-80 mb-2">Voxels</div>
-          <label class="inline-flex items-center cursor-pointer">
+          <label class="inline-flex items-center cursor-pointer mobile-button">
             <div class="relative">
               <input id="toggle-vox" type="checkbox" class="sr-only peer" checked>
               <div class="w-11 h-6 bg-white/10 peer-checked:bg-blue-500/80 rounded-full relative transition"></div>
@@ -57,7 +71,7 @@
         <div>
           <div class="flex items-center justify-between">
             <div class="text-sm font-medium opacity-80">Minecraft textures</div>
-            <label class="inline-flex items-center cursor-pointer">
+            <label class="inline-flex items-center cursor-pointer mobile-button">
               <div class="relative">
                 <input id="toggle-mc" type="checkbox" class="sr-only peer" disabled>
                 <div class="w-11 h-6 bg-white/10 peer-checked:bg-green-500/80 peer-disabled:opacity-50 rounded-full relative transition"></div>
@@ -71,7 +85,7 @@
         <div id="debug-imagery-row" style="display: none;">
           <div class="flex items-center justify-between">
             <div class="text-sm font-medium opacity-80">Debug imagery</div>
-            <label class="inline-flex items-center cursor-pointer">
+            <label class="inline-flex items-center cursor-pointer mobile-button">
               <div class="relative">
                 <input id="toggle-debug-imagery" type="checkbox" class="sr-only peer">
                 <div class="w-11 h-6 bg-white/10 peer-checked:bg-orange-500/80 rounded-full relative transition"></div>
@@ -84,13 +98,13 @@
 
         <div>
           <div class="text-sm font-medium opacity-80 mb-2">Voxel resolution</div>
-          <div class="grid grid-cols-4 gap-1 bg-white/5 rounded-xl p-1">
-            <button class="res-pill rounded-lg py-1.5 text-sm opacity-80 hover:bg-white/10" data-res="32">Low</button>
-            <button class="res-pill rounded-lg py-1.5 text-sm opacity-80 hover:bg-white/10" data-res="64">Med</button>
-            <button class="res-pill rounded-lg py-1.5 text-sm opacity-80 hover:bg-white/10" data-res="128">High</button>
-            <button class="res-pill rounded-lg py-1.5 text-sm opacity-80 hover:bg-white/10" data-res="256">Ultra</button>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-1 bg-white/5 rounded-xl p-1">
+            <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button" data-res="32">Low</button>
+            <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button" data-res="64">Med</button>
+            <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button" data-res="128">High</button>
+            <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button" data-res="256">Ultra</button>
           </div>
-          <input id="res-fine" type="range" min="8" max="512" value="64" class="w-full accent-white/80 mt-2">
+          <input id="res-fine" type="range" min="8" max="512" value="64" class="w-full accent-white/80 mt-2 h-8">
           <div class="text-xs opacity-60 -mt-1">Drag to fine-tune</div>
         </div>
 
@@ -99,9 +113,9 @@
             <span class="material-symbols-rounded">key</span> API Key
           </div>
           <div class="relative">
-            <input id="google-api-key" class="w-full rounded-xl bg-white/10 px-3 py-2 pr-16 outline-none"
+            <input id="google-api-key" class="w-full rounded-xl bg-white/10 px-3 py-3 md:py-2 pr-16 outline-none mobile-text"
                    placeholder="Google Photoreal Tiles API key"/>
-            <button id="save-settings" class="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg bg-white/10 hover:bg-white/20 px-3 py-1 text-xs">Save</button>
+            <button id="save-settings" class="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg bg-white/10 hover:bg-white/20 px-3 py-2 text-xs mobile-button">Save</button>
           </div>
           <div class="text-[11px] opacity-60 leading-4 mt-1">Stored locally in this browser.</div>
         </div>
@@ -111,27 +125,29 @@
 
   <!-- Suggestions (like ChatGPT prompt suggestions) -->
   <div id="suggestions"
-       class="pointer-events-none fixed inset-x-0 bottom-[100px] flex justify-center z-30">
-    <div class="pointer-events-auto composer glass elev rounded-2xl px-3 py-2 flex flex-nowrap gap-1 overflow-x-auto scrollbar-hide">
+       class="pointer-events-none fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-center z-30 px-2">
+    <div class="pointer-events-auto composer glass elev rounded-2xl px-3 py-2 flex flex-nowrap gap-2 md:gap-1 overflow-x-auto scrollbar-hide">
       <!-- Filled by JS -->
     </div>
   </div>
 
   <!-- Search results popup -->
-  <div id="search-results" class="hidden fixed inset-x-0 bottom-[100px] flex justify-center z-50">
-    <div class="composer glass elev rounded-2xl overflow-hidden divide-y divide-white/5"></div>
+  <div id="search-results" class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-center z-50 px-2">
+    <div class="composer glass elev rounded-2xl overflow-hidden divide-y divide-white/5 max-h-[60vh] overflow-y-auto"></div>
   </div>
 
   <!-- Bottom composer bar -->
-  <footer class="pointer-events-none fixed left-0 right-0 bottom-0 z-40">
-    <div class="pointer-events-auto composer mx-auto px-3 pb-4">
-      <div class="glass elev rounded-2xl px-3 py-2.5 flex items-center gap-2">
-        <button id="composer-plus" class="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors" title="Options">
+  <footer class="pointer-events-none fixed left-0 right-0 bottom-0 z-40 mobile-safe">
+    <div class="pointer-events-auto composer mx-auto px-2 md:px-3 pb-4">
+      <div class="glass elev rounded-2xl px-2 md:px-3 py-3 md:py-2.5 flex items-center gap-2">
+        <button id="composer-plus" class="flex-shrink-0 mobile-button w-9 h-9 md:w-9 md:h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors" title="Options">
           <span class="material-symbols-rounded material-bold text-lg">add</span>
         </button>
-        <input id="place-search" class="flex-1 bg-transparent outline-none text-[15px] placeholder-white/60"
-               placeholder="Search places (e.g., Eiffel Tower) or paste 'lat,lon'"/>
-        <button id="composer-send" class="w-9 h-9 rounded-full flex items-center justify-center bg-white/5 text-white/40 cursor-not-allowed transition-all" title="Go" disabled>
+        <div class="flex-1 min-w-0 relative">
+          <input id="place-search" class="w-full bg-transparent outline-none text-base md:text-[15px] placeholder-white/60 py-1 pr-2"
+                 placeholder="Search places or paste 'lat,lon'"/>
+        </div>
+        <button id="composer-send" class="flex-shrink-0 mobile-button w-9 h-9 md:w-9 md:h-9 rounded-full flex items-center justify-center bg-white/5 text-white/40 cursor-not-allowed transition-all" title="Go" disabled>
           <span class="material-symbols-rounded material-bold text-lg">arrow_upward</span>
         </button>
       </div>
@@ -143,78 +159,50 @@
 
   <!-- Status chip (very bottom right) -->
   <div id="status-chip"
-       class="fixed right-4 bottom-2 glass elev rounded-full px-3 py-1.5 text-xs opacity-80 z-30 pointer-events-none">
+       class="fixed right-2 md:right-4 bottom-1 md:bottom-2 glass elev rounded-full px-2 md:px-3 py-1 md:py-1.5 text-[10px] md:text-xs opacity-80 z-30 pointer-events-none mobile-safe">
     Ready
   </div>
 
   <!-- Camera Controls Panel (top right) -->
-  <div id="camera-controls" class="fixed top-4 right-4 z-40 space-y-1">
+  <div id="camera-controls" class="fixed top-4 right-2 md:right-4 z-40 space-y-1">
     <!-- Camera Mode Toggle -->
     <div class="glass elev rounded-lg p-1">
-      <button id="camera-mode-btn" class="w-8 h-8 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Switch Camera Mode">
-        <span class="material-symbols-rounded text-sm">360</span>
+      <button id="camera-mode-btn" class="mobile-button w-10 h-10 md:w-8 md:h-8 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Switch Camera Mode">
+        <span class="material-symbols-rounded text-base md:text-sm">360</span>
       </button>
     </div>
 
     <!-- Compass -->
     <div class="glass elev rounded-lg p-1">
-      <button id="compass-btn" class="w-8 h-8 rounded flex items-center justify-center hover:bg-white/10 transition-colors relative" title="Reset to North">
-        <span id="compass-needle" class="material-symbols-rounded text-sm transition-transform duration-300" style="transform: rotate(0deg)">north</span>
+      <button id="compass-btn" class="mobile-button w-10 h-10 md:w-8 md:h-8 rounded flex items-center justify-center hover:bg-white/10 transition-colors relative" title="Reset to North">
+        <span id="compass-needle" class="material-symbols-rounded text-base md:text-sm transition-transform duration-300" style="transform: rotate(0deg)">north</span>
       </button>
     </div>
 
     <!-- Zoom Controls -->
     <div class="glass elev rounded-lg p-1 space-y-px">
-      <button id="zoom-in-btn" class="w-8 h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Zoom In">
-        <span class="material-symbols-rounded text-xs">add</span>
+      <button id="zoom-in-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Zoom In">
+        <span class="material-symbols-rounded text-sm md:text-xs">add</span>
       </button>
       <div class="h-px bg-white/10"></div>
-      <button id="zoom-out-btn" class="w-8 h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Zoom Out">
-        <span class="material-symbols-rounded text-xs">remove</span>
+      <button id="zoom-out-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Zoom Out">
+        <span class="material-symbols-rounded text-sm md:text-xs">remove</span>
       </button>
     </div>
 
     <!-- Tilt Controls -->
     <div class="glass elev rounded-lg p-1 space-y-px">
-      <button id="tilt-up-btn" class="w-8 h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Tilt Up">
-        <span class="material-symbols-rounded text-xs">keyboard_arrow_up</span>
+      <button id="tilt-up-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Tilt Up">
+        <span class="material-symbols-rounded text-sm md:text-xs">keyboard_arrow_up</span>
       </button>
       <div class="h-px bg-white/10"></div>
-      <button id="tilt-down-btn" class="w-8 h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Tilt Down">
-        <span class="material-symbols-rounded text-xs">keyboard_arrow_down</span>
+      <button id="tilt-down-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Tilt Down">
+        <span class="material-symbols-rounded text-sm md:text-xs">keyboard_arrow_down</span>
       </button>
     </div>
   </div>
 
   <!-- Hidden compat fields expected by map.js -->
-  <input id="lat-lng" type="hidden" value="37.7749,-122.4194">
-  <input id="sse" type="hidden" value="20">
-  <button id="fetch" class="hidden"></button>
-  <pre id="fetch-log" class="hidden"></pre>
-  <button id="download" class="hidden"></button>
-
-  <script type="module" src="/src/map.js"></script>
-</body>
-</html>
-
-  <!-- Settings drawer -->
-  <div id="settings" class="hidden fixed top-[120px] right-4 z-30 w-[360px]">
-    <div class="glass rounded-2xl elev-3 p-4 space-y-3">
-      <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
-        <span class="material-symbols-rounded">key</span> API Settings
-      </div>
-      <label class="text-xs opacity-70">Google Photoreal Tiles API Key</label>
-      <input id="google-api-key" class="w-full rounded-xl bg-white/10 px-3 py-2 outline-none"
-             placeholder="Paste your Google API key"/>
-      <div class="flex gap-2">
-        <button id="save-settings" class="rounded-xl bg-white/10 hover:bg-white/20 px-3 py-2 text-sm">Save</button>
-        <button id="close-settings" class="rounded-xl bg-white/10 hover:bg-white/20 px-3 py-2 text-sm">Close</button>
-      </div>
-      <div class="text-[11px] opacity-60 leading-4">Stored locally in this browser.</div>
-    </div>
-  </div>
-
-  <!-- Hidden compatibility elements expected by map.js -->
   <input id="lat-lng" type="hidden" value="37.7749,-122.4194">
   <input id="sse" type="hidden" value="20">
   <button id="fetch" class="hidden"></button>
