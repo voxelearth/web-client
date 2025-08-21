@@ -21,9 +21,13 @@ function textureToPixels(tex) {
   const canvas = document.createElement('canvas');
   canvas.width  = img.width;
   canvas.height = img.height;
-  const ctx = canvas.getContext('2d', { willReadFrequently:true });
-  ctx.drawImage(img, 0, 0);
-  return ctx.getImageData(0, 0, img.width, img.height);   // Uint8ClampedArray
+  try {
+    const ctx = canvas.getContext('2d', { willReadFrequently:true });
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, img.width, img.height);   // Uint8ClampedArray
+  } catch {
+    return null; // fall back to material color
+  }
 }
 
 /* --------------------------------------------------------------- */
@@ -107,13 +111,14 @@ function serializeModel(model) {
 /* --------------------------------------------------------------- */
 /* 2️⃣  send to worker, receive voxel mesh back                     */
 /* --------------------------------------------------------------- */
-export function voxelizeModel({ model, resolution = 200 }) {
+export function voxelizeModel({ model, resolution = 200, needGrid = false, onStart }) {
   return new Promise((resolve, reject) => {
 
     const worker = new Worker(
       new URL('./voxelizer.worker.js', import.meta.url),
       { type:'module' }
     );
+    if (onStart) try { onStart(worker); } catch {}
 
     worker.onmessage = e => {
       const { status, result, message, stack } = e.data;
@@ -130,24 +135,37 @@ export function voxelizeModel({ model, resolution = 200 }) {
         const geom = new THREE.BufferGeometry();
         geom.setAttribute('position', new THREE.BufferAttribute(g.positions, 3));
         
-        // NEW: RGBA8 (4 bytes) -> arrayStride = 4 (legal on WebGPU)
-        const vertCount = g.colors.length / 3;
+        // Colors: handle missing safely
+        const srcColors = g.colors ?? new Float32Array((g.positions.length/3) * 3).fill(1);
+        const vertCount = srcColors.length / 3;
         const c8 = new Uint8Array(vertCount * 4);
         for (let v = 0; v < vertCount; v++) {
-          const r = Math.max(0, Math.min(255, (g.colors[v*3+0] * 255) | 0));
-          const gC= Math.max(0, Math.min(255, (g.colors[v*3+1] * 255) | 0));
-          const b = Math.max(0, Math.min(255, (g.colors[v*3+2] * 255) | 0));
-          c8[v*4+0] = r; c8[v*4+1] = gC; c8[v*4+2] = b; c8[v*4+3] = 255; // alpha pad
+          let r = srcColors[v*3+0], g1 = srcColors[v*3+1], b = srcColors[v*3+2];
+          if (!Number.isFinite(r) || !Number.isFinite(g1) || !Number.isFinite(b)) { r=g1=b=1; } // white fallback
+          c8[v*4+0] = Math.max(0, Math.min(255, (r * 255) | 0));
+          c8[v*4+1] = Math.max(0, Math.min(255, (g1 * 255) | 0));
+          c8[v*4+2] = Math.max(0, Math.min(255, (b * 255) | 0));
+          c8[v*4+3] = 255;
         }
         geom.setAttribute('color', new THREE.BufferAttribute(c8, 4, true));
         
-        // normals are required by the WebGPU pipeline three builds for MeshBasicMaterial
-        geom.setAttribute('normal', new THREE.BufferAttribute(g.normals, 3));
+        // Normals: optional (WebGL doesn't require for MeshBasicMaterial)
+        if (g.normals) {
+          geom.setAttribute('normal', new THREE.BufferAttribute(g.normals, 3));
+        }
         
-        geom.setIndex      (new THREE.BufferAttribute(g.indices, 1));
+        geom.setIndex(new THREE.BufferAttribute(g.indices, 1));
+        geom.boundingBox = new THREE.Box3(
+          new THREE.Vector3(g.bounds.min[0], g.bounds.min[1], g.bounds.min[2]),
+          new THREE.Vector3(g.bounds.max[0], g.bounds.max[1], g.bounds.max[2])
+        );
         geom.computeBoundingSphere();
         
-        const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors:true }));
+        const mesh = new THREE.Mesh(
+          geom,
+          new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false })
+        );
+        mesh.userData.chunkBounds = { min: g.bounds.min, max: g.bounds.max };
         
         // Store chunk bounds for frustum culling (if available from greedy meshing)
         if (g.bounds) {
@@ -163,15 +181,17 @@ export function voxelizeModel({ model, resolution = 200 }) {
       resolve({
         voxelMesh : group,
         voxelCount: result.voxelCount,
-        _voxelGrid: {
-          ...result.voxelGrid,
-          bbox     : new THREE.Box3(
-            new THREE.Vector3().fromArray(result.voxelGrid.bbox.min),
-            new THREE.Vector3().fromArray(result.voxelGrid.bbox.max)
-          ),
-          gridSize : new THREE.Vector3().copy(result.voxelGrid.gridSize),
-          unit     : new THREE.Vector3().copy(result.voxelGrid.unit)
-        }
+        _voxelGrid: result.voxelGrid
+          ? {
+              ...result.voxelGrid,
+              bbox     : new THREE.Box3(
+                new THREE.Vector3().fromArray(result.voxelGrid.bbox.min),
+                new THREE.Vector3().fromArray(result.voxelGrid.bbox.max)
+              ),
+              gridSize : new THREE.Vector3(result.voxelGrid.gridSize.x, result.voxelGrid.gridSize.y, result.voxelGrid.gridSize.z),
+              unit     : new THREE.Vector3(result.voxelGrid.unit.x, result.voxelGrid.unit.y, result.voxelGrid.unit.z)
+            }
+          : null
       });
     };
 
@@ -187,6 +207,6 @@ export function voxelizeModel({ model, resolution = 200 }) {
     });
     payload.imageDatas.forEach(([uuid, idata]) => transfers.push(idata.data.buffer));
 
-    worker.postMessage({ modelData: payload, resolution }, transfers);
+    worker.postMessage({ modelData: payload, resolution, needGrid }, transfers);
   });
 }

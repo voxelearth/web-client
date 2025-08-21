@@ -3,6 +3,42 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
+const ALPHA_CUTOFF = 0.08; // skip texels with alpha below this to avoid black bleed
+const MAX_GRID_VOXELS = 4_000_000; // ~80MB worst case for counts+colors; adjust to taste
+const ALPHA_EPS = 1e-3; // minimum alpha for palette inclusion
+
+// returns [r,g,b, aWeighted] in *linear*; if no coverage, returns null
+function sampleAlbedoLinear(material, uv, imageDatas) {
+    let aSum = 0, rSum = 0, gSum = 0, bSum = 0;
+    const tex = material.map;
+    if (tex) {
+        const s = getSampler(tex, imageDatas);
+        if (s) {
+            const c = s(uv, true); // [r,g,b,a] linear & unpremultiplied
+            const a = Math.max(0, Math.min(1, c[3] || 0));
+            if (a > 0) { rSum += c[0]*a; gSum += c[1]*a; bSum += c[2]*a; aSum += a; }
+        }
+    }
+    if (aSum <= ALPHA_EPS) return null;
+    return [ rSum/aSum, gSum/aSum, bSum/aSum, aSum ];
+}
+
+function sampleAlbedoNeighborhood(material, uv, imageDatas) {
+    const tex = material.map;
+    const s = tex ? getSampler(tex, imageDatas) : null;
+    if (!s) return null;
+    const du = s._du || 0, dv = s._dv || 0;
+    const OFFS = [[0,0],[du,0],[-du,0],[0,dv],[0,-dv]];
+    let aSum = 0, rSum = 0, gSum = 0, bSum = 0;
+    for (const [ou,ov] of OFFS) {
+        const c = s(new THREE.Vector2(uv.x+ou, uv.y+ov), true);
+        const a = Math.max(0, Math.min(1, c[3] || 0));
+        if (a > 0) { rSum += c[0]*a; gSum += c[1]*a; bSum += c[2]*a; aSum += a; }
+    }
+    if (aSum <= ALPHA_EPS) return null;
+    return [ rSum/aSum, gSum/aSum, bSum/aSum, aSum ];
+}
+
 // --- Helper functions ---
 const _samplers = new WeakMap();
 function getSampler(tex, imageDatas) {
@@ -16,6 +52,9 @@ function getSampler(tex, imageDatas) {
         const { data, width, height } = imgData;
         const { offset, repeat, rotation, center, flipY, wrapS, wrapT } = tex;
         const cosR = Math.cos(rotation), sinR = Math.sin(rotation);
+
+        // sRGB -> linear helper
+        const srgbToLin = x => (x <= 0.04045) ? (x / 12.92) : Math.pow((x + 0.055) / 1.055, 2.4);
 
         sampler = (uv, wantRGBA = false) => {
             let u = uv.x * repeat.x + offset.x, v = uv.y * repeat.y + offset.y;
@@ -35,30 +74,42 @@ function getSampler(tex, imageDatas) {
 
             const sample = (ix, iy) => {
                 const i = (iy * width + ix) * 4;
-                return { r: data[i]/255, g: data[i+1]/255, b: data[i+2]/255, a: data[i+3]/255 };
+                let r = data[i] / 255, g = data[i+1] / 255, b = data[i+2] / 255, a = data[i+3] / 255;
+                // convert EACH texel to linear before mixing
+                if (tex.encoding === THREE.sRGBEncoding) {
+                    r = srgbToLin(r); g = srgbToLin(g); b = srgbToLin(b);
+                }
+                return [r, g, b, a];
             };
 
             const c00 = sample(x0, y0), c10 = sample(x1, y0), c01 = sample(x0, y1), c11 = sample(x1, y1);
-            const lerp = (a, b, t) => a + (b - a) * t;
-            const r0 = lerp(c00.r, c10.r, tx), g0 = lerp(c00.g, c10.g, tx), b0 = lerp(c00.b, c10.b, tx);
-            const r1 = lerp(c01.r, c11.r, tx), g1 = lerp(c01.g, c11.g, tx), b1 = lerp(c01.b, c11.b, tx);
+            
+            // premultiplied bilinear blend: RGB*A, then divide by A
+            const w00 = (1 - tx) * (1 - ty);
+            const w10 = tx * (1 - ty);
+            const w01 = (1 - tx) * ty;
+            const w11 = tx * ty;
 
-            const color = new THREE.Color(lerp(r0, r1, ty), lerp(g0, g1, ty), lerp(b0, b1, ty));
-            if (tex.encoding === THREE.sRGBEncoding) {
-                color.convertSRGBToLinear();
-            }
-            if (wantRGBA) {
-                const a0 = lerp(c00.a, c10.a, tx), a1 = lerp(c01.a, c11.a, tx);
-                return { r: color.r, g: color.g, b: color.b, a: lerp(a0, a1, ty) };
-            }
-            return color;
+            const a = c00[3]*w00 + c10[3]*w10 + c01[3]*w01 + c11[3]*w11;
+            let r = c00[0]*c00[3]*w00 + c10[0]*c10[3]*w10 + c01[0]*c01[3]*w01 + c11[0]*c11[3]*w11;
+            let g = c00[1]*c00[3]*w00 + c10[1]*c10[3]*w10 + c01[1]*c01[3]*w01 + c11[1]*c11[3]*w11;
+            let b = c00[2]*c00[3]*w00 + c10[2]*c10[3]*w10 + c01[2]*c01[3]*w01 + c11[2]*c11[3]*w11;
+
+            if (a > 1e-5) { r /= a; g /= a; b /= a; } // unpremultiply
+            else { r = 0; g = 0; b = 0; }             // fully transparent → neutral
+
+            return wantRGBA ? [r, g, b, a] : [r, g, b];
         };
+        
+        // expose 1-pixel UV deltas for neighborhood taps
+        sampler._du = 1 / width;
+        sampler._dv = 1 / height;
     }
     _samplers.set(tex, sampler);
     return sampler;
 }
 
-const COLOR_MAP_KEYS = ['map', 'emissiveMap'];
+const COLOR_MAP_KEYS = ['map']; // only albedo participates in multiplication
 function* allTextures(mat) {
     for (const k of COLOR_MAP_KEYS) {
         const t = mat[k];
@@ -67,43 +118,94 @@ function* allTextures(mat) {
 }
 
 function kMeansPalette(colors, k = 64, iters = 8) {
-    const n = colors.length / 3;
-    if (n === 0) return { palette: new Float32Array(k * 3) };
-    const cent = new Float32Array(k * 3);
-    const sel  = new Set();
-    while (sel.size < k && sel.size < n) sel.add(Math.floor(Math.random() * n));
-    let ci = 0;
-    for (const s of sel) { cent[ci++]=colors[s*3]; cent[ci++]=colors[s*3+1]; cent[ci++]=colors[s*3+2]; }
+    let n = colors.length / 3;
+    const MAX_SAMPLES = 4096;
 
-    const sums = new Float32Array(k*3), cnts = new Uint32Array(k);
+    // Downsample to a bounded set for stability
+    if (n > MAX_SAMPLES) {
+        const sampled = new Float32Array(MAX_SAMPLES * 3);
+        const step = Math.ceil(n / MAX_SAMPLES);
+        let m = 0;
+        for (let i = 0; i < n && m < MAX_SAMPLES; i += step) {
+            sampled[m*3+0] = colors[i*3+0];
+            sampled[m*3+1] = colors[i*3+1];
+            sampled[m*3+2] = colors[i*3+2];
+            m++;
+        }
+        colors = sampled;
+        n = m; // use actual count, not MAX_SAMPLES
+    }
+
+    if (n === 0) return { palette: new Float32Array([1,1,1]) }; // sane fallback (white)
+
+    k = Math.min(k, n);                            // ← important: clamp k to available samples
+    const cent = new Float32Array(k * 3);
+
+    // evenly spaced seeds (deterministic)
+    for (let c = 0; c < k; ++c) {
+        const s = Math.min(n - 1, Math.floor((c + 0.5) * n / k));
+        cent[c*3+0] = colors[s*3+0];
+        cent[c*3+1] = colors[s*3+1];
+        cent[c*3+2] = colors[s*3+2];
+    }
+
+    const sums = new Float32Array(k * 3);
+    const cnts = new Uint32Array(k);
+
     for (let it = 0; it < iters; ++it) {
         sums.fill(0); cnts.fill(0);
+
+        // Assignment
         for (let p = 0; p < n; ++p) {
-            const r = colors[p*3], g = colors[p*3+1], b = colors[p*3+2];
-            let best=0, bestD=1e9;
-            for (let c=0; c<k; ++c) {
-                const dr=r-cent[c*3], dg=g-cent[c*3+1], db=b-cent[c*3+2];
-                const d = dr*dr + dg*dg + db*db;
-                if (d < bestD) { bestD = d; best = c; }
+            const r = colors[p*3+0], g = colors[p*3+1], b = colors[p*3+2];
+            let best = 0, bestD = Infinity;
+            for (let c = 0; c < k; ++c) {
+                const dr = r - cent[c*3+0], dg = g - cent[c*3+1], db = b - cent[c*3+2];
+                const d2 = dr*dr + dg*dg + db*db;
+                if (d2 < bestD) { bestD = d2; best = c; }
             }
-            sums[best*3] += r; sums[best*3+1] += g; sums[best*3+2] += b;
-            cnts[best]++;
+            sums[best*3+0] += r; sums[best*3+1] += g; sums[best*3+2] += b; cnts[best]++;
         }
-        for (let c=0; c<k; ++c) {
-            const ct = Math.max(1, cnts[c]);
-            cent[c*3]   = sums[c*3]   / ct;
-            cent[c*3+1] = sums[c*3+1] / ct;
-            cent[c*3+2] = sums[c*3+2] / ct;
+
+        // Update (with empty-cluster rescue)
+        for (let c = 0; c < k; ++c) {
+            if (cnts[c] === 0) {
+                // Reseed from a random sample to avoid (0,0,0)
+                const s = Math.floor(Math.random() * n);
+                cent[c*3+0] = colors[s*3+0];
+                cent[c*3+1] = colors[s*3+1];
+                cent[c*3+2] = colors[s*3+2];
+            } else {
+                const inv = 1 / cnts[c];
+                cent[c*3+0] = sums[c*3+0] * inv;
+                cent[c*3+1] = sums[c*3+1] * inv;
+                cent[c*3+2] = sums[c*3+2] * inv;
+            }
         }
     }
+
+    // optional: push centroids away from exact black unless data demands it
+    const MIN_LUMA = 0.015; // ~4/255 – tweak to taste
+    for (let c = 0; c < k; ++c) {
+        const r = cent[c*3+0], g = cent[c*3+1], b = cent[c*3+2];
+        const L = 0.2126*r + 0.7152*g + 0.0722*b;
+        if (L < MIN_LUMA) {
+            const scale = MIN_LUMA / Math.max(L, 1e-6);
+            cent[c*3+0] = Math.min(1, r*scale);
+            cent[c*3+1] = Math.min(1, g*scale);
+            cent[c*3+2] = Math.min(1, b*scale);
+        }
+    }
+
     return { palette: cent };
 }
 
 // --- The Main Voxelizer Class ---
 class WorkerVoxelizer {
-    async init({ modelData, voxelSize, maxGrid = Infinity, paletteSize = 256 }) {
+    async init({ modelData, voxelSize, maxGrid = Infinity, paletteSize = 256, needGrid = false }) {
         this.voxelSize = voxelSize;
         this.paletteSize = paletteSize;
+        this.needGrid = needGrid;
         this.imageDatas = new Map(modelData.imageDatas);
 
         const model = this.#reconstructModel(modelData);
@@ -120,9 +222,9 @@ class WorkerVoxelizer {
         this.voxelSize /= scale;
 
         this.#cpuRasterize();
-        this.filledVoxelCount = this.voxelTris.size;
+        this.filledVoxelCount = this._rasterResult?.filledCount ?? 0;
         const result = this.#buildGreedyMeshChunks();   // NEW
-        const voxelGridData = this.#getVoxelGridData();
+        const voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
 
         return {
             geometries: result.geometries,
@@ -199,15 +301,40 @@ class WorkerVoxelizer {
                 if (!m) continue;
                 for (let vi=grp.start; vi<grp.start+grp.count; ++vi) {
                     let col = (m.color ? m.color.clone() : new THREE.Color(1,1,1));
-                    if (m.emissive && m.emissive.getHSL({h:0,s:0,l:0}) > 0) col.add(m.emissive);
+                    let hasValidAlbedo = false;
+                    
                     if (uvA) {
                         const uvv = new THREE.Vector2(uvA.getX(vi), uvA.getY(vi));
-                        for (const tex of allTextures(m)) {
-                            const samp = getSampler(tex, this.imageDatas);
-                            if (samp) col.multiply(samp(uvv));
+                        const albedo = sampleAlbedoLinear(m, uvv, this.imageDatas);
+                        if (albedo) {
+                            col.multiply(new THREE.Color(albedo[0], albedo[1], albedo[2]));
+                            hasValidAlbedo = true;
                         }
+                        
+                        // emissive add
+                        if (m.emissive) col.add(m.emissive);
+                        if (m.emissiveMap) {
+                            const es = getSampler(m.emissiveMap, this.imageDatas);
+                            if (es) { const ec = es(uvv, true); col.add(new THREE.Color(ec[0], ec[1], ec[2])); }
+                        }
+                    } else {
+                        // no UV, just add emissive to base color
+                        if (m.emissive) col.add(m.emissive);
+                        hasValidAlbedo = true; // base color is always valid
                     }
-                    allRGB.push(col.r, col.g, col.b);
+                    
+                    // Sanitize colors before pushing to palette samples
+                    if (!Number.isFinite(col.r) || !Number.isFinite(col.g) || !Number.isFinite(col.b)) {
+                        col.set(1,1,1); // fallback to white if we ever hit NaNs
+                    }
+                    col.r = Math.min(1, Math.max(0, col.r));
+                    col.g = Math.min(1, Math.max(0, col.g));
+                    col.b = Math.min(1, Math.max(0, col.b));
+                    
+                    // Only include in palette if we had valid coverage (skip transparent samples)
+                    if (hasValidAlbedo) {
+                        allRGB.push(col.r, col.g, col.b);
+                    }
                 }
             }
 
@@ -239,18 +366,24 @@ class WorkerVoxelizer {
     }
     
     #cpuRasterize() {
-        this.voxelTris = new Map();
-        const dists = new Map();
-        
+        const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
+        const total = NX * NY * NZ;
+        const index1D = (x,y,z) => x + NX * (y + NY * z);
+        const voxelTri  = new Int32Array(total);      voxelTri.fill(-1);
+        const voxelDist = new Float32Array(total);    voxelDist.fill(Infinity);
+        const filled    = new Uint32Array(total);     // worst-case list
+        let filledCount = 0;
+
         const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
         const triBox = new THREE.Box3();
         const voxelCenter = new THREE.Vector3();
         const gridMax = new THREE.Vector3().copy(this.grid).subScalar(1);
         
-        // Temporary vectors for triangle-voxel intersection tests
+        // Reused temporaries (no allocations inside loops)
         const tv0 = new THREE.Vector3(), tv1 = new THREE.Vector3(), tv2 = new THREE.Vector3();
         const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(), e2 = new THREE.Vector3();
-        const n = new THREE.Vector3();
+        const n = new THREE.Vector3(), absN = new THREE.Vector3();
+        const axisTmp = new THREE.Vector3();
 
         const numTriangles = this.indices.length / 3;
         for (let i = 0; i < numTriangles; i++) {
@@ -270,76 +403,56 @@ class WorkerVoxelizer {
             vMin.clamp(new THREE.Vector3(0,0,0), gridMax);
             vMax.clamp(new THREE.Vector3(0,0,0), gridMax);
             
-            // Triangle normal and edges (matching GPU version exactly)
-            e0.subVectors(v1, v0);  // v1 - v0
-            e1.subVectors(v2, v1);  // v2 - v1  
-            e2.subVectors(v0, v2);  // v0 - v2
-            n.crossVectors(e0, new THREE.Vector3().subVectors(v2, v0)); // cross(v1-v0, v2-v0)
+            e0.subVectors(v1, v0);
+            e1.subVectors(v2, v1);
+            e2.subVectors(v0, v2);
+            n.crossVectors(e0, new THREE.Vector3().subVectors(v2, v0));
             const nn = n.dot(n);
-            if (nn < 1e-12) continue; // Degenerate triangle
-            
-            const absN = new THREE.Vector3(Math.abs(n.x), Math.abs(n.y), Math.abs(n.z));
+            if (nn < 1e-12) continue;
+            absN.set(Math.abs(n.x), Math.abs(n.y), Math.abs(n.z));
             const half = this.voxelSize * 0.5;
 
             for (let z = vMin.z; z <= vMax.z; z++) {
                 for (let y = vMin.y; y <= vMax.y; y++) {
                     for (let x = vMin.x; x <= vMax.x; x++) {
-                        // Voxel center in world space
                         voxelCenter.set(x + 0.5, y + 0.5, z + 0.5).multiplyScalar(this.voxelSize).add(this.bbox.min);
-                        
-                        // Translate triangle vertices relative to voxel center
+
                         tv0.subVectors(v0, voxelCenter);
                         tv1.subVectors(v1, voxelCenter);
                         tv2.subVectors(v2, voxelCenter);
-                        
-                        // 1) Separating axis test: triangle normal
+
+                        // 1) normal axis
                         const rP = half * (absN.x + absN.y + absN.z);
                         if (Math.abs(n.dot(tv0)) > rP) continue;
-                        
-                        // 2) Edge × axis tests (9 in total)
-                        const testEdgeAxis = (edge, tv0, tv1, tv2, axisX, axisY, axisZ) => {
-                            const axis = new THREE.Vector3();
-                            axis.crossVectors(edge, new THREE.Vector3(axisX, axisY, axisZ));
-                            // Skip if axis is too small (parallel edge and axis)
-                            if (axis.lengthSq() < 1e-12) return true;
-                            
-                            const p0 = axis.dot(tv0);
-                            const p1 = axis.dot(tv1);
-                            const p2 = axis.dot(tv2);
-                            const mn = Math.min(p0, Math.min(p1, p2));
-                            const mx = Math.max(p0, Math.max(p1, p2));
-                            const r = half * (Math.abs(axis.x) + Math.abs(axis.y) + Math.abs(axis.z));
+
+                        // 2) edge x axes (reusing axisTmp, no allocations)
+                        const test = (edge, ax, ay, az) => {
+                            axisTmp.set(edge.y*az - edge.z*ay, edge.z*ax - edge.x*az, edge.x*ay - edge.y*ax);
+                            const l2 = axisTmp.x*axisTmp.x + axisTmp.y*axisTmp.y + axisTmp.z*axisTmp.z;
+                            if (l2 < 1e-12) return true;
+                            const p0 = axisTmp.dot(tv0), p1 = axisTmp.dot(tv1), p2 = axisTmp.dot(tv2);
+                            const mn = Math.min(p0, p1, p2), mx = Math.max(p0, p1, p2);
+                            const r  = half * (Math.abs(axisTmp.x) + Math.abs(axisTmp.y) + Math.abs(axisTmp.z));
                             return !(mn > r || mx < -r);
                         };
-                        
-                        const edge0 = e0.clone();
-                        const edge1 = e1.clone();
-                        const edge2 = e2.clone();
-                        
-                        if (!testEdgeAxis(edge0, tv0, tv1, tv2, 1, 0, 0)) continue;
-                        if (!testEdgeAxis(edge0, tv0, tv1, tv2, 0, 1, 0)) continue;
-                        if (!testEdgeAxis(edge0, tv0, tv1, tv2, 0, 0, 1)) continue;
-                        
-                        if (!testEdgeAxis(edge1, tv0, tv1, tv2, 1, 0, 0)) continue;
-                        if (!testEdgeAxis(edge1, tv0, tv1, tv2, 0, 1, 0)) continue;
-                        if (!testEdgeAxis(edge1, tv0, tv1, tv2, 0, 0, 1)) continue;
-                        
-                        if (!testEdgeAxis(edge2, tv0, tv1, tv2, 1, 0, 0)) continue;
-                        if (!testEdgeAxis(edge2, tv0, tv1, tv2, 0, 1, 0)) continue;
-                        if (!testEdgeAxis(edge2, tv0, tv1, tv2, 0, 0, 1)) continue;
-                        
-                        // If we get here, the triangle intersects the voxel
-                        const key = `${x},${y},${z}`;
+                        if (!test(e0,1,0,0) || !test(e0,0,1,0) || !test(e0,0,0,1)) continue;
+                        if (!test(e1,1,0,0) || !test(e1,0,1,0) || !test(e1,0,0,1)) continue;
+                        if (!test(e2,1,0,0) || !test(e2,0,1,0) || !test(e2,0,0,1)) continue;
+
+                        // Record closest triangle
+                        const lin = index1D(x,y,z);
                         const dist2 = (n.dot(tv0) * n.dot(tv0)) / nn;
-                        
-                        if (!dists.has(key) || dist2 < dists.get(key)) {
-                            dists.set(key, dist2);
-                            this.voxelTris.set(key, i);
+                        if (dist2 < voxelDist[lin]) {
+                            voxelDist[lin] = dist2;
+                            if (voxelTri[lin] === -1) filled[filledCount++] = lin;
+                            voxelTri[lin] = i;
                         }
                     }
                 }
             }
         }
+        this.filledVoxelCount = filledCount;
+        this._rasterResult = { NX, NY, NZ, voxelTri, voxelDist, filled, filledCount };
     }
 
     // Greedy meshing + chunked output (à la OptiFine/Sodium)
@@ -354,8 +467,13 @@ class WorkerVoxelizer {
       const uv0 = new THREE.Vector2(), uv1 = new THREE.Vector2(), uv2 = new THREE.Vector2();
       const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(), ep = new THREE.Vector3();
 
-      for (const [key, triId] of this.voxelTris.entries()) {
-        const [gx, gy, gz] = key.split(',').map(n => n|0);
+      const { voxelTri, filled, filledCount, NX:RX, NY:RY, NZ:RZ } = this._rasterResult;
+      for (let k = 0; k < filledCount; k++) {
+        const lin = filled[k];
+        const gx = lin % NX;
+        const gy = ((lin / NX) | 0) % NY;
+        const gz = (lin / (NX*NY)) | 0;
+        const triId = voxelTri[lin];
 
         // sample color for voxel center using triangle triId
         const i0 = this.indices[triId*3], i1 = this.indices[triId*3+1], i2 = this.indices[triId*3+2];
@@ -402,19 +520,38 @@ class WorkerVoxelizer {
           .addScaledVector(uv2, w_b);
 
         const mat = this.materials[this.triMats[triId]] || this.materials[0];
-        let col = (mat && mat.color) ? mat.color.clone() : new THREE.Color(1,1,1);
-        if (mat && mat.emissive) col.add(mat.emissive);
-        if (mat) {
-          for (const tex of allTextures(mat)) {
-            const s = getSampler(tex, this.imageDatas);
-            if (s) col.multiply(s(uvp));
+        let r=1, g=1, b=1;
+        if (mat && mat.color) { r *= mat.color.r; g *= mat.color.g; b *= mat.color.b; }
+        
+        if (mat && mat.map) {
+            const albedo = sampleAlbedoLinear(mat, uvp, this.imageDatas)
+                        || sampleAlbedoNeighborhood(mat, uvp, this.imageDatas);
+            if (albedo) {
+                r *= albedo[0]; g *= albedo[1]; b *= albedo[2];
+            }
+            // if still no coverage, leave r,g,b as base color (don't multiply by 0)
+        }
+        
+        // emissive add (after albedo)
+        if (mat && mat.emissive) { r += mat.emissive.r; g += mat.emissive.g; b += mat.emissive.b; }
+        if (mat && mat.emissiveMap) {
+          const eSamp = getSampler(mat.emissiveMap, this.imageDatas);
+          if (eSamp) {
+            const ec = eSamp(uvp, true);
+            r += ec[0]; g += ec[1]; b += ec[2];
           }
         }
+        
+        // Clamp sampled color (defensive)
+        r = Math.min(1, Math.max(0, r));
+        g = Math.min(1, Math.max(0, g));
+        b = Math.min(1, Math.max(0, b));
 
-        // choose nearest palette entry
+        // choose nearest palette entry (use actual palette length!)
         let best = 0, bestD = Infinity;
-        for (let c = 0; c < this.paletteSize; ++c) {
-          const dr = col.r - this.palette[c*3], dg = col.g - this.palette[c*3+1], db = col.b - this.palette[c*3+2];
+        const K = (this.palette?.length ?? 0) / 3;
+        for (let c = 0; c < K; ++c) {
+          const dr = r - this.palette[c*3], dg = g - this.palette[c*3+1], db = b - this.palette[c*3+2];
           const d2 = dr*dr + dg*dg + db*db;
           if (d2 < bestD) { bestD = d2; best = c; }
         }
@@ -427,12 +564,15 @@ class WorkerVoxelizer {
       const bx = this.bbox.min.x, by = this.bbox.min.y, bz = this.bbox.min.z;
       const vs = this.voxelSize;
 
+      // Reusable mask (max CHUNK*CHUNK)
+      const mask = new Int32Array(CHUNK * CHUNK);
+
       const sample = (x,y,z) => {
         if (x < 0 || y < 0 || z < 0 || x >= NX || y >= NY || z >= NZ) return 0;
         return grid[idx(x,y,z)];
       };
 
-      // helper to emit a quad into arrays with correct winding
+      // helper to emit a quad into arrays with correct winding (no normals)
       function pushQuad(out, p, q, r, s, nrm, colorIdx) {
         const base = out.positions.length / 3;
         // positions
@@ -441,13 +581,6 @@ class WorkerVoxelizer {
           q[0], q[1], q[2],
           r[0], r[1], r[2],
           s[0], s[1], s[2]
-        );
-        // normals
-        out.normals.push(
-          nrm[0], nrm[1], nrm[2],
-          nrm[0], nrm[1], nrm[2],
-          nrm[0], nrm[1], nrm[2],
-          nrm[0], nrm[1], nrm[2]
         );
         // colors (Float32; main thread will pack to RGBA8)
         const rC = this.palette[(colorIdx)*3+0];
@@ -481,9 +614,7 @@ class WorkerVoxelizer {
 
       // Run greedy meshing within a chunk
       const meshChunk = (cx0, cx1, cy0, cy1, cz0, cz1) => {
-        const out = { positions: [], colors: [], normals: [], indices: [] };
-        // mask buffer for merging faces on each slice
-        const mask = [];
+        const out = { positions: [], colors: [], indices: [] };
 
         // axis loop: 0=X,1=Y,2=Z (like Mikola Lysenko's algorithm)
         for (let d = 0; d < 3; d++) {
@@ -507,17 +638,18 @@ class WorkerVoxelizer {
             const nv = (maxV - minV);
             if (nu === 0 || nv === 0) continue;
 
-            // build the face mask
+            // build mask for this plane
+            const planeSize = nu * nv;
             let n = 0;
             for (let j = minV; j < maxV; j++) {
               for (let i = minU; i < maxU; i++) {
                 // get voxel on both sides of the plane
                 const a = (d===0) ? sample(x-1, i, j)
-                          : (d===1) ? sample(i, x-1, j)
-                                    : sample(i, j, x-1);
+                          : (d===1) ? sample(j, x-1, i)   // Y-sweep: (X=j, Y=plane, Z=i)
+                          : sample(i, j, x-1);
                 const b = (d===0) ? sample(x, i, j)
-                          : (d===1) ? sample(i, x, j)
-                                    : sample(i, j, x);
+                          : (d===1) ? sample(j, x, i)
+                          : sample(i, j, x);
                 let id = 0;
                 if ((a !== 0) !== (b !== 0)) {
                   // sign encodes which side is solid; magnitude encodes color id
@@ -559,9 +691,9 @@ class WorkerVoxelizer {
                   if (d === 0) { // X
                     p = [xPlane, iu0, iv0]; q = [xPlane, iu1, iv0];
                     r = [xPlane, iu1, iv1]; s = [xPlane, iu0, iv1];
-                  } else if (d === 1) { // Y
-                    p = [iu0, xPlane, iv0]; q = [iu1, xPlane, iv0];
-                    r = [iu1, xPlane, iv1]; s = [iu0, xPlane, iv1];
+                  } else if (d === 1) { // Y plane (u = Z, v = X)
+                    p = [iv0, xPlane, iu0]; q = [iv1, xPlane, iu0];
+                    r = [iv1, xPlane, iu1]; s = [iv0, xPlane, iu1];
                   } else { // Z
                     p = [iu0, iv0, xPlane]; q = [iu1, iv0, xPlane];
                     r = [iu1, iv1, xPlane]; s = [iu0, iv1, xPlane];
@@ -600,8 +732,7 @@ class WorkerVoxelizer {
         // pack to typed arrays
         const positions = new Float32Array(out.positions);
         const colors    = new Float32Array(out.colors);
-        const normals   = new Float32Array(out.normals);
-        const indices   = positions.length/3 > 65535 ? new Uint32Array(out.indices) : new Uint16Array(out.indices);
+        const indices   = positions.length/3 >= 65536 ? new Uint32Array(out.indices) : new Uint16Array(out.indices);
 
         // chunk bounds in world space (for frustum culling on the main thread)
         const bounds = {
@@ -609,7 +740,7 @@ class WorkerVoxelizer {
           max: [bx + cx1*vs, by + cy1*vs, bz + cz1*vs],
         };
 
-        return { positions, colors, normals, indices, bounds };
+        return { positions, colors, indices, bounds };
       };
 
       // iterate chunks
@@ -635,6 +766,13 @@ class WorkerVoxelizer {
     #getVoxelGridData() {
         const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const tot = NX * NY * NZ;
+        
+        if (tot > MAX_GRID_VOXELS) {
+            // refuse to allocate gigantic dense arrays; caller will handle null
+            console.warn(`Voxel grid too large (${tot} voxels > ${MAX_GRID_VOXELS}). Reduce resolution or zoom in.`);
+            return null;
+        }
+        
         const voxelColors = new Float32Array(tot * 4);
         const voxelCounts = new Uint32Array(tot);
 
@@ -686,7 +824,7 @@ class WorkerVoxelizer {
 // --- Worker Entry Point ---
 self.onmessage = async (event) => {
     try {
-        const { modelData, resolution } = event.data;
+        const { modelData, resolution, needGrid = false } = event.data;
         
         const bbox = new THREE.Box3(
             new THREE.Vector3().fromArray(modelData.bbox.min),
@@ -698,16 +836,17 @@ self.onmessage = async (event) => {
         const voxelSize = maxDim / resolution;
 
         const voxelizer = new WorkerVoxelizer();
-        const result = await voxelizer.init({ modelData, voxelSize });
+        const result = await voxelizer.init({ modelData, voxelSize, needGrid });
         
         const transferList = [];
-        if (result.voxelGrid) {
-            if (result.voxelGrid.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);
-            if (result.voxelGrid.voxelCounts) transferList.push(result.voxelGrid.voxelCounts.buffer);
+        if (result.voxelGrid?.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);
+        if (result.voxelGrid?.voxelCounts) transferList.push(result.voxelGrid.voxelCounts.buffer);
+        for (const g of (result.geometries || [])) {
+          if (g?.positions?.buffer) transferList.push(g.positions.buffer);
+          if (g?.colors?.buffer)    transferList.push(g.colors.buffer);
+          if (g?.normals?.buffer)   transferList.push(g.normals.buffer);   // only if present
+          if (g?.indices?.buffer)   transferList.push(g.indices.buffer);
         }
-        result.geometries.forEach(g => {
-            transferList.push(g.positions.buffer, g.colors.buffer, g.normals.buffer, g.indices.buffer);
-        });
 
         self.postMessage({ status: 'success', result }, transferList);
     } catch (error) {
