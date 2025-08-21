@@ -339,9 +339,9 @@ class HUD {
       if (!items || !items.length) return this._showResults(false);
       for (const it of items) {
         const el = document.createElement('button');
-        el.className = 'w-full text-left px-3 py-2 hover:bg-white/5 text-sm';
-        el.innerHTML = `<div class="font-medium">${it.name}</div>
-                        <div class="text-xs opacity-70">${it.addr}</div>`;
+        el.className = 'w-full text-left px-3 py-2 hover:bg-white/5 text-sm break-words';
+        el.innerHTML = `<div class="font-medium truncate pr-2">${it.name}</div>
+                        <div class="text-xs opacity-70 truncate pr-2">${it.addr}</div>`;
         el.onclick = () => { this._goTo(it.lat, it.lon); this._showResults(false); };
         list.appendChild(el);
       }
