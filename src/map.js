@@ -27,8 +27,17 @@ class HUD {
     const menu         = document.querySelector('#settings-menu');
     const composerPlus = document.querySelector('#composer-plus');
     const closeMenu    = document.querySelector('#menu-close');
+    
+    // Voxelization methods menu
+    const voxelMethodsMenu = document.querySelector('#voxel-methods-menu');
+    const voxelMethodsBtn  = document.querySelector('#voxel-methods-btn');
+    const voxelMethodsBack = document.querySelector('#voxel-methods-back');
+    const voxelMethodsClose = document.querySelector('#voxel-methods-close');
 
-    console.log('Elements found:', { menu: !!menu, composerPlus: !!composerPlus, closeMenu: !!closeMenu });
+    console.log('Elements found:', { 
+      menu: !!menu, composerPlus: !!composerPlus, closeMenu: !!closeMenu,
+      voxelMethodsMenu: !!voxelMethodsMenu, voxelMethodsBtn: !!voxelMethodsBtn, voxelMethodsBack: !!voxelMethodsBack, voxelMethodsClose: !!voxelMethodsClose
+    });
 
     if (!menu || !composerPlus || !closeMenu) {
       console.error('Missing menu elements:', { menu, composerPlus, closeMenu });
@@ -37,13 +46,29 @@ class HUD {
       return;
     }
 
-    const openMenu   = () => { 
+    const openMenu          = () => { 
       console.log('Opening menu');
       menu.classList.remove('hidden'); 
+      voxelMethodsMenu?.classList.add('hidden');
     };
-    const hideMenu   = () => { 
+    const hideMenu          = () => { 
       console.log('Closing menu');
       menu.classList.add('hidden'); 
+      voxelMethodsMenu?.classList.add('hidden');
+    };
+    const openVoxelMethods  = () => {
+      console.log('Opening voxel methods menu');
+      menu?.classList.add('hidden');
+      voxelMethodsMenu?.classList.remove('hidden');
+    };
+    const closeVoxelMethods = () => {
+      console.log('Closing voxel methods menu');
+      voxelMethodsMenu?.classList.add('hidden');
+    };
+    const backToSettings = () => {
+      console.log('Going back to settings menu');
+      voxelMethodsMenu?.classList.add('hidden');
+      menu?.classList.remove('hidden');
     };
     
     // Add event listeners with proper event handling
@@ -64,17 +89,51 @@ class HUD {
       hideMenu();
     });
 
-    // Close menu when clicking outside (but not on the plus button)
+    // Voxelization methods navigation
+    if (voxelMethodsBtn) {
+      voxelMethodsBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openVoxelMethods();
+      });
+    }
+
+    if (voxelMethodsBack) {
+      voxelMethodsBack.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        backToSettings();
+      });
+    }
+
+    if (voxelMethodsClose) {
+      voxelMethodsClose.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeVoxelMethods();
+      });
+    }
+
+    // Close menus when clicking outside
     document.addEventListener('click', (e) => {
-      if (!menu.contains(e.target) && e.target !== composerPlus && !composerPlus.contains(e.target)) {
+      if (!menu.contains(e.target) && 
+          !voxelMethodsMenu?.contains(e.target) &&
+          e.target !== composerPlus && 
+          !composerPlus.contains(e.target)) {
         hideMenu();
       }
     });
 
-    // Prevent menu from closing when interacting with form elements inside
+    // Prevent menus from closing when interacting with form elements inside
     menu.addEventListener('click', (e) => {
       e.stopPropagation();
     });
+
+    if (voxelMethodsMenu) {
+      voxelMethodsMenu.addEventListener('click', (e) => {
+        e.stopPropagation();
+      });
+    }
 
     this._initializeBasicElements();
   }
@@ -91,6 +150,8 @@ class HUD {
         if (this.keyInput) {
           localStorage.setItem('token', this.keyInput.value.trim());
           toast('Saved API key');
+          // Refresh tiles when API key changes
+          this.refreshTiles();
         }
       };
     }
@@ -117,6 +178,15 @@ class HUD {
     this.resPills  = [...document.querySelectorAll('.res-pill')];
     this.resFine   = document.querySelector('#res-fine');
 
+    // Voxelization method controls
+    this.voxelMethodRadios = [...document.querySelectorAll('input[name="voxel-method"]')];
+
+    // Load saved voxelization method (default to 2.5d-scan)
+    const savedMethod = localStorage.getItem('voxelMethod') || '2.5d-scan';
+    this.voxelMethodRadios.forEach(radio => {
+      radio.checked = radio.value === savedMethod;
+    });
+
     // Load saved coords
     const saved = localStorage.getItem('coords');
     if (saved && this.coordsEl) this.coordsEl.value = saved;
@@ -126,6 +196,7 @@ class HUD {
     if (this.search && this.sendBtn) this._wireComposer();
     if (this.search) this._wireSearch();
     if (this.toggleVox) this._wireVoxUI();
+    if (this.voxelMethodRadios.length) this._wireVoxelMethods();
     this._wireCameraControls();
 
     this.setStatus('Ready');
@@ -240,6 +311,34 @@ class HUD {
     }
   }
 
+  /* ─── Voxelization Methods panel ─────────────────────────────── */
+  _wireVoxelMethods() {
+    this.voxelMethodRadios.forEach(radio => {
+      radio.addEventListener('change', e => {
+        if (e.target.checked) {
+          localStorage.setItem('voxelMethod', e.target.value);
+          console.log('Voxelization method changed to:', e.target.value);
+          // Always trigger rebuild when method changes (user wants to see the difference)
+          if (state.vox) {
+            rebuildAll();
+          }
+        }
+      });
+    });
+  }
+
+  getVoxelizationMethod() {
+    const selected = this.voxelMethodRadios.find(r => r.checked);
+    return selected ? selected.value : '2.5d-scan'; // default fallback
+  }
+
+  refreshTiles() {
+    if (tiles && tiles.layer) {
+      // Force refresh of the Google Earth tiles layer
+      tiles.layer.refresh();
+    }
+  }
+
   /* ─── Suggestions (chips above composer) ─────────────────────── */
   _renderSuggestions() {
     const PICKS = [
@@ -257,7 +356,13 @@ class HUD {
       const b = document.createElement('button');
       b.className = 'flex-shrink-0 rounded-lg bg-white/5 hover:bg-white/10 px-2 py-1 text-xs text-nowrap transition-all';
       b.textContent = p.label;
-      b.onclick = () => this._goTo(p.lat, p.lon, p.view);
+      b.onclick = () => {
+        // Update the search input field with the selected location
+        if (this.search) {
+          this.search.value = p.label;
+        }
+        this._goTo(p.lat, p.lon, p.view);
+      };
       this.suggestions.appendChild(b);
     }
   }
@@ -342,7 +447,14 @@ class HUD {
         el.className = 'w-full text-left px-3 py-2 hover:bg-white/5 text-sm break-words';
         el.innerHTML = `<div class="font-medium truncate pr-2">${it.name}</div>
                         <div class="text-xs opacity-70 truncate pr-2">${it.addr}</div>`;
-        el.onclick = () => { this._goTo(it.lat, it.lon); this._showResults(false); };
+        el.onclick = () => { 
+          // Update the search input field with the selected location name
+          if (this.search) {
+            this.search.value = it.name;
+          }
+          this._goTo(it.lat, it.lon); 
+          this._showResults(false); 
+        };
         list.appendChild(el);
       }
       this._showResults(true);
@@ -1025,6 +1137,7 @@ async function buildVoxelFor(tile){
       model: tile,
       resolution: perTileResolution,
       needGrid: state.mc,   // ← only when Minecraft is enabled
+      method: ui.getVoxelizationMethod(), // ← pass selected method
       onStart: w => { workerRef = w; tile._voxWorker = w; }
     });
     
@@ -1078,7 +1191,8 @@ async function buildMinecraftFor(tile){
       const vox = await voxelizeModel({
         model: tile._tempContainer,          // already cloned container
         resolution: perTileResolution,
-        needGrid: true
+        needGrid: true,
+        method: ui.getVoxelizationMethod() // ← pass selected method
       });
       tile._voxelizer._voxelGrid = vox._voxelGrid;
       if (!vox._voxelGrid) {

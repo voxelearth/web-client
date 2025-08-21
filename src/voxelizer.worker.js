@@ -202,10 +202,11 @@ function kMeansPalette(colors, k = 64, iters = 8) {
 
 // --- The Main Voxelizer Class ---
 class WorkerVoxelizer {
-    async init({ modelData, voxelSize, maxGrid = Infinity, paletteSize = 256, needGrid = false }) {
+    async init({ modelData, voxelSize, maxGrid = Infinity, paletteSize = 256, needGrid = false, method = '2.5d-scan' }) {
         this.voxelSize = voxelSize;
         this.paletteSize = paletteSize;
         this.needGrid = needGrid;
+        this.method = method;
         this.imageDatas = new Map(modelData.imageDatas);
 
         const model = this.#reconstructModel(modelData);
@@ -221,7 +222,13 @@ class WorkerVoxelizer {
         this.grid = new THREE.Vector3(Math.ceil(nx*scale), Math.ceil(ny*scale), Math.ceil(nz*scale));
         this.voxelSize /= scale;
 
-        this.#cpuRasterize();
+        // Choose rasterization method
+        if (this.method === '3d-sat') {
+            this.#cpuRasterize3DSAT();
+        } else {
+            this.#cpuRasterize2D5(); // Default: 2.5D scan converter
+        }
+        
         this.filledVoxelCount = this._rasterResult?.filledCount ?? 0;
         const result = this.#buildGreedyMeshChunks();   // NEW
         const voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
@@ -365,7 +372,183 @@ class WorkerVoxelizer {
         };
     }
     
-    #cpuRasterize() {
+    #cpuRasterize2D5() {
+        const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
+        const total = NX * NY * NZ;
+
+        // Outputs (same as before)
+        const voxelTri  = new Int32Array(total);  voxelTri.fill(-1);
+        const voxelDist = new Float32Array(total); voxelDist.fill(Infinity);
+        const filled    = new Uint32Array(total); // worst-case list
+        let   filledCount = 0;
+
+        // Helpers
+        const index1D = (x,y,z) => x + NX * (y + NY * z);
+
+        // Precompute vertex positions in **voxel space** once
+        // pVox[k*3 + 0|1|2] = (pos - bbox.min) / voxelSize
+        const pVox = new Float32Array(this.positions.length);
+        const invVS = 1 / this.voxelSize;
+        const bx = this.bbox.min.x, by = this.bbox.min.y, bz = this.bbox.min.z;
+
+        for (let i = 0, n = this.positions.length / 3; i < n; i++) {
+            const x = this.positions[i*3+0], y = this.positions[i*3+1], z = this.positions[i*3+2];
+            pVox[i*3+0] = (x - bx) * invVS;
+            pVox[i*3+1] = (y - by) * invVS;
+            pVox[i*3+2] = (z - bz) * invVS;
+        }
+
+        // Temporary scalars
+        let uAxis=0, vAxis=1, wAxis=2;
+
+        // For each triangle
+        const triCount = (this.indices.length / 3) | 0;
+        for (let t = 0; t < triCount; t++) {
+            const i0 = this.indices[t*3+0], i1 = this.indices[t*3+1], i2 = this.indices[t*3+2];
+
+            // Fetch vertices in voxel space
+            const x0 = pVox[i0*3+0], y0 = pVox[i0*3+1], z0 = pVox[i0*3+2];
+            const x1 = pVox[i1*3+0], y1 = pVox[i1*3+1], z1 = pVox[i1*3+2];
+            const x2 = pVox[i2*3+0], y2 = pVox[i2*3+1], z2 = pVox[i2*3+2];
+
+            // Triangle normal in voxel space (for major-axis and distance scale)
+            const e10x = x1 - x0, e10y = y1 - y0, e10z = z1 - z0;
+            const e20x = x2 - x0, e20y = y2 - y0, e20z = z2 - z0;
+            const nx = e10y*e20z - e10z*e20y;
+            const ny = e10z*e20x - e10x*e20z;
+            const nz = e10x*e20y - e10y*e20x;
+            const abx = Math.abs(nx), aby = Math.abs(ny), abz = Math.abs(nz);
+            const nn  = nx*nx + ny*ny + nz*nz;
+            if (nn < 1e-12) continue; // degenerate
+
+            // Choose dominant axis (w), and corresponding 2D projection (u,v)
+            if (abx >= aby && abx >= abz) { wAxis = 0; uAxis = 1; vAxis = 2; }     // X-major → (u,v) = (Y,Z)
+            else if (aby >= abx && aby >= abz) { wAxis = 1; uAxis = 2; vAxis = 0; } // Y-major → (u,v) = (Z,X)
+            else { wAxis = 2; uAxis = 0; vAxis = 1; }                               // Z-major → (u,v) = (X,Y)
+
+            // Read components by axis quickly
+            const U0 = (uAxis===0?x0:uAxis===1?y0:z0), V0 = (vAxis===0?x0:vAxis===1?y0:z0), W0 = (wAxis===0?x0:wAxis===1?y0:z0);
+            const U1 = (uAxis===0?x1:uAxis===1?y1:z1), V1 = (vAxis===0?x1:vAxis===1?y1:z1), W1 = (wAxis===0?x1:wAxis===1?y1:z1);
+            const U2 = (uAxis===0?x2:uAxis===1?y2:z2), V2 = (vAxis===0?x2:vAxis===1?y2:z2), W2 = (wAxis===0?x2:wAxis===1?y2:z2);
+
+            // 2D area (denominator for barycentric); skip near-zero projected area
+            const denom = (V1 - V2)*(U0 - U2) + (U2 - U1)*(V0 - V2);
+            if (Math.abs(denom) < 1e-12) continue;
+            const invDen = 1.0 / denom;
+
+            // Plane interpolation in terms of (u,v): W = λ0*W0 + λ1*W1 + λ2*W2
+            // Precompute row/col increments for λ0, λ1 (λ2 = 1 - λ0 - λ1)
+            const dL0du = (V1 - V2) * invDen;
+            const dL0dv = (U2 - U1) * invDen;
+            const dL1du = (V2 - V0) * invDen;
+            const dL1dv = (U0 - U2) * invDen;
+
+            // Conservative 2D integer bbox on (u,v); clamp to grid extents
+            const uMin = Math.max(0, Math.floor(Math.min(U0, U1, U2)));
+            const vMin = Math.max(0, Math.floor(Math.min(V0, V1, V2)));
+            const uMax = Math.min((uAxis===0?NX-1:uAxis===1?NY-1:NZ-1), Math.floor(Math.max(U0, U1, U2)));
+            const vMax = Math.min((vAxis===0?NX-1:vAxis===1?NY-1:NZ-1), Math.floor(Math.max(V0, V1, V2)));
+            if (uMin > uMax || vMin > vMax) continue;
+
+            // Distance scaling: |dist_normal|^2 = (ΔW)^2 * (n_w^2 / |n|^2)
+            const nW = (wAxis===0?nx:(wAxis===1?ny:nz));
+            const distScale = (nW*nW) / nn;
+
+            // Pixel-center offset (u+0.5, v+0.5)
+            const eps = 1e-6; // inside tolerance
+
+            for (let v = vMin; v <= vMax; v++) {
+                // λ0, λ1 at (uMin+0.5, v+0.5)
+                const uu0 = (uMin + 0.5), vv0 = (v + 0.5);
+                let L0 = ((V1 - V2)*(uu0 - U2) + (U2 - U1)*(vv0 - V2)) * invDen;
+                let L1 = ((V2 - V0)*(uu0 - U2) + (U0 - U2)*(vv0 - V2)) * invDen;
+                let L2 = 1.0 - L0 - L1;
+
+                // Precompute W at start of row and dW/du
+                let W = L0*W0 + L1*W1 + L2*W2;
+                const dWdu = dL0du*W0 + dL1du*W1 - (dL0du + dL1du)*W2;
+
+                // Row scan
+                for (let u = uMin; u <= uMax; u++) {
+                    // Inside test using barycentric (top-left rule approx via small epsilon)
+                    if (L0 >= -eps && L1 >= -eps && L2 >= -eps) {
+                        // Candidate voxel along W (nearest slice)
+                        const wIdx = Math.floor(W);
+                        // Update up to two nearest slices for conservativeness
+                        // primary
+                        if (wIdx >= 0 && wIdx < (wAxis===0?NX:(wAxis===1?NY:NZ))) {
+                            const delta = W - (wIdx + 0.5);
+                            const d2 = delta*delta * distScale;
+
+                            let x = 0, y = 0, z = 0;
+                            // Clear branch-based mapping for axis assignment
+                            if (wAxis === 2) { // Z-major: (u,v)=(X,Y), W=Z
+                                x = u;
+                                y = v;
+                                z = wIdx;
+                            } else if (wAxis === 1) { // Y-major: (u,v)=(Z,X), W=Y
+                                z = u;
+                                x = v;
+                                y = wIdx;
+                            } else { // X-major: (u,v)=(Y,Z), W=X
+                                y = u;
+                                z = v;
+                                x = wIdx;
+                            }
+
+                            const lin = index1D(x|0, y|0, z|0);
+                            if (d2 < voxelDist[lin]) {
+                                voxelDist[lin] = d2;
+                                if (voxelTri[lin] === -1) filled[filledCount++] = lin;
+                                voxelTri[lin] = t;
+                            }
+                        }
+
+                        // secondary neighbor if plane crosses near boundary (captures thin surfaces)
+                        const frac = W - Math.floor(W);
+                        if (frac < 0.15 || frac > 0.85) {
+                            const w2 = (W - (wIdx + 0.5)) < 0 ? (wIdx - 1) : (wIdx + 1);
+                            if (w2 >= 0 && w2 < (wAxis===0?NX:(wAxis===1?NY:NZ))) {
+                                let x2=0,y2=0,z2=0;
+                                if (wAxis === 2) { x2 = u; y2 = v; z2 = w2; }
+                                else if (wAxis === 1) { z2 = u; x2 = v; y2 = w2; }
+                                else { y2 = u; z2 = v; x2 = w2; }
+                                const lin2 = index1D(x2|0, y2|0, z2|0);
+                                const d2b = (W - (w2 + 0.5)); // signed
+                                const d2n = d2b*d2b * distScale;
+                                if (d2n < voxelDist[lin2]) {
+                                    voxelDist[lin2] = d2n;
+                                    if (voxelTri[lin2] === -1) filled[filledCount++] = lin2;
+                                    voxelTri[lin2] = t;
+                                }
+                            }
+                        }
+                    }
+
+                    // advance to next pixel in row
+                    L0 += dL0du;
+                    L1 += dL1du;
+                    L2 = 1.0 - L0 - L1;
+                    W  += dWdu;
+                } // u
+
+                // advance to next row (v+1)
+                // (recompute L0, L1 for numerical stability)
+                const uu1 = (uMin + 0.5), vv1 = ((v + 1) + 0.5);
+                L0 = ((V1 - V2)*(uu1 - U2) + (U2 - U1)*(vv1 - V2)) * invDen;
+                L1 = ((V2 - V0)*(uu1 - U2) + (U0 - U2)*(vv1 - V2)) * invDen;
+                // L2 implied; W recomputed below for clarity & numeric stability
+                const L2row = 1.0 - L0 - L1;
+                W = L0*W0 + L1*W1 + L2row*W2;
+                // dWdu unchanged per triangle
+            } // v
+        } // tri loop
+
+        this.filledVoxelCount = filledCount;
+        this._rasterResult = { NX, NY, NZ, voxelTri, voxelDist, filled, filledCount };
+    }
+
+    #cpuRasterize3DSAT() {
         const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const total = NX * NY * NZ;
         const index1D = (x,y,z) => x + NX * (y + NY * z);
@@ -824,7 +1007,7 @@ class WorkerVoxelizer {
 // --- Worker Entry Point ---
 self.onmessage = async (event) => {
     try {
-        const { modelData, resolution, needGrid = false } = event.data;
+        const { modelData, resolution, needGrid = false, method = '2.5d-scan' } = event.data;
         
         const bbox = new THREE.Box3(
             new THREE.Vector3().fromArray(modelData.bbox.min),
@@ -836,7 +1019,7 @@ self.onmessage = async (event) => {
         const voxelSize = maxDim / resolution;
 
         const voxelizer = new WorkerVoxelizer();
-        const result = await voxelizer.init({ modelData, voxelSize, needGrid });
+        const result = await voxelizer.init({ modelData, voxelSize, needGrid, method });
         
         const transferList = [];
         if (result.voxelGrid?.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);

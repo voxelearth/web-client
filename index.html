@@ -44,10 +44,11 @@
 <body class="text-white font-sans selection:bg-white/20">
 
   <!-- Settings menu popup -->
-  <div id="settings-menu" class="hidden fixed bottom-[80px] md:bottom-[80px] left-4 right-4 md:left-4 md:right-auto z-50">
-    <div class="glass elev rounded-2xl p-4 mobile-compact w-full md:w-[320px] max-w-[90vw] space-y-4">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
+  <div id="settings-menu" class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-start z-50 px-2">
+    <div class="w-full max-w-[min(820px,96vw)] mx-auto flex">
+      <div class="glass elev rounded-2xl p-4 mobile-compact w-full md:w-[320px] max-w-[90vw] space-y-4">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
           <span class="material-symbols-rounded">tune</span> Options
         </div>
         <button id="menu-close" class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
@@ -80,6 +81,18 @@
             </label>
           </div>
           <div class="text-xs opacity-60 mt-1">Enable after voxels are on.</div>
+        </div>
+
+        <div class="cursor-pointer hover:bg-white/5 -mx-2 px-2 py-1 rounded" id="voxel-methods-btn">
+          <div class="flex items-stretch">
+            <div class="flex-1">
+              <div class="text-sm font-medium opacity-80">Voxelization Methods</div>
+              <div class="text-xs opacity-60 mt-1">Choose algorithm speed vs accuracy.</div>
+            </div>
+            <div class="flex items-center justify-center px-2">
+              <span class="material-symbols-rounded text-2xl opacity-70">edit</span>
+            </div>
+          </div>
         </div>
 
         <div id="debug-imagery-row" style="display: none;">
@@ -118,6 +131,89 @@
             <button id="save-settings" class="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg bg-white/10 hover:bg-white/20 px-3 py-2 text-xs mobile-button">Save</button>
           </div>
           <div class="text-[11px] opacity-60 leading-4 mt-1">Stored locally in this browser.</div>
+        </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Voxelization Methods menu popup -->
+  <div id="voxel-methods-menu" class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-start z-50 px-2">
+    <div class="w-full max-w-[min(820px,96vw)] mx-auto flex">
+      <div class="glass elev rounded-2xl p-4 mobile-compact w-full md:w-[320px] max-w-[90vw] space-y-4">
+        <div class="flex items-center justify-between">
+          <button id="voxel-methods-back" class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
+          <span class="material-symbols-rounded text-lg">arrow_back</span>
+        </button>
+        <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
+          Voxelization Methods
+        </div>
+        <button id="voxel-methods-close" class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
+          <span class="material-symbols-rounded text-lg">close</span>
+        </button>
+      </div>
+
+      <div class="space-y-3">
+        <!-- 3D SAT (Original) Method -->
+        <label class="flex items-center p-3 rounded-xl hover:bg-white/5 cursor-pointer transition-colors">
+          <input name="voxel-method" type="radio" class="sr-only peer" value="3d-sat">
+          <div class="w-5 h-5 rounded-full border-2 border-white/30 peer-checked:border-blue-500 peer-checked:bg-blue-500 flex items-center justify-center mr-3 transition-colors">
+            <span class="material-symbols-rounded text-white text-xs opacity-0 peer-checked:opacity-100">check</span>
+          </div>
+          <div class="flex-1">
+            <div class="flex items-center gap-2 mb-1">
+              <div class="text-sm font-medium">3D SAT</div>
+              <div class="px-2 py-0.5 rounded-full bg-yellow-500/20 text-yellow-400 text-xs font-medium">~1x</div>
+            </div>
+            <div class="text-xs opacity-60 leading-relaxed">Full 3D separating axis tests. Most accurate but slower.</div>
+          </div>
+        </label>
+
+        <!-- 2.5D Scan Converter (Current Default) -->
+        <label class="flex items-center p-3 rounded-xl hover:bg-white/5 cursor-pointer transition-colors">
+          <input name="voxel-method" type="radio" class="sr-only peer" value="2.5d-scan" checked>
+          <div class="w-5 h-5 rounded-full border-2 border-white/30 peer-checked:border-blue-500 peer-checked:bg-blue-500 flex items-center justify-center mr-3 transition-colors">
+            <span class="material-symbols-rounded text-white text-xs opacity-0 peer-checked:opacity-100">check</span>
+          </div>
+          <div class="flex-1">
+            <div class="flex items-center gap-2 mb-1">
+              <div class="text-sm font-medium">2.5D Scan Converter</div>
+              <div class="px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 text-xs font-medium">~10x</div>
+              <div class="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 text-xs font-medium">DEFAULT</div>
+            </div>
+            <div class="text-xs opacity-60 leading-relaxed">Dominant-plane projection with incremental barycentric stepping.</div>
+          </div>
+        </label>
+
+        <!-- Rust WASM (Future) -->
+        <div class="flex items-center p-3 rounded-xl bg-white/2 opacity-70 cursor-not-allowed">
+          <div class="w-5 h-5 rounded-full border-2 border-white/30 flex items-center justify-center mr-3">
+            <span class="material-symbols-rounded text-white/30 text-xs">lock</span>
+          </div>
+          <div class="flex-1">
+            <div class="flex items-center gap-2 mb-1">
+              <div class="text-sm font-medium text-white/80">Rust WASM</div>
+              <div class="px-2 py-0.5 rounded-full bg-orange-500/10 text-orange-400/80 text-xs font-medium">~50x</div>
+              <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium">FUTURE</div>
+            </div>
+            <div class="text-xs opacity-60 leading-relaxed">Native-speed voxelization compiled to WebAssembly with SIMD optimizations.</div>
+          </div>
+        </div>
+
+        <!-- WebGPU (Coming Soon) -->
+        <div class="flex items-center p-3 rounded-xl bg-white/2 opacity-70 cursor-not-allowed">
+          <div class="w-5 h-5 rounded-full border-2 border-white/30 flex items-center justify-center mr-3">
+            <span class="material-symbols-rounded text-white/30 text-xs">lock</span>
+          </div>
+          <div class="flex-1">
+            <div class="flex items-center gap-2 mb-1">
+              <div class="text-sm font-medium text-white/80">WebGPU Compute</div>
+              <div class="px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400/80 text-xs font-medium">~100x</div>
+              <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium">COMING SOON</div>
+            </div>
+            <div class="text-xs opacity-60 leading-relaxed">GPU-accelerated parallel voxelization with compute shaders.</div>
+          </div>
+        </div>
         </div>
       </div>
     </div>
