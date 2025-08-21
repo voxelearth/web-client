@@ -68,6 +68,20 @@
           <div class="text-xs opacity-60 mt-1">Enable after voxels are on.</div>
         </div>
 
+        <div id="debug-imagery-row" style="display: none;">
+          <div class="flex items-center justify-between">
+            <div class="text-sm font-medium opacity-80">Debug imagery</div>
+            <label class="inline-flex items-center cursor-pointer">
+              <div class="relative">
+                <input id="toggle-debug-imagery" type="checkbox" class="sr-only peer">
+                <div class="w-11 h-6 bg-white/10 peer-checked:bg-orange-500/80 rounded-full relative transition"></div>
+                <div class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5"></div>
+              </div>
+            </label>
+          </div>
+          <div class="text-xs opacity-60 mt-1">Hide original imagery to see voxel coverage.</div>
+        </div>
+
         <div>
           <div class="text-sm font-medium opacity-80 mb-2">Voxel resolution</div>
           <div class="grid grid-cols-4 gap-1 bg-white/5 rounded-xl p-1">

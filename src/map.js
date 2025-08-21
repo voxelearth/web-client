@@ -112,6 +112,8 @@ class HUD {
     // Vox controls (in drawer)
     this.toggleVox = document.querySelector('#toggle-vox');
     this.toggleMC  = document.querySelector('#toggle-mc');
+    this.debugImageryRow = document.querySelector('#debug-imagery-row');
+    this.toggleDebugImagery = document.querySelector('#toggle-debug-imagery');
     this.resPills  = [...document.querySelectorAll('.res-pill')];
     this.resFine   = document.querySelector('#res-fine');
 
@@ -191,6 +193,15 @@ class HUD {
             state.mc = false;
           }
         }
+        // Show/Hide Debug imagery row when voxel mode changes
+        if (this.debugImageryRow) {
+          this.debugImageryRow.style.display = state.vox ? '' : 'none';
+        }
+        if (!state.vox) {
+          // Reset debugImagery when voxels are off
+          state.debugImagery = false;
+          if (this.toggleDebugImagery) this.toggleDebugImagery.checked = false;
+        }
         updateVis();
       });
     }
@@ -198,6 +209,13 @@ class HUD {
     if (this.toggleMC) {
       this.toggleMC.addEventListener('change', e => {
         state.mc = e.target.checked;
+        updateVis();
+      });
+    }
+
+    if (this.toggleDebugImagery) {
+      this.toggleDebugImagery.addEventListener('change', e => {
+        state.debugImagery = e.target.checked;
         updateVis();
       });
     }
@@ -767,7 +785,10 @@ let __desiredView = null; // populated by HUD._goTo
 let freecamUpdateFn = null; // Will be set by camera controls
 
 /* ─────────────────────────────────── GUI & state ──────────────────── */
-const state = { resolution: 64, vox: true, mc: false };
+const LAYER_IMAGERY = 0;   // Google 3D Tiles
+const LAYER_VOXELS  = 1;   // Our voxel meshes / MC
+
+const state = { resolution: 64, vox: true, mc: false, debugImagery: false };
 let lastVoxelUpdateTime = 0;
 
 (() => {
@@ -780,9 +801,16 @@ let lastVoxelUpdateTime = 0;
 
   scene=new THREE.Scene();
   scene.background=new THREE.Color(0x151c1f);
-  scene.add(new THREE.HemisphereLight(0xffffff,0x202020,1));
+  const hemi = new THREE.HemisphereLight(0xffffff,0x202020,1);
+  scene.add(hemi);
+  // Lights affect both layers
+  hemi.layers.enable(LAYER_IMAGERY);
+  hemi.layers.enable(LAYER_VOXELS);
 
   camera=new THREE.PerspectiveCamera(60,1,0.1,1_600_000);
+  // Camera can render both layers; we'll toggle them later
+  camera.layers.enable(LAYER_IMAGERY);
+  camera.layers.enable(LAYER_VOXELS);
   controls=new OrbitControls(camera,renderer.domElement);
   controls.enableDamping=true; controls.maxDistance=3e4;
 
@@ -879,6 +907,8 @@ function spawnTiles(root,key,latDeg,lonDeg){
     // The actual three.js mesh group is in 'tile.cached.scene'.
     const tileGroup = tile.cached.scene;
     if (!tileGroup) return; // Group not loaded yet.
+    
+    tileGroup.userData.rendererVisible = visible;  // <- remember renderer's idea
 
     if (visible) {
       // If voxel mode is on and this tile becomes visible, build its voxel mesh.
@@ -888,6 +918,10 @@ function spawnTiles(root,key,latDeg,lonDeg){
         buildVoxelFor(tileGroup);
       }
     } else {
+      // Cancel in-flight worker if tile becomes invisible
+      try { tileGroup._voxWorker?.terminate?.(); } catch {}
+      voxelizingTiles.delete(tileGroup);
+      
       // Just hide voxels when tile becomes invisible - keep them cached for instant return
       // Only dispose in onTileDispose when the tile is actually removed from cache
       if (tileGroup._voxMesh) tileGroup._voxMesh.visible = false;
@@ -942,7 +976,9 @@ const voxelizingTiles = new Set();
 const disposingTiles = new Set();
 
 // --- New: distance-aware resolution & concurrency budget ---
-const MAX_CONCURRENT_VOXELIZERS = 1;     // was effectively 3; lower = calmer UI
+const CPU = (navigator.hardwareConcurrency || 4);
+const MAX_CONCURRENT_VOXELIZERS = Math.max(1, Math.min(4, Math.floor(CPU / 2)));
+const MOVING_BUDGET = 1; // keep UI smooth while the camera is in motion
 const TARGET_PX_PER_VOXEL       = 3;     // tweak to taste (2..4 is a good band)
 
 function screenRadiusForObject(obj) {
@@ -965,7 +1001,8 @@ function resolutionForTile(tile) {
 }
 
 async function buildVoxelFor(tile){
-  if(!tile || tile._voxMesh || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile) || !tile.visible) return;
+  const rendererVisible = tile?.userData?.rendererVisible ?? tile?.visible ?? false;
+  if(!tile || tile._voxMesh || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile) || !rendererVisible) return;
   if(!tile.parent || tile.parent !== tiles.group) return;
   
   let hasMeshes = false;
@@ -982,32 +1019,43 @@ async function buildVoxelFor(tile){
   
   voxelizingTiles.add(tile);
   try{
-    tile.updateMatrixWorld(true);
-    const tempContainer = new THREE.Group();
-    tempContainer.applyMatrix4(tile.matrixWorld);
-    const clone = tile.clone(true);
-    clone.position.set(0, 0, 0);
-    clone.rotation.set(0, 0, 0);
-    clone.scale.set(1, 1, 1);
-    tempContainer.add(clone);
-    
     const perTileResolution = resolutionForTile(tile);
-    const vox = await voxelizeModel({ model: tempContainer, renderer, scene, resolution: perTileResolution });
+    let workerRef = null;
+    const vox = await voxelizeModel({
+      model: tile,
+      resolution: perTileResolution,
+      needGrid: state.mc,   // ← only when Minecraft is enabled
+      onStart: w => { workerRef = w; tile._voxWorker = w; }
+    });
     
     if(!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
-      dispose(vox.voxelMesh);
-      dispose(tempContainer);
+      try { workerRef?.terminate?.(); } catch{} 
+      dispose(vox.voxelMesh); 
       return;
     }
 
     const vMesh = vox.voxelMesh;
     vMesh.matrixAutoUpdate = false;
     vMesh.userData.sourceTile = tile;
+    
+    // assign smaller renderOrder for nearer chunks (better early-Z)
+    vMesh.traverse(m=>{
+      if (!m.isMesh) return;
+      const bb = m.geometry.boundingBox;
+      if (bb) {
+        const c = bb.getCenter(new THREE.Vector3());
+        m.renderOrder = -camera.position.distanceToSquared(c);
+      }
+    });
+    
+    // Put voxels on the voxel layer
+    vMesh.traverse(n => n.layers.set(LAYER_VOXELS));
     scene.add(vMesh);
 
     tile._voxMesh = vMesh;
     tile._voxelizer = vox;
-    tile._tempContainer = tempContainer;
+    tile._tempContainer = new THREE.Group(); // still used for MC export
+    tile._tempContainer._voxelGrid = vox._voxelGrid;
 
     if(state.mc) await buildMinecraftFor(tile);
     applyVis(tile);
@@ -1022,6 +1070,26 @@ async function buildVoxelFor(tile){
 async function buildMinecraftFor(tile){
   if(!tile || tile._mcMesh || !tile._voxelizer || !tile._tempContainer || disposingTiles.has(tile)) return;
   if(!tile.parent || tile.parent !== tiles.group) return;
+  
+  // make sure we have a voxel grid (we skipped it when MC was off)
+  if (!tile._voxelizer._voxelGrid) {
+    try {
+      const perTileResolution = resolutionForTile(tile);
+      const vox = await voxelizeModel({
+        model: tile._tempContainer,          // already cloned container
+        resolution: perTileResolution,
+        needGrid: true
+      });
+      tile._voxelizer._voxelGrid = vox._voxelGrid;
+      if (!vox._voxelGrid) {
+        console.warn('Voxel grid too large to export; reduce resolution or zoom in.');
+        return; // bail gracefully
+      }
+    } catch(e) {
+      console.warn('Failed to generate voxel grid for MC:', e);
+      return;
+    }
+  }
   
   try {
     await initBlockData();
@@ -1039,6 +1107,7 @@ async function buildMinecraftFor(tile){
     const mc = container.getObjectByName('voxelGroup');
     if(mc){
       mc.matrixAutoUpdate = false;
+      mc.traverse(n => n.layers.set(LAYER_VOXELS));
       scene.add(mc);
       tile._mcMesh = mc;
       mc.userData.sourceTile = tile;
@@ -1054,15 +1123,20 @@ function onTileLoad({scene:tile}){
   if(!tile || !tile.parent || tile.parent !== tiles.group || tile.type !== 'Group') return;
   tile.updateMatrixWorld(true);
 
+  // All original meshes live on the imagery layer
+  tile.traverse(n => n.layers.set(LAYER_IMAGERY));
+
   // The complex 'cleanupOverlappingVoxels' is no longer needed.
   // The 'tile-visibility-change' event now handles removing voxels from
   // parent tiles when children (higher LODs) are loaded.
   applyVis(tile);
   
   // Automatically voxelize if vox mode is on.
-  if(state.vox && !isInteracting && tile.visible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
+  const rendererVisible = tile?.userData?.rendererVisible ?? tile.visible;
+  if(state.vox && !isInteracting && rendererVisible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
     requestAnimationFrame(() => {
-      if(!isInteracting && tile.parent && tile.visible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
+      const stillVisible = tile?.userData?.rendererVisible ?? tile.visible;
+      if(!isInteracting && tile.parent && stillVisible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
         buildVoxelFor(tile);
       }
     });
@@ -1083,6 +1157,7 @@ function cleanupTileVoxels(tile){
   
   disposingTiles.add(tile);
   try {
+    try { tile._voxWorker?.terminate?.(); } catch {}
     dispose(tile._voxMesh); 
     dispose(tile._mcMesh);
     dispose(tile._tempContainer);
@@ -1094,6 +1169,7 @@ function cleanupTileVoxels(tile){
     delete tile._voxelizer;
     delete tile._tempContainer;
     delete tile._voxError;  // allow retry after cleanup
+    delete tile._voxWorker;
   } finally {
     disposingTiles.delete(tile);
   }
@@ -1101,19 +1177,25 @@ function cleanupTileVoxels(tile){
 
 /* ─────────────────────── visibility resolver ─────────────────────── */
 function applyVis(tile){
-  if(!tile || !tile.parent || tile.parent !== tiles.group || typeof tile.type !== 'string' || tile.visible === undefined) return;
+  if(!tile || !tile.parent || tile.parent !== tiles.group || typeof tile.type !== 'string') return;
   
   // Note: We no longer hide voxels during interaction - they stay visible for smoother experience
   // Only new voxelization builds are paused during interaction
 
   const showV = state.vox && !state.mc;
   const showM = state.vox &&  state.mc;
-  const building = voxelizingTiles.has(tile);
-  const hasVoxelVersion = tile._voxMesh || tile._mcMesh;
-  // The visibility of the tile itself is controlled by the renderer for LOD.
-  // When in voxel mode, we hide the original tile IF a voxel version exists,
-  // letting the voxel mesh be visible instead.
-  tile.visible = state.vox ? (building || !hasVoxelVersion) : true;
+
+  // "Debug imagery" unchecked => hide original imagery when voxels are on
+  const hideImagery = state.vox && (state.debugImagery === false);
+  if (hideImagery) {
+    camera.layers.disable(LAYER_IMAGERY);
+    camera.layers.enable(LAYER_VOXELS);
+  } else {
+    // Vox off → imagery only; Vox on + debug imagery on → both
+    camera.layers.enable(LAYER_IMAGERY);
+    if (state.vox) camera.layers.enable(LAYER_VOXELS);
+    else           camera.layers.disable(LAYER_VOXELS);
+  }
 
   if(tile._voxMesh) tile._voxMesh.visible = showV;
   if(tile._mcMesh) tile._mcMesh.visible = showM;
@@ -1127,7 +1209,8 @@ function updateVis(){
       if (tile && tile.type === 'Group') {
         // If we're turning voxel mode on, and a tile is visible but
         // not voxelized yet, build it.
-        if (state.vox && tile.visible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
+        const rendererVisible = tile?.userData?.rendererVisible ?? tile?.visible;
+        if (state.vox && rendererVisible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
           buildVoxelFor(tile);
         }
         // Apply the latest visibility rules to the tile and its voxel meshes.
@@ -1179,7 +1262,8 @@ function loop(){
       if(tiles.group && tiles.group.children) {
         const tilesToVoxelize = [];
         tiles.group.children.forEach(tile => {
-          if (tile && tile.type === 'Group' && tile.visible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
+          const rendererVisible = tile?.userData?.rendererVisible ?? tile?.visible;
+          if (tile && tile.type === 'Group' && rendererVisible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
             tilesToVoxelize.push(tile);
           }
         });
@@ -1194,7 +1278,9 @@ function loop(){
             return aPos.distanceToSquared(camPos) - bPos.distanceToSquared(camPos);
           });
           
-          const budget = Math.max(0, MAX_CONCURRENT_VOXELIZERS - voxelizingTiles.size);
+          const budget = Math.max(
+            0, (isInteracting ? MOVING_BUDGET : MAX_CONCURRENT_VOXELIZERS) - voxelizingTiles.size
+          );
           tilesToVoxelize.slice(0, budget).forEach(tile => buildVoxelFor(tile));
         }
       }
