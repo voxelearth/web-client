@@ -15,6 +15,8 @@ import { DRACOLoader                } from 'three/examples/jsm/loaders/DRACOLoad
 import { voxelizeModel              } from './voxelize-model.js';
 import { initBlockData,
          assignVoxelsToBlocks       } from './assignToBlocksForGLB.js';
+import { SingleSceneViewer          } from './SingleSceneViewer.js';
+import { SingleSceneFetcher         } from './SingleSceneFetcher.js';
 
 /* ─────────────────────────── ChatGPT-style HUD ───────────────────────── */
 class HUD {
@@ -136,6 +138,436 @@ class HUD {
     }
 
     this._initializeBasicElements();
+    this._initializeModelPicker();
+  }
+
+  _initializeModelPicker() {
+    const modelPickerBtn = document.querySelector('#model-picker-btn');
+    const modelPickerMenu = document.querySelector('#model-picker-menu');
+    const modelPickerArrow = document.querySelector('#model-picker-arrow');
+    const modelOptions = document.querySelectorAll('.model-option');
+    const singleScenePanel = document.querySelector('#single-scene-panel');
+
+    if (!modelPickerBtn || !modelPickerMenu) return;
+
+    // Toggle dropdown
+    modelPickerBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isHidden = modelPickerMenu.classList.contains('hidden');
+      
+      if (isHidden) {
+        modelPickerMenu.classList.remove('hidden');
+        modelPickerArrow.style.transform = 'rotate(180deg)';
+      } else {
+        modelPickerMenu.classList.add('hidden');
+        modelPickerArrow.style.transform = 'rotate(0deg)';
+      }
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+      if (!modelPickerMenu.contains(e.target) && e.target !== modelPickerBtn) {
+        modelPickerMenu.classList.add('hidden');
+        modelPickerArrow.style.transform = 'rotate(0deg)';
+      }
+    });
+
+    // Handle model selection
+    modelOptions.forEach(option => {
+      option.addEventListener('click', (e) => {
+        e.preventDefault();
+        const selectedModel = option.dataset.model;
+        
+        // Update UI selection state
+        modelOptions.forEach(opt => opt.classList.remove('selected'));
+        option.classList.add('selected');
+        
+        // Close dropdown
+        modelPickerMenu.classList.add('hidden');
+        modelPickerArrow.style.transform = 'rotate(0deg)';
+        
+        // Handle model switch
+        this.switchToModel(selectedModel);
+      });
+    });
+
+    this._initializeSingleScene();
+  }
+
+  switchToModel(modelType) {
+    const singleScenePanel = document.querySelector('#single-scene-panel');
+    const modelPickerBtn = document.querySelector('#model-picker-btn');
+    
+    if (modelType === 'single-scene') {
+      // Hide the main 3D tiles and show single scene interface
+      this.setStatus('Single Scene Mode - Ready');
+      singleScenePanel.classList.remove('hidden');
+      
+      // Update model picker button text
+      if (modelPickerBtn) {
+        const titleEl = modelPickerBtn.querySelector('.text-sm.font-medium');
+        const subtitleEl = modelPickerBtn.querySelector('.text-xs.opacity-60');
+        if (titleEl) titleEl.textContent = 'Single Scene';
+        if (subtitleEl) subtitleEl.textContent = 'export specific area';
+      }
+      
+      // Clean up existing tiles if any
+      if (window.tiles) {
+        scene.remove(window.tiles.group);
+        window.tiles.dispose();
+        window.tiles = null;
+      }
+      
+      // Initialize single scene viewer with empty scene immediately
+      this.initializeSingleSceneViewer();
+      
+    } else {
+      // Switch back to voxel earth mode
+      singleScenePanel.classList.add('hidden');
+      this.setStatus('Voxel Earth Mode');
+      
+      // Update model picker button text
+      if (modelPickerBtn) {
+        const titleEl = modelPickerBtn.querySelector('.text-sm.font-medium');
+        const subtitleEl = modelPickerBtn.querySelector('.text-xs.opacity-60');
+        if (titleEl) titleEl.textContent = 'Voxel Earth 1.0';
+        if (subtitleEl) subtitleEl.textContent = 'with Google Earth tiles';
+      }
+      
+      // Clean up single scene viewer if exists
+      if (window.singleSceneViewer) {
+        window.singleSceneViewer.destroy();
+        window.singleSceneViewer = null;
+      }
+      
+      // Reinitialize main tiles if we have an API key
+      const key = this.getKey();
+      if (key) {
+        const [lat, lon] = this.getLatLon();
+        const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
+        this.setStatus('Loading tiles...');
+        spawnTiles(root, key, lat, lon);
+      }
+    }
+  }
+
+  initializeSingleSceneViewer() {
+    // Create a basic SingleSceneViewer instance for the empty scene
+    if (!window.singleSceneViewer) {
+      window.singleSceneViewer = new SingleSceneViewer();
+    }
+  }
+
+  _initializeSingleScene() {
+    this._initializeSingleSceneControls();
+    this._initializeSingleSceneMap();
+  }
+
+  _initializeSingleSceneControls() {
+  const fetchBtn = document.querySelector('#single-scene-fetch');
+  const downloadBtn = document.querySelector('#single-scene-download');
+    const toggleVoxels = document.querySelector('#single-scene-toggle-voxels');
+    const tileSlider = document.querySelector('#single-scene-tile-slider');
+    const resPills = document.querySelectorAll('.single-scene-res-pill');
+    const resFine = document.querySelector('#single-scene-res-fine');
+
+    // Resolution pills
+    const highlightResPill = (val) => {
+      resPills.forEach(pill => pill.classList.remove('active'));
+      const active = document.querySelector(`.single-scene-res-pill[data-res="${val}"]`);
+      if (active) active.classList.add('active');
+    };
+
+    resPills.forEach(pill => {
+      pill.addEventListener('click', async () => {
+        const res = parseInt(pill.dataset.res);
+        if (resFine) resFine.value = res;
+        highlightResPill(res);
+        // auto rebuild if single-scene voxels are on
+        if (document.querySelector('#single-scene-toggle-voxels')?.checked) {
+          await this._rebuildSingleSceneVoxels(res);
+        }
+      });
+    });
+
+    if (resFine) {
+      const debounced = ((fn, ms)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; })(async val=>{
+        const res = parseInt(val, 10) || 64;
+        const closest = [32,64,128,256].reduce((p,c)=>Math.abs(c-res)<Math.abs(p-res)?c:p);
+        highlightResPill(closest);
+        if (document.querySelector('#single-scene-toggle-voxels')?.checked) {
+          await this._rebuildSingleSceneVoxels(res);
+        }
+      }, 200);
+
+      resFine.addEventListener('input', e => debounced(e.target.value));
+    }
+
+    // Initialize with medium resolution
+    highlightResPill(64);
+
+    // Fetch tiles button
+    if (fetchBtn) {
+      fetchBtn.addEventListener('click', async () => {
+        const apiKey = this.getKey();
+        const coordsInput = document.querySelector('#single-scene-coords');
+        const sseInput = document.querySelector('#single-scene-sse');
+        
+        // Get coordinates from single scene panel or fall back to main coords
+        let lat, lon;
+        if (coordsInput && coordsInput.value.trim()) {
+          const coords = coordsInput.value.trim().split(',');
+          lat = parseFloat(coords[0]);
+          lon = parseFloat(coords[1]);
+        } else {
+          [lat, lon] = this.getLatLon();
+        }
+        
+        // Get SSE from single scene panel or fall back to main SSE
+        const sse = sseInput ? parseInt(sseInput.value) || 8 : this.getSSE();
+        
+        if (!apiKey) {
+          this._showSingleSceneLog();
+          this._logSingleScene('❌ No Google API key found in settings.');
+          this._logSingleScene('Please set your API key:');
+          this._logSingleScene('1. Click the + button in the bottom bar');
+          this._logSingleScene('2. Enter your Google API key');
+          this._logSingleScene('3. Click Save');
+          this._logSingleScene('4. Try fetching tiles again');
+          return;
+        }
+
+        if (isNaN(lat) || isNaN(lon)) {
+          this._showSingleSceneLog();
+          this._logSingleScene('❌ Invalid coordinates. Please select a location on the map.');
+          return;
+        }
+
+        try {
+          fetchBtn.disabled = true;
+          fetchBtn.textContent = 'Fetching...';
+          this._showSingleSceneLog();
+          this._logSingleScene('Fetching tiles...');
+
+          const fetcher = new SingleSceneFetcher();
+          const urls = await fetcher.fetch3DTiles(lat, lon, 16, sse, apiKey, this._logSingleScene.bind(this));
+
+          if (urls.length === 0) {
+            this._logSingleScene('No tiles found for this location');
+            return;
+          }
+
+          // Load the tiles into the existing viewer
+          if (window.singleSceneViewer) {
+            await window.singleSceneViewer.loadGLTFTiles(urls, this._logSingleScene.bind(this));
+          }
+
+          // Show tile controls and enable voxels toggle
+          document.querySelector('#single-scene-tile-controls')?.classList.remove('hidden');
+          document.querySelector('#single-scene-tile-count').textContent = urls.length;
+          
+          if (toggleVoxels) {
+            toggleVoxels.disabled = false;
+          }
+          
+          this._logSingleScene(`Successfully loaded ${urls.length} tiles`);
+          
+        } catch (error) {
+          this._logSingleScene(`Error: ${error.message}`);
+        } finally {
+          fetchBtn.disabled = false;
+          fetchBtn.textContent = 'Fetch Tiles';
+        }
+      });
+    }
+
+    // Tile visibility slider
+    if (tileSlider) {
+      tileSlider.addEventListener('input', () => {
+        const value = parseInt(tileSlider.value);
+        if (window.singleSceneViewer && window.singleSceneViewer.gltfArray) {
+          window.singleSceneViewer.gltfArray.forEach((gltf, index) => {
+            if (gltf && gltf.scene) {
+              gltf.scene.visible = index <= value;
+            }
+          });
+        }
+      });
+    }
+
+    // Voxelize button
+    // Remove the separate voxelize button and use the toggle as the only control
+    if (toggleVoxels) {
+      toggleVoxels.addEventListener('change', async () => {
+        const viewer = window.singleSceneViewer;
+        const container = viewer?.tilesContainer;
+        if (!viewer || !container) {
+          this._logSingleScene('❌ Error: No tiles loaded to voxelize');
+          toggleVoxels.checked = false;
+          return;
+        }
+
+        const wantOn = toggleVoxels.checked;
+        const res = parseInt(resFine?.value || 64, 10);
+
+        if (wantOn) {
+          const vox = container.getObjectByName('singleSceneVoxels');
+          const currRes = vox?.userData?.resolution;
+          if (!vox || currRes !== res) {
+            await this._rebuildSingleSceneVoxels(res);
+          } else {
+            this._setSingleSceneVisibility(true);
+            this._logSingleScene('✅ Voxels shown.');
+          }
+        } else {
+          this._setSingleSceneVisibility(false);
+          this._logSingleScene('✅ Original tiles shown.');
+        }
+      });
+    }
+
+    // Download button
+    if (downloadBtn) {
+      downloadBtn.addEventListener('click', () => {
+        if (window.singleSceneViewer) {
+          window.singleSceneViewer.generateCombineGltf();
+          this._logSingleScene('Export started...');
+        }
+      });
+    }
+
+  // No duplicate toggle handler — visibility logic handled by the single toggle above
+  }
+
+  _initializeSingleSceneMap() {
+    const mapContainer = document.querySelector('#single-scene-map');
+    if (!mapContainer || typeof L === 'undefined') return;
+    try {
+      const [lat, lon] = this.getLatLon();
+      const map = L.map('single-scene-map').setView([lat || 40.6891, lon || -74.0446], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors'
+      }).addTo(map);
+
+      let marker = L.marker([lat || 40.6891, lon || -74.0446]).addTo(map);
+
+      map.on('click', (e) => {
+        const { lat, lng } = e.latlng;
+        marker.setLatLng([lat, lng]);
+        // Persist into the shared coords so the Fetch button uses these.
+        this.setLatLon([lat, lng]);
+      });
+    } catch (error) {
+      console.error('Failed to initialize single scene map:', error);
+    }
+  }
+
+  _showSingleSceneLog() {
+    const log = document.querySelector('#single-scene-log');
+    if (log) log.classList.remove('hidden');
+  }
+
+  _logSingleScene(message) {
+    const log = document.querySelector('#single-scene-log');
+    if (log) {
+      log.textContent += message + '\n';
+      log.scrollTop = log.scrollHeight;
+    }
+    console.log('[Single Scene]', message);
+  }
+
+  /* Single-Scene helpers */
+  _setSingleSceneVisibility(showVoxels) {
+    const viewer = window.singleSceneViewer;
+    const container = viewer?.tilesContainer;
+    if (!viewer || !container) return;
+
+    const vox = container.getObjectByName('singleSceneVoxels');
+    container.children.forEach(ch => {
+      if (vox && ch === vox) ch.visible = !!showVoxels;
+      else ch.visible = !showVoxels;
+    });
+  }
+
+  async _rebuildSingleSceneVoxels(resolution) {
+    const viewer = window.singleSceneViewer;
+    const container = viewer?.tilesContainer;
+    if (!viewer || !container) { this._logSingleScene('❌ No tiles loaded'); return; }
+
+    this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
+    const myVersion = this._ssVoxVersion;
+
+    // Remove old voxels
+    const old = container.getObjectByName('singleSceneVoxels');
+    if (old) {
+      old.traverse(n => {
+        if (n.isMesh) {
+          n.geometry?.dispose();
+          (Array.isArray(n.material) ? n.material : [n.material]).forEach(m => m?.dispose?.());
+        }
+      });
+      container.remove(old);
+      const i = viewer.voxelMeshes.indexOf(old);
+      if (i >= 0) viewer.voxelMeshes.splice(i, 1);
+    }
+
+    // Show originals while rebuilding
+    container.children.forEach(ch => { if (ch.name !== 'singleSceneVoxels') ch.visible = true; });
+
+    this._logSingleScene(`🔄 (Re)voxelizing @ ${resolution}…`);
+    container.updateMatrixWorld(true);
+
+    let vox;
+    try {
+      vox = await voxelizeModel({ model: container, renderer: viewer.renderer, scene: viewer.scene, resolution, needGrid: false });
+    } catch (e) {
+      this._logSingleScene(`❌ Voxelization error: ${e?.message || e}`);
+      return;
+    }
+
+    if (myVersion !== this._ssVoxVersion) {
+      // stale
+      vox?.voxelMesh?.traverse(n => {
+        if (n.isMesh) { n.geometry?.dispose(); (Array.isArray(n.material)?n.material:[n.material]).forEach(m=>m?.dispose?.()); }
+      });
+      return;
+    }
+
+    if (!vox || !vox.voxelMesh) {
+      this._logSingleScene('❌ Voxelizer returned no geometry');
+      return;
+    }
+
+    const voxelMesh = vox.voxelMesh;
+
+    // world -> container-local + attach
+    const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
+    voxelMesh.traverse(node => {
+      if (node.isMesh && node.geometry) {
+        node.geometry.applyMatrix4(inv);
+        node.position.set(0,0,0);
+        node.rotation.set(0,0,0);
+        node.scale.set(1,1,1);
+        node.updateMatrix();
+        node.frustumCulled = false;
+        node.geometry.computeBoundingBox?.();
+        node.geometry.computeBoundingSphere?.();
+        try { node.layers.set(1); } catch {}
+      }
+    });
+
+    voxelMesh.matrixAutoUpdate = false;
+    voxelMesh.name = 'singleSceneVoxels';
+    voxelMesh.userData.resolution = resolution;
+    container.add(voxelMesh);
+    viewer.voxelMeshes = [voxelMesh];
+    viewer.voxelizer = vox;
+
+    // Respect current toggle
+    const on = document.querySelector('#single-scene-toggle-voxels')?.checked;
+    this._setSingleSceneVisibility(!!on);
+
+    this._logSingleScene(`✅ Voxels ready (${vox.voxelCount ?? '—'}) @ ${resolution}`);
   }
 
   _initializeBasicElements() {
@@ -202,7 +634,13 @@ class HUD {
     this.setStatus('Ready');
   }
 
-  getKey()    { return this.keyInput ? this.keyInput.value.trim() : ''; }
+  getKey()    { 
+    if (this.keyInput && this.keyInput.value.trim()) {
+      return this.keyInput.value.trim();
+    }
+    // Fallback to localStorage if input field is empty
+    return localStorage.getItem('token') || '';
+  }
   getSSE()    { return this.sseEl ? +this.sseEl.value : 20; }
   getLatLon() { 
     return this.coordsEl ? this.coordsEl.value.split(',').map(Number) : [37.7749, -122.4194]; 
@@ -817,6 +1255,8 @@ class HUD {
     // Initial compass update
     updateCompass();
   }
+
+  // single-scene map initialized earlier; duplicate removed
 }
 
 /* helpers */
