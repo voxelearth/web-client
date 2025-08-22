@@ -5,11 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
   <title>World-Voxel Map</title>
 
-  <!-- Tailwind + Inter + Material Symbols -->
+  <!-- Tailwind + Inter + Material Symbols + Leaflet -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Material+Symbols+Rounded:wght@300&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script>
     tailwind.config = {
       theme: { extend: { fontFamily: { sans: ['Inter','system-ui','sans-serif'] } } }
@@ -39,6 +42,77 @@
     
     /* Touch targets */
     button, input[type="range"], label { touch-action: manipulation; }
+    
+    /* Model picker styles */
+    .model-option .material-symbols-rounded:last-child { display: none; }
+    .model-option.selected .material-symbols-rounded:last-child { display: block; }
+    
+    /* Single scene resolution pill styles */
+    .single-scene-res-pill.active {
+      background: white;
+      color: #0b0e11;
+    }
+    
+    /* Line clamp utility */
+    .line-clamp-2 {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+      overflow: hidden;
+    }
+    
+    /* Custom slider styling */
+    input[type="range"].slider {
+      -webkit-appearance: none;
+      appearance: none;
+      background: transparent;
+      cursor: pointer;
+    }
+    
+    input[type="range"].slider::-webkit-slider-track {
+      height: 8px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+    }
+    
+    input[type="range"].slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      height: 20px;
+      width: 20px;
+      border-radius: 50%;
+      background: #3b82f6;
+      cursor: pointer;
+      border: 2px solid rgba(255, 255, 255, 0.2);
+      box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.3);
+    }
+    
+    input[type="range"].slider::-moz-range-track {
+      height: 8px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+      border: none;
+    }
+    
+    input[type="range"].slider::-moz-range-thumb {
+      height: 20px;
+      width: 20px;
+      border-radius: 50%;
+      background: #3b82f6;
+      cursor: pointer;
+      border: 2px solid rgba(255, 255, 255, 0.2);
+      box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.3);
+    }
+    
+    /* Leaflet map in glass panels */
+    #single-scene-panel .leaflet-container {
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.3) !important;
+    }
+    
+    #single-scene-panel .leaflet-control-container {
+      filter: invert(1) hue-rotate(180deg);
+    }
   </style>
 </head>
 <body class="text-white font-sans selection:bg-white/20">
@@ -259,6 +333,54 @@
     Ready
   </div>
 
+  <!-- Model Picker (top left) -->
+  <div id="model-picker" class="fixed top-4 left-2 md:left-4 z-50">
+    <div class="relative">
+      <!-- Main Model Button -->
+      <button id="model-picker-btn" class="glass elev rounded-xl px-3 py-2 flex items-center gap-2 hover:bg-white/5 transition-colors">
+        <span class="material-symbols-rounded text-blue-400">public</span>
+        <div class="flex flex-col items-start">
+          <div class="text-sm font-medium text-white">Voxel Earth 1.0</div>
+          <div class="text-xs opacity-60 text-white/70">with Google Earth tiles</div>
+        </div>
+        <span id="model-picker-arrow" class="material-symbols-rounded text-sm opacity-60 transition-transform duration-200">expand_more</span>
+      </button>
+      
+      <!-- Dropdown Menu -->
+      <div id="model-picker-menu" class="hidden absolute top-full left-0 mt-1 w-80 glass elev rounded-xl overflow-hidden border border-white/10">
+        <!-- Voxel Earth 1.0 (Current) -->
+        <div class="model-option selected flex items-center p-3 hover:bg-white/5 cursor-pointer transition-colors" data-model="voxel-earth">
+          <span class="material-symbols-rounded text-blue-400 mr-3 flex-shrink-0">public</span>
+          <div class="flex-1 min-w-0 mr-3">
+            <div class="flex items-center gap-2 mb-1">
+              <div class="text-sm font-medium text-white truncate">Voxel Earth 1.0</div>
+              <div class="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 text-xs font-medium flex-shrink-0">CURRENT</div>
+            </div>
+            <div class="text-xs opacity-60 text-white/70 line-clamp-2 pr-2">Stream and voxelize Google Earth imagery in real-time</div>
+          </div>
+          <div class="flex-shrink-0 w-8 flex justify-center">
+            <span class="material-symbols-rounded text-blue-400 text-lg">check</span>
+          </div>
+        </div>
+        
+        <!-- Single Scene -->
+        <div class="model-option flex items-center p-3 hover:bg-white/5 cursor-pointer transition-colors" data-model="single-scene">
+          <span class="material-symbols-rounded text-green-400 mr-3 flex-shrink-0">landscape</span>
+          <div class="flex-1 min-w-0 mr-3">
+            <div class="flex items-center gap-2 mb-1">
+              <div class="text-sm font-medium text-white truncate">Single Scene</div>
+              <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium flex-shrink-0">EXPORT</div>
+            </div>
+            <div class="text-xs opacity-60 text-white/70 line-clamp-2 pr-2">Load a specific area and export as GLTF/Schematic</div>
+          </div>
+          <div class="flex-shrink-0 w-8 flex justify-center">
+            <span class="material-symbols-rounded text-blue-400 text-lg">check</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Camera Controls Panel (top right) -->
   <div id="camera-controls" class="fixed top-4 right-2 md:right-4 z-40 space-y-1">
     <!-- Camera Mode Toggle -->
@@ -295,6 +417,84 @@
       <button id="tilt-down-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Tilt Down">
         <span class="material-symbols-rounded text-sm md:text-xs">keyboard_arrow_down</span>
       </button>
+    </div>
+  </div>
+
+  <!-- Single Scene Panel (floating window) -->
+  <div id="single-scene-panel" class="hidden fixed left-4 top-20 w-72 z-40 pointer-events-auto">
+    <div class="glass elev rounded-2xl p-4 space-y-4 max-h-[calc(100vh-6rem)] overflow-y-auto">
+      <div class="mb-4">
+        <h2 class="text-sm font-semibold text-white mb-1">Single Scene Export</h2>
+        <p class="text-xs text-white/60">Load and voxelize a specific area</p>
+      </div>
+      
+      <!-- Controls -->
+      <div class="space-y-3">
+        <div class="flex gap-2">
+          <button id="single-scene-fetch" 
+                  class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm">
+            Fetch Tiles
+          </button>
+        </div>
+        
+        <!-- Map -->
+        <div>
+          <label class="block text-sm font-medium text-white/80 mb-2">Select Location</label>
+          <div id="single-scene-map" class="w-full h-32 rounded-lg overflow-hidden"></div>
+        </div>
+        
+        <!-- Tile Controls -->
+        <div id="single-scene-tile-controls" class="hidden">
+          <label class="block text-sm font-medium text-white/80 mb-2">
+            Tiles: <span id="single-scene-tile-count">0</span>
+          </label>
+          <input id="single-scene-tile-slider" type="range" min="-1" max="100" value="100"
+                 class="w-full slider"/>
+        </div>
+
+        <!-- Voxelization Controls -->
+        <div id="single-scene-voxel-controls" class="space-y-3">
+          <div class="border-t border-white/10 pt-3">
+            <div class="flex items-center justify-between mb-3">
+              <span class="text-sm text-white/80">Show Voxels</span>
+              <label class="inline-flex items-center cursor-pointer">
+                <div class="relative">
+                  <input id="single-scene-toggle-voxels" type="checkbox" class="sr-only peer">
+                  <div class="w-9 h-5 bg-white/10 peer-checked:bg-blue-500/80 rounded-full relative transition"></div>
+                  <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-4"></div>
+                </div>
+              </label>
+            </div>
+
+            <div>
+              <label class="block text-sm font-medium text-white/80 mb-2">Voxel Resolution</label>
+              <div class="grid grid-cols-2 gap-1 bg-white/5 rounded-lg p-1 mb-2">
+                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="32">Low</button>
+                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="64">Med</button>
+                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="128">High</button>
+                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="256">Ultra</button>
+              </div>
+              <input id="single-scene-res-fine" type="range" min="8" max="512" value="64" class="w-full slider">
+              <div class="text-xs opacity-60 mt-1">Fine-tune resolution</div>
+            </div>
+
+            <!-- Generate button removed: the 'Voxels' toggle will auto-voxelize -->
+          </div>
+        </div>
+
+        <!-- Export Controls -->
+        <div id="single-scene-export-controls" class="hidden">
+          <div class="border-t border-white/10 pt-3">
+            <button id="single-scene-download" 
+                    class="w-full bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm">
+              Export GLTF
+            </button>
+          </div>
+        </div>
+        
+        <!-- Log -->
+        <div id="single-scene-log" class="bg-black/20 rounded-lg p-2 text-xs text-white/80 font-mono max-h-20 overflow-y-auto hidden"></div>
+      </div>
     </div>
   </div>
 
