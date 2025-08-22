@@ -266,10 +266,18 @@ class HUD {
   _initializeSingleSceneControls() {
   const fetchBtn = document.querySelector('#single-scene-fetch');
   const downloadBtn = document.querySelector('#single-scene-download');
-    const toggleVoxels = document.querySelector('#single-scene-toggle-voxels');
-    const tileSlider = document.querySelector('#single-scene-tile-slider');
-    const resPills = document.querySelectorAll('.single-scene-res-pill');
-    const resFine = document.querySelector('#single-scene-res-fine');
+  const toggleVoxels = document.querySelector('#single-scene-toggle-voxels');
+  const tileSlider = document.querySelector('#single-scene-tile-slider');
+  const resPills = document.querySelectorAll('.single-scene-res-pill');
+  const resFine = document.querySelector('#single-scene-res-fine');
+  const sseSlider = document.querySelector('#single-scene-sse');
+  const sseValue  = document.querySelector('#single-scene-sse-value');
+    // SSE slider update
+    if (sseSlider && sseValue) {
+      sseSlider.addEventListener('input', () => {
+        sseValue.textContent = sseSlider.value;
+      });
+    }
 
     // Resolution pills
     const highlightResPill = (val) => {
@@ -311,8 +319,9 @@ class HUD {
       fetchBtn.addEventListener('click', async () => {
         const apiKey = this.getKey();
         const coordsInput = document.querySelector('#single-scene-coords');
+        // Use the new SSE slider for single scene
         const sseInput = document.querySelector('#single-scene-sse');
-        
+
         // Get coordinates from single scene panel or fall back to main coords
         let lat, lon;
         if (coordsInput && coordsInput.value.trim()) {
@@ -322,10 +331,10 @@ class HUD {
         } else {
           [lat, lon] = this.getLatLon();
         }
-        
-        // Get SSE from single scene panel or fall back to main SSE
-        const sse = sseInput ? parseInt(sseInput.value) || 8 : this.getSSE();
-        
+
+        // Get SSE from the slider (default 20)
+        const sse = sseInput ? parseInt(sseInput.value) || 20 : 20;
+
         if (!apiKey) {
           this._showSingleSceneLog();
           this._logSingleScene('❌ No Google API key found in settings.');
@@ -365,13 +374,13 @@ class HUD {
           // Show tile controls and enable voxels toggle
           document.querySelector('#single-scene-tile-controls')?.classList.remove('hidden');
           document.querySelector('#single-scene-tile-count').textContent = urls.length;
-          
+
           if (toggleVoxels) {
             toggleVoxels.disabled = false;
           }
-          
+
           this._logSingleScene(`Successfully loaded ${urls.length} tiles`);
-          
+
         } catch (error) {
           this._logSingleScene(`Error: ${error.message}`);
         } finally {
@@ -426,12 +435,31 @@ class HUD {
       });
     }
 
-    // Download button
+    // Download button (Single Scene panel)
     if (downloadBtn) {
       downloadBtn.addEventListener('click', () => {
         if (window.singleSceneViewer) {
           window.singleSceneViewer.generateCombineGltf();
           this._logSingleScene('Export started...');
+        }
+      });
+    }
+
+    // Global Export GLB button (exports whatever is currently visible)
+    const exportGlbBtn = document.getElementById('export-glb-btn');
+    if (exportGlbBtn) {
+      exportGlbBtn.addEventListener('click', () => {
+        // Prefer Single Scene if active, else main viewer
+        if (window.singleSceneViewer && window.singleSceneViewer.scene) {
+          window.singleSceneViewer.generateCombineGltf();
+          this._logSingleScene?.('Export started (Single Scene)...');
+        } else if (window.viewer && window.viewer.scene) {
+          // If you have a main viewer, call its export method here
+          window.viewer.generateCombineGltf?.();
+          // Optionally log to main status
+          this.setStatus?.('Export started (Main Viewer)...');
+        } else {
+          alert('No active scene to export.');
         }
       });
     }

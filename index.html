@@ -466,6 +466,17 @@
               </label>
             </div>
 
+            <!-- SSE Slider -->
+            <div class="mb-3">
+              <label for="single-scene-sse" class="block text-sm font-medium text-white/80 mb-1">Screen Space Error (SSE)</label>
+              <input id="single-scene-sse" type="range" min="2" max="64" value="20" class="w-full slider">
+              <div class="flex justify-between text-xs opacity-60 mt-1">
+                <span>Low detail</span>
+                <span id="single-scene-sse-value">20</span>
+                <span>High detail</span>
+              </div>
+            </div>
+
             <div>
               <label class="block text-sm font-medium text-white/80 mb-2">Voxel Resolution</label>
               <div class="grid grid-cols-2 gap-1 bg-white/5 rounded-lg p-1 mb-2">
@@ -482,14 +493,12 @@
           </div>
         </div>
 
-        <!-- Export Controls -->
-        <div id="single-scene-export-controls" class="hidden">
-          <div class="border-t border-white/10 pt-3">
-            <button id="single-scene-download" 
-                    class="w-full bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm">
-              Export GLTF
-            </button>
-          </div>
+
+        <!-- Global Export GLB Button -->
+        <div id="global-export-controls" class="mt-4">
+          <button id="export-glb-btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm">
+            Export Current Scene as GLB
+          </button>
         </div>
         
         <!-- Log -->
