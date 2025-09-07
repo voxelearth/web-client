@@ -515,5 +515,13 @@
   <button id="download" class="hidden"></button>
 
   <script type="module" src="/src/map.js"></script>
+  <script>
+    // Lightweight SW registrar; ignores errors (e.g., unsupported contexts)
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(()=>{});
+      });
+    }
+  </script>
 </body>
 </html>

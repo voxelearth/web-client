@@ -88,7 +88,11 @@ export class SingleSceneFetcher {
   }
 
   async load3DTileset(tilesetUrl, viewport, screenSpaceError) {
-    const tilesetJson = await load(tilesetUrl, Tiles3DLoader, {'3d-tiles': { loadGLTF: false }} );
+    const tilesetJson = await load(tilesetUrl, Tiles3DLoader, {
+      // Prefer browser HTTP cache when fresh (still respects Cache-Control / ETag)
+      fetch: { cache: 'force-cache' },
+      '3d-tiles': { loadGLTF: false }
+    });
     const tileset3d = new Tileset3D(tilesetJson, {
       throttleRequests: false,
       maximumScreenSpaceError: screenSpaceError

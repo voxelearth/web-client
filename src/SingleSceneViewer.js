@@ -64,6 +64,8 @@ export class SingleSceneViewer {
 		loader.setDRACOLoader(draco);
 		loader.setKTX2Loader(ktx2);
 		loader.setMeshoptDecoder(MeshoptDecoder);
+		// Enable three.js in-memory cache to short-circuit duplicate GLB / texture fetches this session
+		THREE.Cache.enabled = true;
 		return loader;
 	}
 
