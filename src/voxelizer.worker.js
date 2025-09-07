@@ -306,42 +306,24 @@ class WorkerVoxelizer {
             for (const grp of groups) {
                 const m = meshMats[grp.materialIndex];
                 if (!m) continue;
+                const baseR = m.color ? m.color.r : 1;
+                const baseG = m.color ? m.color.g : 1;
+                const baseB = m.color ? m.color.b : 1;
                 for (let vi=grp.start; vi<grp.start+grp.count; ++vi) {
-                    let col = (m.color ? m.color.clone() : new THREE.Color(1,1,1));
-                    let hasValidAlbedo = false;
-                    
+                    let r = baseR, g = baseG, b = baseB; let had = false;
                     if (uvA) {
-                        const uvv = new THREE.Vector2(uvA.getX(vi), uvA.getY(vi));
-                        const albedo = sampleAlbedoLinear(m, uvv, this.imageDatas);
-                        if (albedo) {
-                            col.multiply(new THREE.Color(albedo[0], albedo[1], albedo[2]));
-                            hasValidAlbedo = true;
-                        }
-                        
-                        // emissive add
-                        if (m.emissive) col.add(m.emissive);
-                        if (m.emissiveMap) {
-                            const es = getSampler(m.emissiveMap, this.imageDatas);
-                            if (es) { const ec = es(uvv, true); col.add(new THREE.Color(ec[0], ec[1], ec[2])); }
-                        }
+                        const u = uvA.getX(vi), v = uvA.getY(vi);
+                        const albedo = sampleAlbedoLinear(m, new THREE.Vector2(u,v), this.imageDatas);
+                        if (albedo) { r *= albedo[0]; g *= albedo[1]; b *= albedo[2]; had = true; }
+                        if (m.emissive) { r += m.emissive.r; g += m.emissive.g; b += m.emissive.b; }
+                        if (m.emissiveMap) { const es = getSampler(m.emissiveMap, this.imageDatas); if (es) { const ec = es(new THREE.Vector2(u,v), true); r += ec[0]; g += ec[1]; b += ec[2]; } }
                     } else {
-                        // no UV, just add emissive to base color
-                        if (m.emissive) col.add(m.emissive);
-                        hasValidAlbedo = true; // base color is always valid
+                        if (m.emissive) { r += m.emissive.r; g += m.emissive.g; b += m.emissive.b; }
+                        had = true;
                     }
-                    
-                    // Sanitize colors before pushing to palette samples
-                    if (!Number.isFinite(col.r) || !Number.isFinite(col.g) || !Number.isFinite(col.b)) {
-                        col.set(1,1,1); // fallback to white if we ever hit NaNs
-                    }
-                    col.r = Math.min(1, Math.max(0, col.r));
-                    col.g = Math.min(1, Math.max(0, col.g));
-                    col.b = Math.min(1, Math.max(0, col.b));
-                    
-                    // Only include in palette if we had valid coverage (skip transparent samples)
-                    if (hasValidAlbedo) {
-                        allRGB.push(col.r, col.g, col.b);
-                    }
+                    if (!(Number.isFinite(r)&&Number.isFinite(g)&&Number.isFinite(b))) { r=g=b=1; }
+                    r = r<0?0:r>1?1:r; g = g<0?0:g>1?1:g; b = b<0?0:b>1?1:b;
+                    if (had) allRGB.push(r,g,b);
                 }
             }
 
@@ -755,8 +737,8 @@ class WorkerVoxelizer {
         return grid[idx(x,y,z)];
       };
 
-      // helper to emit a quad into arrays with correct winding (no normals)
-      function pushQuad(out, p, q, r, s, nrm, colorIdx) {
+    // helper to emit a quad into arrays with correct winding (no normals)
+    function pushQuad(out, p, q, r, s, nrm, colorIdx) {
         const base = out.positions.length / 3;
         // positions
         out.positions.push(
@@ -765,13 +747,17 @@ class WorkerVoxelizer {
           r[0], r[1], r[2],
           s[0], s[1], s[2]
         );
-        // colors (Float32; main thread will pack to RGBA8)
-        const rC = this.palette[(colorIdx)*3+0];
-        const gC = this.palette[(colorIdx)*3+1];
-        const bC = this.palette[(colorIdx)*3+2];
-        out.colors.push(
-          rC,gC,bC, rC,gC,bC, rC,gC,bC, rC,gC,bC
-        );
+                // colors (u8 RGBA packed here)
+                const rC = this.palette[(colorIdx)*3+0];
+                const gC = this.palette[(colorIdx)*3+1];
+                const bC = this.palette[(colorIdx)*3+2];
+                const R = Math.max(0,Math.min(255,(rC*255)|0));
+                const G = Math.max(0,Math.min(255,(gC*255)|0));
+                const B = Math.max(0,Math.min(255,(bC*255)|0));
+                const A = 255;
+                out.colors8.push(
+                    R,G,B,A, R,G,B,A, R,G,B,A, R,G,B,A
+                );
         
         // Check winding order and emit triangles with correct CCW orientation
         // Calculate face cross product to determine if we need to flip
@@ -797,7 +783,7 @@ class WorkerVoxelizer {
 
       // Run greedy meshing within a chunk
       const meshChunk = (cx0, cx1, cy0, cy1, cz0, cz1) => {
-        const out = { positions: [], colors: [], indices: [] };
+    const out = { positions: [], colors8: [], indices: [] };
 
         // axis loop: 0=X,1=Y,2=Z (like Mikola Lysenko's algorithm)
         for (let d = 0; d < 3; d++) {
@@ -914,8 +900,8 @@ class WorkerVoxelizer {
 
         // pack to typed arrays
         const positions = new Float32Array(out.positions);
-        const colors    = new Float32Array(out.colors);
-        const indices   = positions.length/3 >= 65536 ? new Uint32Array(out.indices) : new Uint16Array(out.indices);
+    const colors8   = new Uint8Array(out.colors8);
+    const indices   = positions.length/3 >= 65536 ? new Uint32Array(out.indices) : new Uint16Array(out.indices);
 
         // chunk bounds in world space (for frustum culling on the main thread)
         const bounds = {
@@ -923,7 +909,7 @@ class WorkerVoxelizer {
           max: [bx + cx1*vs, by + cy1*vs, bz + cz1*vs],
         };
 
-        return { positions, colors, indices, bounds };
+    return { positions, colors8, indices, bounds };
       };
 
       // iterate chunks
@@ -1024,12 +1010,12 @@ self.onmessage = async (event) => {
         const transferList = [];
         if (result.voxelGrid?.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);
         if (result.voxelGrid?.voxelCounts) transferList.push(result.voxelGrid.voxelCounts.buffer);
-        for (const g of (result.geometries || [])) {
-          if (g?.positions?.buffer) transferList.push(g.positions.buffer);
-          if (g?.colors?.buffer)    transferList.push(g.colors.buffer);
-          if (g?.normals?.buffer)   transferList.push(g.normals.buffer);   // only if present
-          if (g?.indices?.buffer)   transferList.push(g.indices.buffer);
-        }
+                for (const g of (result.geometries || [])) {
+                    if (g?.positions?.buffer) transferList.push(g.positions.buffer);
+                    if (g?.colors8?.buffer)   transferList.push(g.colors8.buffer);
+                    if (g?.normals?.buffer)   transferList.push(g.normals.buffer);   // only if present
+                    if (g?.indices?.buffer)   transferList.push(g.indices.buffer);
+                }
 
         self.postMessage({ status: 'success', result }, transferList);
     } catch (error) {
