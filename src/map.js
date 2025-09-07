@@ -41,6 +41,10 @@ class HUD {
       voxelMethodsMenu: !!voxelMethodsMenu, voxelMethodsBtn: !!voxelMethodsBtn, voxelMethodsBack: !!voxelMethodsBack, voxelMethodsClose: !!voxelMethodsClose
     });
 
+  // Single Scene mini-map handles (populated in _initializeSingleSceneMap)
+  this._singleMap = null;
+  this._singleMapMarker = null;
+
     if (!menu || !composerPlus || !closeMenu) {
       console.error('Missing menu elements:', { menu, composerPlus, closeMenu });
       // Let's try to continue without menu functionality
@@ -202,6 +206,7 @@ class HUD {
       // Hide the main 3D tiles and show single scene interface
       this.setStatus('Single Scene Mode - Ready');
       singleScenePanel.classList.remove('hidden');
+  this._scheduleMiniMapInvalidate?.();
       
       // Update model picker button text
       if (modelPickerBtn) {
@@ -256,6 +261,8 @@ class HUD {
     // Create a basic SingleSceneViewer instance for the empty scene
     if (!window.singleSceneViewer) {
       window.singleSceneViewer = new SingleSceneViewer();
+  // Reflect initial debug tiles state if toggle exists
+  document.querySelector('#single-scene-debug-tiles')?.dispatchEvent(new Event('change'));
     }
   }
 
@@ -268,16 +275,58 @@ class HUD {
   const fetchBtn = document.querySelector('#single-scene-fetch');
   const downloadBtn = document.querySelector('#single-scene-download');
   const toggleVoxels = document.querySelector('#single-scene-toggle-voxels');
+  const debugTilesToggle = document.querySelector('#single-scene-debug-tiles');
+  const radiusSlider = document.querySelector('#single-scene-radius');
+  const rotSlider = document.querySelector('#single-scene-rot');
   const tileSlider = document.querySelector('#single-scene-tile-slider');
   const resPills = document.querySelectorAll('.single-scene-res-pill');
   const resFine = document.querySelector('#single-scene-res-fine');
   const sseSlider = document.querySelector('#single-scene-sse');
   const sseValue  = document.querySelector('#single-scene-sse-value');
+  const radiusValue = document.querySelector('#single-scene-radius-value');
+  const rotValue = document.querySelector('#single-scene-rot-value');
+
+    // Unhide rows if present (SSE + Debug)
+    document.querySelector('#single-scene-sse-row')?.classList.remove('hidden');
+    document.querySelector('#single-scene-debug-row')?.classList.remove('hidden');
     // SSE slider update
     if (sseSlider && sseValue) {
       sseSlider.addEventListener('input', () => {
         sseValue.textContent = sseSlider.value;
       });
+      sseValue.textContent = sseSlider.value;
+    }
+
+    // Slider filled track updater
+    const _setSliderFill = (el) => {
+      if (!el) return;
+      const min = +el.min || 0, max = +el.max || 100, val = +el.value || 0;
+      const p = Math.max(0, Math.min(100, ((val - min) / (max - min)) * 100));
+      el.style.setProperty('--p', p + '%');
+    };
+    [sseSlider, radiusSlider, resFine, rotSlider, tileSlider].forEach(el => {
+      if (!el) return;
+      _setSliderFill(el);
+      el.addEventListener('input', () => _setSliderFill(el));
+    });
+
+    // Radius slider (meters) default 500
+    if (radiusSlider && radiusValue) {
+      const updateRadius = () => { radiusValue.textContent = `${parseInt(radiusSlider.value||500,10)} m`; };
+      radiusSlider.addEventListener('input', updateRadius);
+      updateRadius();
+    }
+
+    // Rotation (Y) slider
+    if (rotSlider && rotValue) {
+      const updateRot = () => { rotValue.textContent = `${parseInt(rotSlider.value||0,10)}°`; };
+      rotSlider.addEventListener('input', async () => {
+        updateRot();
+        if (document.querySelector('#single-scene-toggle-voxels')?.checked) {
+          await this._rebuildSingleSceneVoxels(parseInt(resFine?.value||64,10));
+        }
+      });
+      updateRot();
     }
 
     // Resolution pills
@@ -315,6 +364,9 @@ class HUD {
     // Initialize with medium resolution
     highlightResPill(64);
 
+  // Default voxels ON for Single Scene
+  if (toggleVoxels) toggleVoxels.checked = true;
+
     // Fetch tiles button
     if (fetchBtn) {
       fetchBtn.addEventListener('click', async () => {
@@ -335,6 +387,9 @@ class HUD {
 
         // Get SSE from the slider (default 20)
         const sse = sseInput ? parseInt(sseInput.value) || 20 : 20;
+
+  // Radius in meters (controls how large an area to fetch)
+  const radiusM = radiusSlider ? (parseInt(radiusSlider.value,10) || 500) : 500;
 
         if (!apiKey) {
           this._showSingleSceneLog();
@@ -360,7 +415,8 @@ class HUD {
           this._logSingleScene('Fetching tiles...');
 
           const fetcher = new SingleSceneFetcher();
-          const urls = await fetcher.fetch3DTiles(lat, lon, 16, sse, apiKey, this._logSingleScene.bind(this));
+          // zoom auto-computed from radius; pass null for zoom and provide radiusM
+          const urls = await fetcher.fetch3DTiles(lat, lon, null, sse, apiKey, this._logSingleScene.bind(this), radiusM);
 
           if (urls.length === 0) {
             this._logSingleScene('No tiles found for this location');
@@ -378,6 +434,14 @@ class HUD {
 
           if (toggleVoxels) {
             toggleVoxels.disabled = false;
+            if (toggleVoxels.checked) {
+              const res = parseInt(resFine?.value || 64, 10);
+              await this._rebuildSingleSceneVoxels(res);
+            }
+          }
+          // Apply debug state to viewer if present
+          if (debugTilesToggle && window.singleSceneViewer?.setDebugTiles) {
+            window.singleSceneViewer.setDebugTiles(!!debugTilesToggle.checked);
           }
 
           this._logSingleScene(`Successfully loaded ${urls.length} tiles`);
@@ -388,6 +452,13 @@ class HUD {
           fetchBtn.disabled = false;
           fetchBtn.textContent = 'Fetch Tiles';
         }
+      });
+    }
+
+    // Debug Tiles toggle (per-tile bounding boxes)
+    if (debugTilesToggle) {
+      debugTilesToggle.addEventListener('change', () => {
+        window.singleSceneViewer?.setDebugTiles?.(!!debugTilesToggle.checked);
       });
     }
 
@@ -479,6 +550,7 @@ class HUD {
       }).addTo(map);
 
       let marker = L.marker([lat || 40.6891, lon || -74.0446]).addTo(map);
+  map.whenReady(() => this._scheduleMiniMapInvalidate());
 
       map.on('click', (e) => {
         const { lat, lng } = e.latlng;
@@ -486,9 +558,73 @@ class HUD {
         // Persist into the shared coords so the Fetch button uses these.
         this.setLatLon([lat, lng]);
       });
+
+      // When the mini-map view changes (pan/zoom), update marker + coords
+      map.on('moveend', () => {
+        const c = map.getCenter();
+        marker.setLatLng([c.lat, c.lng]);
+        this.setLatLon([c.lat, c.lng]);
+        const coordsInput = document.querySelector('#single-scene-coords');
+        if (coordsInput) coordsInput.value = `${c.lat.toFixed(6)},${c.lng.toFixed(6)}`;
+      });
+
+  // Save handles for later sync
+  this._singleMap = map;
+  this._singleMapMarker = marker;
+      // Observers for size/visibility changes
+      this._installMiniMapObservers(map, document.querySelector('#single-scene-panel'), mapContainer);
     } catch (error) {
       console.error('Failed to initialize single scene map:', error);
     }
+  }
+
+  // Debounced (RAF) Leaflet invalidate
+  _scheduleMiniMapInvalidate() {
+    if (!this._singleMap) return;
+    cancelAnimationFrame(this._miniMapInvalidateRAF);
+    this._miniMapInvalidateRAF = requestAnimationFrame(() => {
+      try { this._singleMap.invalidateSize(true); } catch {}
+    });
+  }
+
+  // Install observers to react to panel visibility and size changes
+  _installMiniMapObservers(map, panelEl, containerEl) {
+    // ResizeObserver
+    try {
+      this._miniMapResizeObs?.disconnect?.();
+      this._miniMapResizeObs = new ResizeObserver(() => this._scheduleMiniMapInvalidate());
+      if (panelEl) this._miniMapResizeObs.observe(panelEl);
+      if (containerEl) this._miniMapResizeObs.observe(containerEl);
+    } catch {}
+
+    // MutationObserver for class changes (.hidden toggle)
+    if (panelEl) {
+      this._miniMapMutationObs?.disconnect?.();
+      this._miniMapMutationObs = new MutationObserver(muts => {
+        for (const m of muts) {
+          if (m.type === 'attributes' && m.attributeName === 'class') {
+            if (!panelEl.classList.contains('hidden')) this._scheduleMiniMapInvalidate();
+          }
+        }
+      });
+      this._miniMapMutationObs.observe(panelEl, { attributes: true, attributeFilter: ['class'] });
+      panelEl.addEventListener('transitionend', () => this._scheduleMiniMapInvalidate(), { passive: true });
+    }
+
+    // Window resize handler (light debounce via RAF)
+    this._miniMapWindowResizeHandler && window.removeEventListener('resize', this._miniMapWindowResizeHandler);
+    this._miniMapWindowResizeHandler = () => this._scheduleMiniMapInvalidate();
+    window.addEventListener('resize', this._miniMapWindowResizeHandler, { passive: true });
+  }
+
+  // Sync mini-map + single scene coords input with current position
+  _syncSingleSceneMiniMap(lat, lon) {
+    if (this._singleMap) {
+      this._singleMap.setView([lat, lon]);
+      this._singleMapMarker?.setLatLng([lat, lon]);
+    }
+    const coordsInput = document.querySelector('#single-scene-coords');
+    if (coordsInput) coordsInput.value = `${lat.toFixed(6)},${lon.toFixed(6)}`;
   }
 
   _showSingleSceneLog() {
@@ -522,6 +658,7 @@ class HUD {
     const viewer = window.singleSceneViewer;
     const container = viewer?.tilesContainer;
     if (!viewer || !container) { this._logSingleScene('❌ No tiles loaded'); return; }
+  const rotDeg = parseInt(document.querySelector('#single-scene-rot')?.value || '0', 10) || 0; // degrees to sample at
 
     this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
     const myVersion = this._ssVoxVersion;
@@ -548,7 +685,7 @@ class HUD {
 
     let vox;
     try {
-      vox = await voxelizeModel({ model: container, renderer: viewer.renderer, scene: viewer.scene, resolution, needGrid: false });
+  vox = await voxelizeModel({ model: container, renderer: viewer.renderer, scene: viewer.scene, resolution, needGrid: false, preRotateYDeg: rotDeg });
     } catch (e) {
       this._logSingleScene(`❌ Voxelization error: ${e?.message || e}`);
       return;
@@ -569,18 +706,29 @@ class HUD {
 
     const voxelMesh = vox.voxelMesh;
 
-    // world -> container-local + attach
+    // Prepare counter-rotation so only sampling orientation changes
+    const containerBox = new THREE.Box3().setFromObject(container);
+    const pivot = containerBox.getCenter(new THREE.Vector3());
+    const Tneg  = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
+    const RyInv = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(-rotDeg));
+    const Tpos  = new THREE.Matrix4().makeTranslation( pivot.x,  pivot.y,  pivot.z);
+    const counterM = new THREE.Matrix4().multiplyMatrices(Tpos, new THREE.Matrix4().multiplyMatrices(RyInv, Tneg));
+
+    // world -> container-local + attach (after counter-rotation)
     const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
     voxelMesh.traverse(node => {
       if (node.isMesh && node.geometry) {
+        if (rotDeg !== 0) node.geometry.applyMatrix4(counterM); // undo visual rotation
         node.geometry.applyMatrix4(inv);
         node.position.set(0,0,0);
         node.rotation.set(0,0,0);
         node.scale.set(1,1,1);
         node.updateMatrix();
         node.frustumCulled = false;
-        node.geometry.computeBoundingBox?.();
-        node.geometry.computeBoundingSphere?.();
+        try {
+          node.geometry.computeBoundingBox?.();
+          node.geometry.computeBoundingSphere?.();
+        } catch {}
         try { node.layers.set(1); } catch {}
       }
     });
@@ -680,6 +828,8 @@ class HUD {
       this.coordsEl.value = `${lat.toFixed(4)},${lon.toFixed(4)}`;
       localStorage.setItem('coords', this.coordsEl.value);
     }
+  // Reflect into Single Scene mini-map & input
+  try { this._syncSingleSceneMiniMap(lat, lon); } catch {}
   }
   setStatus(t) { 
     if (this.status) this.status.textContent = t; 
@@ -1490,6 +1640,8 @@ function retargetTiles(latDeg,lonDeg){
     frameToView();
     hasFramedOnce = true;
   }
+  // Keep Single Scene mini-map centered with main map moves
+  try { ui?._syncSingleSceneMiniMap?.(latDeg, lonDeg); } catch {}
 }
 
 // Back-compat wrapper for any remaining call sites

@@ -62,53 +62,73 @@
       overflow: hidden;
     }
     
-    /* Custom slider styling */
+    /* Slider: thick track + visible filled portion */
     input[type="range"].slider {
+      --track: rgba(255,255,255,.14);
+      --fill:  #60a5fa; /* blue-400 */
+      --thumb: #ffffff;
       -webkit-appearance: none;
       appearance: none;
+      width: 100%;
       background: transparent;
       cursor: pointer;
+      height: 28px; /* bigger target */
     }
-    
-    input[type="range"].slider::-webkit-slider-track {
-      height: 8px;
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 4px;
+    input[type="range"].slider.slider-lg { height: 34px; }
+    /* WebKit */
+    input[type="range"].slider::-webkit-slider-runnable-track{
+      height: 12px;
+      background:
+        linear-gradient(var(--fill) 0 0) 0/var(--p,0%) 100% no-repeat,
+        var(--track);
+      border-radius: 6px;
     }
-    
-    input[type="range"].slider::-webkit-slider-thumb {
+    input[type="range"].slider.slider-lg::-webkit-slider-runnable-track{ height: 14px; }
+    input[type="range"].slider::-webkit-slider-thumb{
       -webkit-appearance: none;
-      height: 20px;
-      width: 20px;
-      border-radius: 50%;
-      background: #3b82f6;
-      cursor: pointer;
-      border: 2px solid rgba(255, 255, 255, 0.2);
-      box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.3);
+      height: 20px; width: 20px; border-radius: 9999px;
+      background: var(--thumb);
+      border: 2px solid rgba(0,0,0,.35);
+      margin-top: -4px;
+      box-shadow: 0 0 0 1px rgba(255,255,255,.18);
     }
-    
-    input[type="range"].slider::-moz-range-track {
-      height: 8px;
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 4px;
-      border: none;
+    /* Firefox */
+    input[type="range"].slider::-moz-range-track{
+      height: 12px; background: var(--track); border: none; border-radius: 6px;
     }
-    
-    input[type="range"].slider::-moz-range-thumb {
-      height: 20px;
-      width: 20px;
-      border-radius: 50%;
-      background: #3b82f6;
-      cursor: pointer;
-      border: 2px solid rgba(255, 255, 255, 0.2);
-      box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.3);
+    input[type="range"].slider.slider-lg::-moz-range-track{ height: 14px; }
+    input[type="range"].slider::-moz-range-progress{
+      height: 12px; background: var(--fill); border-radius: 6px;
+    }
+    input[type="range"].slider.slider-lg::-moz-range-progress{ height: 14px; }
+    input[type="range"].slider::-moz-range-thumb{
+      height: 20px; width: 20px; border-radius: 9999px;
+      background: var(--thumb);
+      border: 2px solid rgba(0,0,0,.35);
+      box-shadow: 0 0 0 1px rgba(255,255,255,.18);
     }
     
     /* Leaflet map in glass panels */
     #single-scene-panel .leaflet-container {
       border-radius: 12px;
       background: rgba(0, 0, 0, 0.3) !important;
+      /* Force own compositor layer to avoid black/flicker under backdrop-filter */
+      transform: translateZ(0);
+      will-change: transform;
+      isolation: isolate;
     }
+    #single-scene-panel .leaflet-map-pane,
+    #single-scene-panel .leaflet-tile-pane,
+    #single-scene-panel .leaflet-overlay-pane,
+    #single-scene-panel .leaflet-shadow-pane,
+    #single-scene-panel .leaflet-marker-pane,
+    #single-scene-panel .leaflet-tooltip-pane,
+    #single-scene-panel .leaflet-popup-pane {
+      transform: translateZ(0);
+      will-change: transform;
+      backface-visibility: hidden;
+    }
+    #single-scene-panel .leaflet-tile { filter: none !important; -webkit-filter: none !important; }
     
     #single-scene-panel .leaflet-control-container {
       filter: invert(1) hue-rotate(180deg);
@@ -441,10 +461,11 @@
         <div>
           <label class="block text-sm font-medium text-white/80 mb-2">Select Location</label>
           <div id="single-scene-map" class="w-full h-32 rounded-lg overflow-hidden"></div>
+          <input id="single-scene-coords" class="mt-2 w-full rounded-lg bg-white/10 px-2 py-1 text-xs outline-none" placeholder="lat,lon (click map to set)"/>
         </div>
         
         <!-- Tile Controls -->
-        <div id="single-scene-tile-controls" class="hidden">
+        <div id="single-scene-tile-controls" class="hidden" style="display:none;">
           <label class="block text-sm font-medium text-white/80 mb-2">
             Tiles: <span id="single-scene-tile-count">0</span>
           </label>
@@ -459,22 +480,56 @@
               <span class="text-sm text-white/80">Show Voxels</span>
               <label class="inline-flex items-center cursor-pointer">
                 <div class="relative">
-                  <input id="single-scene-toggle-voxels" type="checkbox" class="sr-only peer">
+                  <input id="single-scene-toggle-voxels" type="checkbox" class="sr-only peer" checked>
                   <div class="w-9 h-5 bg-white/10 peer-checked:bg-blue-500/80 rounded-full relative transition"></div>
                   <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-4"></div>
                 </div>
               </label>
             </div>
-
-            <!-- SSE Slider -->
+            <!-- Radius (meters) -->
             <div class="mb-3">
-              <label for="single-scene-sse" class="block text-sm font-medium text-white/80 mb-1">Screen Space Error (SSE)</label>
-              <input id="single-scene-sse" type="range" min="2" max="64" value="20" class="w-full slider">
+              <label for="single-scene-radius" class="block text-sm font-medium text-white/80 mb-1">Radius</label>
+              <input id="single-scene-radius" type="range" min="100" max="3000" step="50" value="500" class="w-full slider slider-lg">
               <div class="flex justify-between text-xs opacity-60 mt-1">
-                <span>Low detail</span>
-                <span id="single-scene-sse-value">20</span>
-                <span>High detail</span>
+                <span>100 m</span>
+                <span id="single-scene-radius-value">500 m</span>
+                <span>3 km</span>
               </div>
+            </div>
+
+            <!-- SSE Slider (High ↔ Low) -->
+            <div id="single-scene-sse-row" class="mb-3">
+              <label for="single-scene-sse" class="block text-sm font-medium text-white/80 mb-1">Screen Space Error (SSE)</label>
+              <input id="single-scene-sse" type="range" min="2" max="64" value="20" class="w-full slider slider-lg">
+              <div class="flex justify-between text-xs opacity-60 mt-1">
+                <span>High detail</span>
+                <span id="single-scene-sse-value">20</span>
+                <span>Low detail</span>
+              </div>
+            </div>
+
+            <!-- Rotation (Y) -->
+            <div class="mb-3">
+              <label for="single-scene-rot" class="block text-sm font-medium text-white/80 mb-1">Rotation (Y)</label>
+              <input id="single-scene-rot" type="range" min="0" max="360" step="1" value="0" class="w-full slider slider-lg">
+              <div class="flex justify-between text-xs opacity-60 mt-1">
+                <span>0°</span><span id="single-scene-rot-value">0°</span><span>360°</span>
+              </div>
+            </div>
+
+            <!-- Debug Tiles -->
+            <div id="single-scene-debug-row" class="mb-3">
+              <div class="flex items-center justify-between">
+                <label class="block text-sm font-medium text-white/80">Debug Tiles</label>
+                <label class="inline-flex items-center cursor-pointer">
+                  <div class="relative">
+                    <input id="single-scene-debug-tiles" type="checkbox" class="sr-only peer">
+                    <div class="w-9 h-5 bg-white/10 peer-checked:bg-amber-500/80 rounded-full relative transition"></div>
+                    <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-4"></div>
+                  </div>
+                </label>
+              </div>
+              <div class="text-xs opacity-60 mt-1">Show tile bounds/helpers in the Single Scene viewer.</div>
             </div>
 
             <div>
@@ -485,7 +540,7 @@
                 <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="128">High</button>
                 <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="256">Ultra</button>
               </div>
-              <input id="single-scene-res-fine" type="range" min="8" max="512" value="64" class="w-full slider">
+              <input id="single-scene-res-fine" type="range" min="8" max="512" value="64" class="w-full slider slider-lg">
               <div class="text-xs opacity-60 mt-1">Fine-tune resolution</div>
             </div>
 
