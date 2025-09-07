@@ -245,8 +245,9 @@ class HUD {
       if (key) {
         const [lat, lon] = this.getLatLon();
         const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
-        this.setStatus('Loading tiles...');
-        spawnTiles(root, key, lat, lon);
+  this.setStatus('Loading tiles...');
+  ensureTiles(root, key);
+  retargetTiles(lat, lon);
       }
     }
   }
@@ -1296,25 +1297,11 @@ function toast(msg) {
   setTimeout(() => t.remove(), 1400);
 }
 
-async function updateAttributionFromTileset(rootUrl) {
-  try {
-    const res = await fetch(rootUrl);
-    const json = await res.json();
-    const credit =
-      json?.asset?.extras?.copyright ||
-      json?.asset?.copyright ||
-      json?.copyright ||
-      '© Google';
-
-    // simple sanitization; then show with links to Google Maps Platform terms
-    const safe = String(credit).replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const html = `${safe} · <a href="https://maps.google.com/help/terms_maps"
-                 target="_blank" rel="noopener noreferrer" class="underline opacity-80 hover:opacity-100">Terms</a>`;
-    const hint = document.querySelector('#composer-hint');
-    if (hint) hint.innerHTML = html;
-  } catch {
-    const hint = document.querySelector('#composer-hint');
-    if (hint) hint.innerHTML = `© Google · <a href="https://maps.google.com/help/terms_maps" target="_blank" rel="noopener noreferrer" class="underline opacity-80 hover:opacity-100">Terms</a>`;
+// Static attribution; avoid extra root.json fetches that count toward quota
+function updateAttributionFromTileset() {
+  const hint = document.querySelector('#composer-hint');
+  if (hint) {
+    hint.innerHTML = `© Google Maps · <a href="https://maps.google.com/help/terms_maps" target="_blank" rel="noopener noreferrer" class="underline opacity-80 hover:opacity-100">Terms</a>`;
   }
 }
 
@@ -1327,13 +1314,14 @@ function initializeApp() {
     
     // Set up UI callbacks after UI is ready
     if (ui && ui.getKey()) {
-      console.log('got key from localStorage; spawning initial tiles');
+      console.log('got key from localStorage; starting tiles');
       const [lat, lon] = ui.getLatLon();
       const key = ui.getKey();
       const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
       ui.setStatus('Loading tiles...');
-      updateAttributionFromTileset(root);
-      spawnTiles(root, key, lat, lon);
+  updateAttributionFromTileset();
+      ensureTiles(root, key);
+      retargetTiles(lat, lon);
     }
 
     if (ui) {
@@ -1343,10 +1331,10 @@ function initializeApp() {
         const [lat, lon] = ui.getLatLon();
         const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
 
-        scene.clear(); scene.add(camera); // wipe old
-        ui.setStatus(`Streaming ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
-        updateAttributionFromTileset(root);        // add this
-        spawnTiles(root, key, lat, lon);
+  ui.setStatus(`Streaming ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
+  updateAttributionFromTileset();        // no network call
+  ensureTiles(root, key);
+  retargetTiles(lat, lon);
       };
     }
   }, 100);
@@ -1360,9 +1348,11 @@ if (document.readyState === 'loading') {
 
 /* ───────────────────────────────  Three.js set-up ─────────────────── */
 let scene,camera,controls,renderer,tiles=null;
+let tilesSessionId = null; // session from first root load (reused across requests)
 let isInteracting = false;
 let __desiredView = null; // populated by HUD._goTo
 let freecamUpdateFn = null; // Will be set by camera controls
+let hasFramedOnce = false; // gate initial auto-framing
 
 /* ─────────────────────────────────── GUI & state ──────────────────── */
 const LAYER_IMAGERY = 0;   // Google 3D Tiles
@@ -1417,8 +1407,24 @@ function resize(){
 }
 
 /* ───────────────────────────── TilesRenderer factory ──────────────── */
-function spawnTiles(root,key,latDeg,lonDeg){
-  if(tiles){scene.remove(tiles.group);tiles.dispose();}
+function frameToView(view = { height: 360, tilt: 60, heading: 0 }) {
+  const tilt    = THREE.MathUtils.degToRad(view.tilt    ?? 60);
+  const heading = THREE.MathUtils.degToRad(view.heading ?? 0);
+  const r       = view.height ?? 360;
+  const horiz = Math.cos(tilt) * r;
+  const up    = Math.sin(tilt) * r;
+  const x     = Math.cos(heading) * horiz;
+  const z     = Math.sin(heading) * horiz;
+
+  controls.target.set(0, 0, 0);
+  camera.position.set(x, up, z);
+  controls.minDistance = 10;
+  controls.maxDistance = 30000;
+  controls.update();
+}
+
+function ensureTiles(root,key){
+  if (tiles) return;
   tiles=new TilesRenderer(root);
   tiles.registerPlugin(new TileCompressionPlugin());
   tiles.registerPlugin(new TilesFadePlugin());
@@ -1427,92 +1433,72 @@ function spawnTiles(root,key,latDeg,lonDeg){
       .setDecoderPath('https://unpkg.com/three@0.160/examples/jsm/libs/draco/gltf/')
   }));
 
-  /* keep single session id and key everywhere */
-  let sessionId;
+  // Prefer browser HTTP cache (honors server Cache-Control/ETag)
+  tiles.fetchOptions = { cache: 'force-cache' };
+
+  // keep single session id and key everywhere
   tiles.preprocessURL = u=>{
     if(u.startsWith('blob:')||u.startsWith('data:')) return u;
     const url=new URL(u,'https://tile.googleapis.com');
-    if(url.searchParams.has('session')) sessionId=url.searchParams.get('session');
-    if(sessionId && !url.searchParams.has('session')) url.searchParams.set('session',sessionId);
+    if(url.searchParams.has('session')) tilesSessionId=url.searchParams.get('session');
+    if(tilesSessionId && !url.searchParams.has('session')) url.searchParams.set('session',tilesSessionId);
     if(!url.searchParams.has('key'))     url.searchParams.set('key',key);
     return url.toString();
   };
 
-  // Simple & reliable: use the (deprecated) method on TilesRenderer for now
-  tiles.setLatLonToYUp(
-    latDeg * THREE.MathUtils.DEG2RAD,
-    lonDeg * THREE.MathUtils.DEG2RAD
-  );
   tiles.errorTarget = ui ? ui.getSSE() : 20;
   tiles.setCamera(camera);
   tiles.setResolutionFromRenderer(camera,renderer);
 
-  let framed=false;
-  tiles.addEventListener('load-tile-set', ()=>{
-    if(framed) return;
-
-    // Put the target (the chosen lat/lon) at the origin and fly camera near it.
-    const view = (window.__desiredView || __desiredView) || { height: 360, tilt: 60, heading: 0 };
-    const tilt    = THREE.MathUtils.degToRad(view.tilt    ?? 60);     // 0 = level, 90 = straight down
-    const heading = THREE.MathUtils.degToRad(view.heading ?? 0);      // degrees around target
-    const r       = view.height ?? 360;                                // meters-ish in local frame
-
-    // Orbit camera around (0,0,0) with Y-up
-    const horiz = Math.cos(tilt) * r;
-    const up    = Math.sin(tilt) * r;
-    const x     = Math.cos(heading) * horiz;
-    const z     = Math.sin(heading) * horiz;
-
-    controls.target.set(0, 0, 0);
-    camera.position.set(x, up, z);
-    controls.minDistance = 10;
-    controls.maxDistance = 30000;
-    controls.update();
-
-    // clear desired view so subsequent pans don't keep snapping
-    window.__desiredView = __desiredView = null;
-    framed=true;
-  });
-
-  // Event Handlers
+  // Events (no auto-framing here; 'load-tile-set' fires multiple times for nested sets)
   tiles.addEventListener('load-model', onTileLoad);
   tiles.addEventListener('dispose-model', onTileDispose);
-
-  // This is the key handler for managing LOD changes. When the renderer
-  // determines a tile is no longer visible (e.g., because it's been
-  // refined into higher-resolution children), we clean up its voxel mesh.
-  // When it becomes visible, we can trigger voxelization.
+  // LOD visibility management
   tiles.addEventListener('tile-visibility-change', ({ tile, visible }) => {
-    // 'tile' is the renderer's internal tile object.
-    // The actual three.js mesh group is in 'tile.cached.scene'.
     const tileGroup = tile.cached.scene;
-    if (!tileGroup) return; // Group not loaded yet.
-    
-    tileGroup.userData.rendererVisible = visible;  // <- remember renderer's idea
-
+    if (!tileGroup) return;
+    tileGroup.userData.rendererVisible = visible;
     if (visible) {
-      // If voxel mode is on and this tile becomes visible, build its voxel mesh.
-      if (state.vox && !isInteracting && 
-          !tileGroup._voxMesh && !tileGroup._mcMesh &&
-          !voxelizingTiles.has(tileGroup) && !disposingTiles.has(tileGroup)) {
+      if (state.vox && !isInteracting && !tileGroup._voxMesh && !tileGroup._mcMesh && !voxelizingTiles.has(tileGroup) && !disposingTiles.has(tileGroup)) {
         buildVoxelFor(tileGroup);
       }
     } else {
-      // Cancel in-flight worker if tile becomes invisible
       try { tileGroup._voxWorker?.terminate?.(); } catch {}
       voxelizingTiles.delete(tileGroup);
-      
-      // Just hide voxels when tile becomes invisible - keep them cached for instant return
-      // Only dispose in onTileDispose when the tile is actually removed from cache
       if (tileGroup._voxMesh) tileGroup._voxMesh.visible = false;
       if (tileGroup._mcMesh) tileGroup._mcMesh.visible = false;
     }
-    // After any change, re-evaluate what should be visible (original vs. voxel).
     applyVis(tileGroup);
   });
-  
+
   scene.add(tiles.group);
 }
+
+function retargetTiles(latDeg,lonDeg){
+  if(!tiles) return;
+  tiles.setLatLonToYUp(
+    latDeg * THREE.MathUtils.DEG2RAD,
+    lonDeg * THREE.MathUtils.DEG2RAD
+  );
+  // Frame only when explicitly requested (search/geocode) or first ever.
+  const requested = (window.__desiredView || __desiredView) || null;
+  if (requested) {
+    frameToView(requested);
+    window.__desiredView = __desiredView = null;
+    hasFramedOnce = true;
+  } else if (!hasFramedOnce) {
+    frameToView();
+    hasFramedOnce = true;
+  }
+}
+
+// Back-compat wrapper for any remaining call sites
+function spawnTiles(root,key,latDeg,lonDeg){
+  ensureTiles(root,key);
+  retargetTiles(latDeg,lonDeg);
+}
+
+// (tile-visibility-change listener now registered inside ensureTiles())
 
 /* ───────────────────── helper to dispose THREE objects ───────────── */
 function dispose(o){
