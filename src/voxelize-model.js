@@ -134,47 +134,56 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
       for (const g of result.geometries) {
         const geom = new THREE.BufferGeometry();
         geom.setAttribute('position', new THREE.BufferAttribute(g.positions, 3));
-        
-        // Colors: handle missing safely
-        const srcColors = g.colors ?? new Float32Array((g.positions.length/3) * 3).fill(1);
-        const vertCount = srcColors.length / 3;
-        const c8 = new Uint8Array(vertCount * 4);
-        for (let v = 0; v < vertCount; v++) {
-          let r = srcColors[v*3+0], g1 = srcColors[v*3+1], b = srcColors[v*3+2];
-          if (!Number.isFinite(r) || !Number.isFinite(g1) || !Number.isFinite(b)) { r=g1=b=1; } // white fallback
-          c8[v*4+0] = Math.max(0, Math.min(255, (r * 255) | 0));
-          c8[v*4+1] = Math.max(0, Math.min(255, (g1 * 255) | 0));
-          c8[v*4+2] = Math.max(0, Math.min(255, (b * 255) | 0));
-          c8[v*4+3] = 255;
+
+        // Prefer worker-packed RGBA8 colors (normalized) else fallback pack here
+        if (g.colors8) {
+          geom.setAttribute('color', new THREE.BufferAttribute(g.colors8, 4, true));
+        } else if (g.colors) {
+          const srcColors = g.colors;
+            const vertCount = srcColors.length / 3;
+            const c8 = new Uint8Array(vertCount * 4);
+            for (let v = 0; v < vertCount; v++) {
+              let r = srcColors[v*3+0], g1 = srcColors[v*3+1], b = srcColors[v*3+2];
+              if (!Number.isFinite(r) || !Number.isFinite(g1) || !Number.isFinite(b)) { r = g1 = b = 1; }
+              c8[v*4+0] = (r * 255) & 255;
+              c8[v*4+1] = (g1 * 255) & 255;
+              c8[v*4+2] = (b * 255) & 255;
+              c8[v*4+3] = 255;
+            }
+            geom.setAttribute('color', new THREE.BufferAttribute(c8, 4, true));
+        } else {
+          const vertCount = g.positions.length / 3;
+          const c8 = new Uint8Array(vertCount * 4);
+          for (let v = 0; v < vertCount; v++) { c8[v*4+0]=c8[v*4+1]=c8[v*4+2]=c8[v*4+3]=255; }
+          geom.setAttribute('color', new THREE.BufferAttribute(c8, 4, true));
         }
-        geom.setAttribute('color', new THREE.BufferAttribute(c8, 4, true));
-        
-        // Normals: optional (WebGL doesn't require for MeshBasicMaterial)
-        if (g.normals) {
-          geom.setAttribute('normal', new THREE.BufferAttribute(g.normals, 3));
-        }
-        
+
+        if (g.normals) geom.setAttribute('normal', new THREE.BufferAttribute(g.normals, 3));
         geom.setIndex(new THREE.BufferAttribute(g.indices, 1));
-        geom.boundingBox = new THREE.Box3(
-          new THREE.Vector3(g.bounds.min[0], g.bounds.min[1], g.bounds.min[2]),
-          new THREE.Vector3(g.bounds.max[0], g.bounds.max[1], g.bounds.max[2])
-        );
-        geom.computeBoundingSphere();
-        
+
+        // Fast bounds (avoid computeBoundingSphere per chunk)
+        if (g.bounds) {
+          const min = new THREE.Vector3(g.bounds.min[0], g.bounds.min[1], g.bounds.min[2]);
+          const max = new THREE.Vector3(g.bounds.max[0], g.bounds.max[1], g.bounds.max[2]);
+          geom.boundingBox = new THREE.Box3(min, max);
+          const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
+          const radius = min.distanceTo(max) * 0.5;
+          geom.boundingSphere = new THREE.Sphere(center, radius);
+        } else {
+          geom.computeBoundingBox?.();
+          geom.computeBoundingSphere?.();
+        }
+
         const mesh = new THREE.Mesh(
           geom,
           new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false })
         );
-        mesh.userData.chunkBounds = { min: g.bounds.min, max: g.bounds.max };
-        
-        // Store chunk bounds for frustum culling (if available from greedy meshing)
         if (g.bounds) {
           mesh.userData.chunkBounds = {
             min: new THREE.Vector3(g.bounds.min[0], g.bounds.min[1], g.bounds.min[2]),
             max: new THREE.Vector3(g.bounds.max[0], g.bounds.max[1], g.bounds.max[2])
           };
         }
-        
         group.add(mesh);
       }
 
