@@ -33,7 +33,7 @@ function textureToPixels(tex) {
 /* --------------------------------------------------------------- */
 /* 1️⃣  serialise the model                                         */
 /* --------------------------------------------------------------- */
-function serializeModel(model) {
+function serializeModel(model, { preRotateYDeg = 0 } = {}) {
   const meshes        = [];
   const materialStore = new Map();   // uuid → serialised material
   const imageStore    = new Map();   // uuid → ImageData
@@ -100,6 +100,36 @@ function serializeModel(model) {
 
   const bbox = new THREE.Box3().setFromObject(model);
 
+  /* Optional pre-bake Y rotation about the bbox center (world space) */
+  if (preRotateYDeg && Math.abs(preRotateYDeg) > 0.0001) {
+    const angle = preRotateYDeg * Math.PI / 180;
+    const center = bbox.getCenter(new THREE.Vector3());
+    const toOrigin = new THREE.Matrix4().makeTranslation(-center.x, -center.y, -center.z);
+    const rot = new THREE.Matrix4().makeRotationY(angle);
+    const back = new THREE.Matrix4().makeTranslation(center.x, center.y, center.z);
+    const rotAboutCenter = new THREE.Matrix4().multiplyMatrices(back, new THREE.Matrix4().multiplyMatrices(rot, toOrigin));
+
+    for (const m of meshes) {
+      const mw = new THREE.Matrix4().fromArray(m.matrixWorld);
+      mw.premultiply(rotAboutCenter); // rot * original
+      m.matrixWorld = mw.toArray();
+    }
+
+    // Recompute rotated bounding box efficiently by rotating the 8 original corners
+    const min = bbox.min.clone();
+    const max = bbox.max.clone();
+    const corners = [
+      new THREE.Vector3(min.x, min.y, min.z), new THREE.Vector3(max.x, min.y, min.z),
+      new THREE.Vector3(min.x, max.y, min.z), new THREE.Vector3(min.x, min.y, max.z),
+      new THREE.Vector3(max.x, max.y, min.z), new THREE.Vector3(max.x, min.y, max.z),
+      new THREE.Vector3(min.x, max.y, max.z), new THREE.Vector3(max.x, max.y, max.z)
+    ];
+    const rotMat = rotAboutCenter; // already includes translations
+    const rbbox = new THREE.Box3();
+    for (const c of corners) { c.applyMatrix4(rotMat); rbbox.expandByPoint(c); }
+    bbox.min.copy(rbbox.min); bbox.max.copy(rbbox.max);
+  }
+
   return {
     meshes,
     materials  : Array.from(materialStore.values()),
@@ -111,7 +141,7 @@ function serializeModel(model) {
 /* --------------------------------------------------------------- */
 /* 2️⃣  send to worker, receive voxel mesh back                     */
 /* --------------------------------------------------------------- */
-export function voxelizeModel({ model, resolution = 200, needGrid = false, method = '2.5d-scan', onStart }) {
+export function voxelizeModel({ model, resolution = 200, needGrid = false, method = '2.5d-scan', onStart, preRotateYDeg = 0 }) {
   return new Promise((resolve, reject) => {
 
     const worker = new Worker(
@@ -206,7 +236,7 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
 
     worker.onerror = err => { worker.terminate(); reject(err); };
 
-    const payload = serializeModel(model);
+  const payload = serializeModel(model, { preRotateYDeg });
 
     /* collect ArrayBuffers for zero-copy transfer */
     const transfers = [];

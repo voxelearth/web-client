@@ -8,17 +8,26 @@ export class SingleSceneFetcher {
     // Constructor can be empty for now
   }
 
-  async fetch3DTiles(lat, lng, zoom, targetScreenSpaceError, apiKey, logFn) {
+  /**
+   * Fetch visible 3D Tiles GLBs for a lat/lng, sized by radius (meters).
+   * If radiusMeters is provided, zoom is auto-computed to fit that diameter across viewport width.
+   */
+  async fetch3DTiles(lat, lng, zoom, targetScreenSpaceError, apiKey, logFn, radiusMeters) {
     const tilesetUrl = 'https://tile.googleapis.com/v1/3dtiles/root.json?key=' + apiKey;
     
     if (logFn) logFn(`Fetching tiles at (${lat} ${lng}, zoom: ${zoom}, sse: ${targetScreenSpaceError})`);
-    
-    const viewport = new WebMercatorViewport({ 
-      width: 230,
-      height: 175, // dimensions from the little map preview
+    const widthPx = 230;
+    const heightPx = 175; // mini map dims
+    const z = (Number.isFinite(radiusMeters) && radiusMeters > 0)
+      ? this._zoomForRadius(lat, radiusMeters, widthPx)
+      : (Number.isFinite(zoom) ? zoom : 16);
+
+    const viewport = new WebMercatorViewport({
+      width: widthPx,
+      height: heightPx,
       latitude: lat,
       longitude: lng,
-      zoom: zoom 
+      zoom: z
     });
 
     const tileset = await this.load3DTileset(tilesetUrl, viewport, targetScreenSpaceError);
@@ -85,6 +94,19 @@ export class SingleSceneFetcher {
     }
 
     return glbUrls;
+  }
+
+  /**
+   * Compute mercator zoom level fitting diameter (2*radius) into viewport width.
+   */
+  _zoomForRadius(latDeg, radiusMeters, viewportWidthPx) {
+    const EARTH_CIRCUMFERENCE_M = 40075016.68557849;
+    const latRad = (latDeg * Math.PI) / 180;
+    const cosLat = Math.max(0.01, Math.cos(latRad));
+    const margin = 1.10; // 10% padding
+    const metersPerPixel = (2 * radiusMeters * margin) / Math.max(1, viewportWidthPx);
+    const rawZoom = Math.log2((cosLat * EARTH_CIRCUMFERENCE_M) / (256 * metersPerPixel));
+    return Math.max(0, Math.min(22, rawZoom));
   }
 
   async load3DTileset(tilesetUrl, viewport, screenSpaceError) {

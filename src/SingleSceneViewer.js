@@ -49,6 +49,8 @@ export class SingleSceneViewer {
 	this.tilesContainer = null;
 	this.gltfArray = [];
 	this.voxelMeshes = []; // Initialize voxel meshes array
+	this._debugTilesOn = false;
+	this._debugHelpers = [];
 	this.gltfLoader = this._makeGLTFLoader(renderer);
 
 		this.render();
@@ -141,6 +143,10 @@ export class SingleSceneViewer {
 				this.tilesContainer = tilesContainer;
 				this.gltfArray = gltfArray;
 
+				// Refresh debug helpers according to current toggle
+				if (this._debugTilesOn) this._ensureDebugHelpers();
+				else                    this._clearDebugHelpers();
+
 				// Frame the camera on the stitched model so it’s visible immediately
 				this._frame(tilesContainer);
 	}
@@ -190,6 +196,37 @@ export class SingleSceneViewer {
 			this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
 		}
 		this.renderer.dispose();
+	}
+
+	// ───────────────────── Debug Tiles helpers ─────────────────────
+	setDebugTiles(on) {
+		this._debugTilesOn = !!on;
+		if (this._debugTilesOn) this._ensureDebugHelpers();
+		else                    this._clearDebugHelpers();
+	}
+
+	_ensureDebugHelpers() {
+		if (!this.tilesContainer) return;
+		this._clearDebugHelpers();
+		const addHelperFor = (obj) => {
+			const box = new THREE.Box3().setFromObject(obj);
+			if (box.isEmpty()) return;
+			const helper = new THREE.Box3Helper(box, 0xffff00);
+			try { helper.layers.enable(1); } catch(e) {}
+			this.scene.add(helper);
+			this._debugHelpers.push(helper);
+		};
+		for (const child of this.tilesContainer.children) addHelperFor(child);
+	}
+
+	_clearDebugHelpers() {
+		if (!this._debugHelpers?.length) return;
+		for (const h of this._debugHelpers) {
+			this.scene.remove(h);
+			try { h.geometry?.dispose?.(); } catch {}
+			try { h.material?.dispose?.(); } catch {}
+		}
+		this._debugHelpers.length = 0;
 	}
 }
 
