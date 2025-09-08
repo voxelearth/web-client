@@ -16,6 +16,15 @@ const textureCache = {};
 let BLOCKS = [];
 let kdTree = null;
 
+// Bias towards brighter/darker blocks during matching (OKLab L adjustment)
+// Recommended external usage range: -0.20 .. +0.20
+let MC_BRIGHTNESS_BIAS = 0.1; // Slightly brighter than normal! Helps the MC bias towards dark blocks
+export function setMinecraftBrightnessBias(bias){
+  MC_BRIGHTNESS_BIAS = Math.max(-0.5, Math.min(0.5, +bias || 0));
+  console.log('[MC] brightness bias set to', MC_BRIGHTNESS_BIAS);
+}
+export function getMinecraftBrightnessBias(){ return MC_BRIGHTNESS_BIAS; }
+
 const BLOCK_SIZE = 16; // 16×16 textures
 const loader = new THREE.TextureLoader();
 
@@ -109,6 +118,12 @@ function rgbToOKLab(r, g, b) {
     a: 1.9779984951*l_ - 2.4285922050*m_ + 0.4505937099*s_,
     b: 0.0259040371*l_ + 0.7827717662*m_ - 0.8086757660*s_
   };
+}
+
+// Apply brightness bias (L channel shift) to a Lab object in-place
+function applyBrightnessBias(lab){
+  lab.L = Math.min(1, Math.max(0, lab.L + MC_BRIGHTNESS_BIAS));
+  return lab;
 }
 
 // Build a per-block material that samples the shared atlas at a sub-rect
@@ -293,8 +308,8 @@ export async function assignVoxelsToBlocks(glbDisplay) {
     const cached = cache[k];
     if (cached >= 0) return cached;
 
-    const { L, a, b:bb } = USE_OKLAB ? rgbToOKLab(r, g, b) : { L:r, a:g, b };
-    const best = nearestNeighbor(kdTree, L, a, bb);
+  const lab = USE_OKLAB ? applyBrightnessBias(rgbToOKLab(r,g,b)) : { L:r, a:g, b };
+  const best = nearestNeighbor(kdTree, lab.L, lab.a, lab.b);
     cache[k] = best.idx;
     return best.idx;
   };
@@ -434,7 +449,7 @@ function computeBlockIndexGrid(voxelGrid) {
     const B=Math.min(LOOK.b-1, Math.max(0,(b*LOOK.b)|0));
     return R + LOOK.r*(G + LOOK.g*B);
   };
-  const findNearest=(r,g,b)=>{ const k=keyFor(r,g,b); const c=cache[k]; if(c>=0) return c; const q=rgbToOKLab(r,g,b); const best=nearestNeighbor(kdTree,q.L,q.a,q.b,{d2:Infinity,idx:-1}); cache[k]=best.idx; return best.idx; };
+  const findNearest=(r,g,b)=>{ const k=keyFor(r,g,b); const c=cache[k]; if(c>=0) return c; const q=applyBrightnessBias(rgbToOKLab(r,g,b)); const best=nearestNeighbor(kdTree,q.L,q.a,q.b,{d2:Infinity,idx:-1}); cache[k]=best.idx; return best.idx; };
   for (let i=0;i<total;i++) {
     const cnt = voxelCounts[i]; if(!cnt) continue;
     const r = voxelColors[i*4+0]/cnt;
@@ -453,7 +468,7 @@ function makeColorFallbackPicker(querySpace='srgb') {
     const r=(col.getX(i0)+col.getX(i1)+col.getX(i2))/3;
     const g=(col.getY(i0)+col.getY(i1)+col.getY(i2))/3;
     const b=(col.getZ(i0)+col.getZ(i1)+col.getZ(i2))/3;
-    const q = rgbToOKLab(r,g,b); // already linearized inside
+  const q = applyBrightnessBias(rgbToOKLab(r,g,b)); // already linearized inside + bias
     const best = nearestNeighbor(kdTree, q.L, q.a, q.b, { d2:Infinity, idx:-1 });
     return best.idx;
   };
@@ -560,15 +575,21 @@ export async function applyAtlasToExistingVoxelMesh(voxelMesh, voxelGrid) {
   const blockIdxGrid = (voxelGrid && voxelGrid.gridSize) ? computeBlockIndexGrid(voxelGrid) : null;
   const atlas = await getSharedAtlasTexture();
   const mcMat = makeAtlasBasicMaterial(atlas);
+  const allowApply = !!(voxelMesh.userData && voxelMesh.userData.__mcAllowApply);
   voxelMesh.traverse(n => {
     if (!n.isMesh || !n.geometry) return;
     if (!n.userData.origMat) n.userData.origMat = n.material;
     const picker = blockIdxGrid ? null : makeColorFallbackPicker('srgb');
     bakeAtlasUVsOnGeometry(n.geometry, voxelGrid || null, blockIdxGrid, picker);
-    n.material = mcMat;
-    n.userData.mcMat = mcMat; // allow toggling back without re-bake
+    if (allowApply) {
+      n.material = mcMat;
+      n.userData.mcMat = mcMat; // allow toggling back without re-bake
+    }
     n.frustumCulled = false;
   });
+  if (allowApply) {
+    voxelMesh.userData.__mcBiasUsed = getMinecraftBrightnessBias();
+  }
 }
 
 export function restoreVoxelOriginalMaterial(voxelMesh) {

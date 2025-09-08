@@ -16,7 +16,9 @@ import { voxelizeModel              } from './voxelize-model.js';
 import { initBlockData,
          assignVoxelsToBlocks,
          applyAtlasToExistingVoxelMesh,
-         restoreVoxelOriginalMaterial } from './assignToBlocksForGLB.js';
+         restoreVoxelOriginalMaterial,
+         setMinecraftBrightnessBias,
+         getMinecraftBrightnessBias } from './assignToBlocksForGLB.js';
 import { SingleSceneViewer          } from './SingleSceneViewer.js';
 import { SingleSceneFetcher         } from './SingleSceneFetcher.js';
 
@@ -968,7 +970,7 @@ class HUD {
       { label:'Cairo',         lat:29.97923, lon:31.13420,  view:{height:420, tilt:38, heading:-140} },
       { label:'Rio de Janeiro',lat:-22.95192, lon:-43.21049,view:{height:340, tilt:43, heading:-20} },
       { label:'San Francisco', lat:37.81993, lon:-122.47825,view:{height:420, tilt:41, heading:  0} },
-      { label:'London',        lat:51.50073, lon:-0.12463,  view:{height:340, tilt:46, heading:210} },
+      { label:'London',        lat:51.50073, lon:-0.12463,  view:{height:340, tilt:46, heading:90} },
     ];
     this.suggestions.innerHTML = '';
     for (const p of PICKS) {
@@ -1779,6 +1781,7 @@ async function buildVoxelFor(tile){
     vMesh.traverse(n => { if(n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
 
     if(state.mc && vox._voxelGrid) {
+      vMesh.userData.__mcAllowApply = true; // allow MC material application
       await applyAtlasToExistingVoxelMesh(vMesh, vox._voxelGrid);
       tile._mcApplied = true;
     }
@@ -1877,9 +1880,20 @@ function applyVis(tile){
   }
 
   if (tile._voxMesh) tile._voxMesh.visible = !!showVoxels;
+  if (tile._voxMesh) tile._voxMesh.userData.__mcAllowApply = !!useMinecraft; // set gating flag
 
   if (tile._voxMesh) {
     if (useMinecraft) {
+      // Lazy rebake only when MC ON and bias changed
+      if (tile._voxelizer?._voxelGrid) {
+        const wantBias = getMinecraftBrightnessBias?.();
+        if (typeof wantBias === 'number' && tile._voxMesh.userData.__mcBiasUsed !== wantBias && !tile._rebaking) {
+          tile._rebaking = true;
+          applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid)
+            .then(()=>{ tile._mcApplied = true; })
+            .finally(()=>{ tile._rebaking = false; });
+        }
+      }
       if (!tile._mcApplied && tile._voxelizer?._voxelGrid) {
         buildMinecraftFor(tile);
       } else {
@@ -1890,6 +1904,23 @@ function applyVis(tile){
     }
   }
 }
+
+// Re-bake Minecraft atlas UVs on currently visible voxel tiles with a new brightness bias.
+// Pure CPU; no re-voxelization or new geometry. Exposed via window.MC_setBrightness.
+async function rebakeMinecraftUVsForVisibleTiles(bias = 0){
+  setMinecraftBrightnessBias(bias);
+  if(!tiles || !tiles.group) return;
+  if(!state.mc){ updateVis(); return; } // don't rebake when MC off; lazy on toggle
+  const kids = tiles.group.children || [];
+  for(const tile of kids){
+    if(!tile || tile.type !== 'Group') continue;
+    if(!tile._voxMesh || !tile._voxelizer?._voxelGrid) continue;
+    tile._voxMesh.userData.__mcAllowApply = true;
+    try { await applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid); tile._mcApplied = true; } catch(e){ console.warn('Rebake failed', e); }
+  }
+  updateVis();
+}
+window.MC_setBrightness = (b)=>rebakeMinecraftUVsForVisibleTiles(b);
 
 // Recompute per-tile visibility & (re)voxelization needs after UI state changes.
 // Called by UI event handlers when toggling vox / mc / debug imagery.
