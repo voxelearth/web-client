@@ -14,7 +14,9 @@ import { DRACOLoader                } from 'three/examples/jsm/loaders/DRACOLoad
 
 import { voxelizeModel              } from './voxelize-model.js';
 import { initBlockData,
-         assignVoxelsToBlocks       } from './assignToBlocksForGLB.js';
+         assignVoxelsToBlocks,
+         applyAtlasToExistingVoxelMesh,
+         restoreVoxelOriginalMaterial } from './assignToBlocksForGLB.js';
 import { SingleSceneViewer          } from './SingleSceneViewer.js';
 import { SingleSceneFetcher         } from './SingleSceneFetcher.js';
 
@@ -1742,8 +1744,8 @@ async function buildVoxelFor(tile){
     const vox = await voxelizeModel({
       model: tile,
       resolution: perTileResolution,
-      needGrid: state.mc,   // ← only when Minecraft is enabled
-      method: ui.getVoxelizationMethod(), // ← pass selected method
+      needGrid: true,   // always build voxelGrid so MC toggle is instant
+      method: ui.getVoxelizationMethod(),
       onStart: w => { workerRef = w; tile._voxWorker = w; }
     });
     
@@ -1753,7 +1755,7 @@ async function buildVoxelFor(tile){
       return;
     }
 
-    const vMesh = vox.voxelMesh;
+  const vMesh = vox.voxelMesh;
     vMesh.matrixAutoUpdate = false;
     vMesh.userData.sourceTile = tile;
     
@@ -1773,10 +1775,13 @@ async function buildVoxelFor(tile){
 
     tile._voxMesh = vMesh;
     tile._voxelizer = vox;
-    tile._tempContainer = new THREE.Group(); // still used for MC export
-    tile._tempContainer._voxelGrid = vox._voxelGrid;
+    // Remember original materials for MC toggle
+    vMesh.traverse(n => { if(n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
 
-    if(state.mc) await buildMinecraftFor(tile);
+    if(state.mc && vox._voxelGrid) {
+      await applyAtlasToExistingVoxelMesh(vMesh, vox._voxelGrid);
+      tile._mcApplied = true;
+    }
     applyVis(tile);
   }catch(e){ 
     console.warn('voxelise failed',e);
@@ -1787,55 +1792,15 @@ async function buildVoxelFor(tile){
 }
 
 async function buildMinecraftFor(tile){
-  if(!tile || tile._mcMesh || !tile._voxelizer || !tile._tempContainer || disposingTiles.has(tile)) return;
-  if(!tile.parent || tile.parent !== tiles.group) return;
-  
-  // make sure we have a voxel grid (we skipped it when MC was off)
-  if (!tile._voxelizer._voxelGrid) {
-    try {
-      const perTileResolution = resolutionForTile(tile);
-      const vox = await voxelizeModel({
-        model: tile._tempContainer,          // already cloned container
-        resolution: perTileResolution,
-        needGrid: true,
-        method: ui.getVoxelizationMethod() // ← pass selected method
-      });
-      tile._voxelizer._voxelGrid = vox._voxelGrid;
-      if (!vox._voxelGrid) {
-        console.warn('Voxel grid too large to export; reduce resolution or zoom in.');
-        return; // bail gracefully
-      }
-    } catch(e) {
-      console.warn('Failed to generate voxel grid for MC:', e);
-      return;
-    }
-  }
-  
+  // Backwards-compat helper: apply atlas material if not already applied
+  if(!tile || !tile._voxMesh || !tile._voxelizer || disposingTiles.has(tile)) return;
+  if(tile._mcApplied) return;
   try {
-    await initBlockData();
-    const container = tile._tempContainer;
-    container._voxelGrid = tile._voxelizer._voxelGrid;
-    if(!container.editor) container.editor = {update(){}};
-    await assignVoxelsToBlocks(container);
-
-    if(!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
-      const mc = container.getObjectByName('voxelGroup');
-      if(mc) dispose(mc);
-      return;
-    }
-
-    const mc = container.getObjectByName('voxelGroup');
-    if(mc){
-      mc.matrixAutoUpdate = false;
-      mc.traverse(n => n.layers.set(LAYER_VOXELS));
-      scene.add(mc);
-      tile._mcMesh = mc;
-      mc.userData.sourceTile = tile;
-    }
+    if (!tile._voxelizer._voxelGrid) return; // needGrid must be true during voxelization when MC enabled
+    await applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid);
+    tile._mcApplied = true;
     applyVis(tile);
-  } catch(e) {
-    console.warn('Minecraft conversion failed', e);
-  }
+  } catch(e) { console.warn('Minecraft material swap failed', e); }
 }
 
 // The 'scene' from the event is the THREE.Group for the tile.
@@ -1878,67 +1843,61 @@ function cleanupTileVoxels(tile){
   disposingTiles.add(tile);
   try {
     try { tile._voxWorker?.terminate?.(); } catch {}
-    dispose(tile._voxMesh); 
-    dispose(tile._mcMesh);
-    dispose(tile._tempContainer);
+  dispose(tile._voxMesh); 
+  dispose(tile._tempContainer);
     
     voxelizingTiles.delete(tile);
     
-    delete tile._voxMesh;
-    delete tile._mcMesh;
-    delete tile._voxelizer;
-    delete tile._tempContainer;
-    delete tile._voxError;  // allow retry after cleanup
-    delete tile._voxWorker;
+  delete tile._voxMesh;
+  delete tile._voxelizer;
+  delete tile._tempContainer;
+  delete tile._voxError;  // allow retry after cleanup
+  delete tile._voxWorker;
+  delete tile._mcApplied;
   } finally {
     disposingTiles.delete(tile);
   }
 }
 
-/* ─────────────────────── visibility resolver ─────────────────────── */
+
+
 function applyVis(tile){
   if(!tile || !tile.parent || tile.parent !== tiles.group || typeof tile.type !== 'string') return;
-  
-  // Note: We no longer hide voxels during interaction - they stay visible for smoother experience
-  // Only new voxelization builds are paused during interaction
 
-  const showV = state.vox && !state.mc;
-  const showM = state.vox &&  state.mc;
+  const showVoxels   = state.vox;
+  const useMinecraft = state.vox && state.mc;
+  const hideImagery  = state.vox && (state.debugImagery === false);
 
-  // "Debug imagery" unchecked => hide original imagery when voxels are on
-  const hideImagery = state.vox && (state.debugImagery === false);
   if (hideImagery) {
     camera.layers.disable(LAYER_IMAGERY);
     camera.layers.enable(LAYER_VOXELS);
   } else {
-    // Vox off → imagery only; Vox on + debug imagery on → both
     camera.layers.enable(LAYER_IMAGERY);
-    if (state.vox) camera.layers.enable(LAYER_VOXELS);
-    else           camera.layers.disable(LAYER_VOXELS);
+    if (state.vox) camera.layers.enable(LAYER_VOXELS); else camera.layers.disable(LAYER_VOXELS);
   }
 
-  if(tile._voxMesh) tile._voxMesh.visible = showV;
-  if(tile._mcMesh) tile._mcMesh.visible = showM;
+  if (tile._voxMesh) tile._voxMesh.visible = !!showVoxels;
+
+  if (tile._voxMesh) {
+    if (useMinecraft) {
+      if (!tile._mcApplied && tile._voxelizer?._voxelGrid) {
+        buildMinecraftFor(tile);
+      } else {
+        tile._voxMesh.traverse(n=>{ if(n.isMesh && n.userData?.mcMat) n.material = n.userData.mcMat; });
+      }
+    } else {
+      tile._voxMesh.traverse(n=>{ if(n.isMesh && n.userData?.origMat) n.material = n.userData.origMat; });
+    }
+  }
 }
 
+// Recompute per-tile visibility & (re)voxelization needs after UI state changes.
+// Called by UI event handlers when toggling vox / mc / debug imagery.
 function updateVis(){
   if(!tiles || !tiles.group) return;
-  
-  if (tiles.group.children) {
-    tiles.group.children.forEach(tile => {
-      if (tile && tile.type === 'Group') {
-        // If we're turning voxel mode on, and a tile is visible but
-        // not voxelized yet, build it.
-        const rendererVisible = tile?.userData?.rendererVisible ?? tile?.visible;
-        if (state.vox && rendererVisible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
-          buildVoxelFor(tile);
-        }
-        // Apply the latest visibility rules to the tile and its voxel meshes.
-        applyVis(tile);
-      }
-    });
-  }
+  tiles.group.children.forEach(tile => { if(tile && tile.type==='Group') applyVis(tile); });
 }
+
 
 function rebuildAll(){
   if(!tiles || !tiles.group) return;
