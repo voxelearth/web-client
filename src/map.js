@@ -968,7 +968,7 @@ class HUD {
       { label:'Tokyo',         lat:35.65858, lon:139.74543, view:{height:340, tilt:47, heading:-20} },
       { label:'Sydney',        lat:-33.85678, lon:151.21530, view:{height:360, tilt:43, heading:120} },
       { label:'Cairo',         lat:29.97923, lon:31.13420,  view:{height:420, tilt:38, heading:-140} },
-      { label:'Rio de Janeiro',lat:-22.95192, lon:-43.21049,view:{height:340, tilt:43, heading:-20} },
+      { label:'Rio de Janeiro',lat:-22.95192, lon:-43.21049,view:{height:2840, tilt:43, heading:-20} },
       { label:'San Francisco', lat:37.81993, lon:-122.47825,view:{height:420, tilt:41, heading:  0} },
       { label:'London',        lat:51.50073, lon:-0.12463,  view:{height:340, tilt:46, heading:90} },
     ];
