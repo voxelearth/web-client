@@ -1722,9 +1722,24 @@ function resolutionForTile(tile) {
   return THREE.MathUtils.clamp(r, 8, state.resolution);
 }
 
+// Only bother voxelizing if the tile is at least a couple pixels on-screen
+function isWorthVoxelizing(tile) {
+  try {
+    return screenRadiusForObject(tile) > 2;
+  } catch {
+    return true; // be permissive on failure
+  }
+}
+
+// Yield voxel starts to idle frames when possible (with a small timeout)
+const scheduleVoxel = (cb) => ('requestIdleCallback' in window)
+  ? requestIdleCallback(cb, { timeout: 120 })
+  : setTimeout(cb, 0);
+
 async function buildVoxelFor(tile){
-  const rendererVisible = tile?.userData?.rendererVisible ?? tile?.visible ?? false;
-  if(!tile || tile._voxMesh || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile) || !rendererVisible) return;
+  const rendererVisible = tile?.userData?.rendererVisible;
+  if(!tile || tile._voxMesh || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile)) return;
+  if (rendererVisible === false) return; // only skip when we know it's hidden
   if(!tile.parent || tile.parent !== tiles.group) return;
   
   let hasMeshes = false;
@@ -1737,7 +1752,7 @@ async function buildVoxelFor(tile){
   tile.getWorldScale(s);           // crude scale proxy
   const approxRadius = tile.boundingSphere?.radius || Math.max(s.x, s.y, s.z) * 50;
   const dist2 = camera.position.distanceToSquared(s.center);
-  if (approxRadius * approxRadius > dist2 * 0.6) return;
+  if (approxRadius * approxRadius > dist2 * 0.3) return;
   
   voxelizingTiles.add(tile);
   try{
@@ -1818,13 +1833,15 @@ function onTileLoad({scene:tile}){
   // The 'tile-visibility-change' event now handles removing voxels from
   // parent tiles when children (higher LODs) are loaded.
   applyVis(tile);
+  // If we don't yet know visibility, assume visible so idle sweep can pick it up.
+  if (tile.userData.rendererVisible === undefined) tile.userData.rendererVisible = true;
   
   // Automatically voxelize if vox mode is on.
-  const rendererVisible = tile?.userData?.rendererVisible ?? tile.visible;
-  if(state.vox && !isInteracting && rendererVisible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
-    requestAnimationFrame(() => {
-      const stillVisible = tile?.userData?.rendererVisible ?? tile.visible;
-      if(!isInteracting && tile.parent && stillVisible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
+  const rendererVisible = tile?.userData?.rendererVisible;
+  if(state.vox && !isInteracting && rendererVisible !== false && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
+    scheduleVoxel(() => {
+      const stillVisible = tile?.userData?.rendererVisible;
+      if(!isInteracting && tile.parent && stillVisible !== false && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile) && isWorthVoxelizing(tile)) {
         buildVoxelFor(tile);
       }
     });
@@ -1972,8 +1989,12 @@ function loop(){
       if(tiles.group && tiles.group.children) {
         const tilesToVoxelize = [];
         tiles.group.children.forEach(tile => {
-          const rendererVisible = tile?.userData?.rendererVisible ?? tile?.visible;
-          if (tile && tile.type === 'Group' && rendererVisible && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
+          const rendererVisible = tile?.userData?.rendererVisible;
+          if (tile && tile.type === 'Group'
+              && rendererVisible !== false
+              && isWorthVoxelizing(tile)
+              && !tile._voxMesh && !tile._voxError
+              && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
             tilesToVoxelize.push(tile);
           }
         });
@@ -1991,7 +2012,7 @@ function loop(){
           const budget = Math.max(
             0, (isInteracting ? MOVING_BUDGET : MAX_CONCURRENT_VOXELIZERS) - voxelizingTiles.size
           );
-          tilesToVoxelize.slice(0, budget).forEach(tile => buildVoxelFor(tile));
+          tilesToVoxelize.slice(0, budget).forEach(tile => scheduleVoxel(() => buildVoxelFor(tile)));
         }
       }
     }
