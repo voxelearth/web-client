@@ -540,6 +540,130 @@ class HUD {
       });
     }
 
+  // ── Single Scene: Minecraft textures toggle
+  let toggleSCMC = document.querySelector('#single-scene-toggle-mc');
+  if (!toggleSCMC) {
+    // Inject a neat little switch next to "Show voxels"
+    const panel = document.querySelector('#single-scene-panel') || document.body;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:.5rem;margin:.25rem 0;';
+    row.innerHTML = `
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;">
+        <input id="single-scene-toggle-mc" type="checkbox" />
+        <span>Minecraft textures</span>
+      </label>
+    `;
+    panel.appendChild(row);
+    toggleSCMC = row.querySelector('#single-scene-toggle-mc');
+  }
+  toggleSCMC.checked = !!(window.state && window.state.mc);
+
+  // apply/remove MC material for the current Single Scene voxel mesh
+  const applySingleSceneMC = async (on) => {
+    const viewer = window.singleSceneViewer;
+    const container = viewer?.tilesContainer;
+    if (!viewer || !container) return;
+    const vox = container.getObjectByName('singleSceneVoxels');
+  const vgrid = viewer.voxelizer?._voxelGridRebased;
+    if (!vox) return;
+
+    window.state = window.state || {};
+    window.state.mc = !!on;
+
+    if (on) {
+      if (!vgrid) { console.warn('No voxel grid for Single Scene; cannot apply MC'); return; }
+      vox.userData.__mcAllowApply = true;
+      try { await applyAtlasToExistingVoxelMesh(vox, vgrid); vox.userData.__mcApplied = true; }
+      catch(e){ console.warn('MC apply failed', e); }
+    } else {
+      // restore vertex-color material (no atlas)
+      try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch {}
+    }
+  };
+
+  toggleSCMC.addEventListener('change', async () => {
+    await applySingleSceneMC(toggleSCMC.checked);
+  });
+
+  // If "Show voxels" toggles off, also turn off MC (to avoid grey surprises)
+  if (toggleVoxels) {
+    toggleVoxels.addEventListener('change', async (e) => {
+      if (!e.target.checked && toggleSCMC) {
+        toggleSCMC.checked = false;
+        await applySingleSceneMC(false);
+      }
+    });
+  }
+
+  // ── Export row (format select + button)
+  let exportRow = document.querySelector('#single-scene-export-row');
+  if (!exportRow) {
+    const panel = document.querySelector('#single-scene-panel') || document.body;
+    exportRow = document.createElement('div');
+    exportRow.id = 'single-scene-export-row';
+    exportRow.style.cssText = 'display:flex;align-items:center;gap:.5rem;margin:.5rem 0;';
+    exportRow.innerHTML = `
+      <select id="single-scene-export-format" style="padding:.25rem;">
+        <option value="mcfunction">mcfunction (vanilla)</option>
+        <option value="palette.json">palette JSON (.schem-ready)</option>
+        <option value="nbt">Structure (.nbt)</option>
+        <option value="schem">WorldEdit v2 (.schem)</option>
+        <option value="schematic">MCEdit legacy (.schematic)</option>
+      </select>
+      <button id="single-scene-export-btn" style="padding:.35rem .6rem;">Export</button>
+    `;
+    panel.appendChild(exportRow);
+  }
+  const exportBtn = exportRow.querySelector('#single-scene-export-btn');
+  const exportFmt = exportRow.querySelector('#single-scene-export-format');
+
+  const downloadText = (filename, text) => {
+    const blob = new Blob([text], { type:'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 250);
+  };
+
+  exportBtn.addEventListener('click', async () => {
+    const viewer = window.singleSceneViewer;
+    const vgrid  = viewer?.voxelizer?._voxelGridRebased || viewer?.voxelizer?._voxelGrid;
+    if (!viewer || !vgrid) { this._logSingleScene('❌ No voxel grid to export'); return; }
+
+    try {
+      const mod = await import('./assignToBlocksForGLB.js');
+      const dense = mod.buildBlockGrid(vgrid); // palette + dense indices
+      const fmt  = exportFmt.value;
+  if (fmt === 'mcfunction') {
+        const txt = mod.generateMcfunction(dense, { x:0,y:0,z:0 });
+        downloadText('structure.mcfunction', txt);
+        this._logSingleScene('✅ Exported mcfunction');
+      } else if (fmt === 'nbt') {
+        const bytes = await mod.writeStructureNBT(dense, { dataVersion: 3955 });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([bytes], { type:'application/octet-stream' }));
+        a.download = 'structure.nbt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),250);
+        this._logSingleScene('✅ Exported Structure .nbt');
+      } else if (fmt === 'schem') {
+        const bytes = await mod.writeSpongeSchem(dense, { mcVersion: '1.20' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([bytes], { type:'application/octet-stream' }));
+        a.download = 'structure.schem'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),250);
+        this._logSingleScene('✅ Exported .schem');
+      } else if (fmt === 'schematic') {
+        const bytes = await mod.writeMCEditSchematic(dense);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([bytes], { type:'application/octet-stream' }));
+        a.download = 'structure.schematic'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),250);
+        this._logSingleScene('✅ Exported legacy .schematic');
+      }
+    } catch (e) {
+      console.error(e);
+      this._logSingleScene('❌ Export failed');
+    }
+  });
+
   // No duplicate toggle handler — visibility logic handled by the single toggle above
   }
 
@@ -718,8 +842,10 @@ class HUD {
     const Tpos  = new THREE.Matrix4().makeTranslation( pivot.x,  pivot.y,  pivot.z);
     const counterM = new THREE.Matrix4().multiplyMatrices(Tpos, new THREE.Matrix4().multiplyMatrices(RyInv, Tneg));
 
-    // world -> container-local + attach (after counter-rotation)
-    const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
+  // world -> container-local + attach (after counter-rotation)
+  const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
+  // Combined matrix that we apply to geometry; use same to rebase voxelGrid
+  const Mreb = new THREE.Matrix4().multiplyMatrices(inv, counterM);
     voxelMesh.traverse(node => {
       if (node.isMesh && node.geometry) {
         if (rotDeg !== 0) node.geometry.applyMatrix4(counterM); // undo visual rotation
@@ -741,17 +867,43 @@ class HUD {
     voxelMesh.name = 'singleSceneVoxels';
     voxelMesh.userData.resolution = resolution;
     container.add(voxelMesh);
+  // Ensure transforms are up-to-date before any material/shader compilation
+  try { container.updateMatrixWorld(true); } catch {}
+  try { voxelMesh.updateMatrixWorld(true); } catch {}
     viewer.voxelMeshes = [voxelMesh];
     viewer.voxelizer = vox;
 
-    // Apply Minecraft atlas with consistent KD using the voxel grid (avoid linear vertex-color fallback)
-    if (vox._voxelGrid) {
+    // Save a voxelGrid that matches the transformed geometry
+    try {
+      const rawGrid = vox._voxelGrid;
+      const rebasedGrid = rawGrid ? rebaseVoxelGrid(rawGrid, Mreb) : null;
+      viewer.voxelizer._voxelGridRebased = rebasedGrid;
+    } catch (e) {
+      console.warn('Failed to compute rebased voxelGrid:', e);
+      viewer.voxelizer._voxelGridRebased = vox._voxelGrid || null;
+    }
+
+    // Preserve original materials so we can keep vertex-color rendering unless MC is enabled
+    voxelMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
+
+    // Single Scene: only apply MC when MC mode is on (mirror main viewer behavior)
+    const wantMC = !!(typeof state === 'object' ? state.mc : (window.state && window.state.mc));
+  if (wantMC && viewer.voxelizer?._voxelGridRebased) {
       try {
         voxelMesh.userData.__mcAllowApply = true;
-        await applyAtlasToExistingVoxelMesh(voxelMesh, vox._voxelGrid);
+    await applyAtlasToExistingVoxelMesh(voxelMesh, viewer.voxelizer._voxelGridRebased);
+        voxelMesh.userData.__mcApplied = true;
       } catch (e) {
         console.warn('MC apply (single-scene) failed:', e);
       }
+    } else {
+      // Ensure we keep the original vertex-color material
+      voxelMesh.traverse(n => {
+        if (n.isMesh) {
+          if (!n.userData.origMat) n.userData.origMat = n.material; // preserve
+          n.material = n.userData.origMat;
+        }
+      });
     }
 
     // Respect current toggle
@@ -2029,4 +2181,36 @@ function loop(){
   }
   
   renderer.render(scene,camera);
+}
+
+// Rebase a voxelGrid's bbox+unit by a 4x4 transform M (the SAME matrices applied to the voxel geometry).
+function rebaseVoxelGrid(voxelGrid, M) {
+  if (!voxelGrid || !voxelGrid.bbox || !voxelGrid.unit) return voxelGrid;
+
+  const from = voxelGrid.bbox;
+  const corners = [
+    new THREE.Vector3(from.min.x, from.min.y, from.min.z),
+    new THREE.Vector3(from.max.x, from.min.y, from.min.z),
+    new THREE.Vector3(from.min.x, from.max.y, from.min.z),
+    new THREE.Vector3(from.min.x, from.min.y, from.max.z),
+    new THREE.Vector3(from.max.x, from.max.y, from.min.z),
+    new THREE.Vector3(from.max.x, from.min.y, from.max.z),
+    new THREE.Vector3(from.min.x, from.max.y, from.max.z),
+    new THREE.Vector3(from.max.x, from.max.y, from.max.z),
+  ];
+  const outBox = new THREE.Box3();
+  for (const c of corners) outBox.expandByPoint(c.clone().applyMatrix4(M));
+
+  // derive per-axis scale from M (assume mostly orthonormal after our counter-rotation)
+  const origin = new THREE.Vector3(0,0,0).applyMatrix4(M);
+  const ex = new THREE.Vector3(1,0,0).applyMatrix4(M).sub(origin).length();
+  const ey = new THREE.Vector3(0,1,0).applyMatrix4(M).sub(origin).length();
+  const ez = new THREE.Vector3(0,0,1).applyMatrix4(M).sub(origin).length();
+
+  // shallow clone (keep big arrays by reference)
+  return {
+    ...voxelGrid,
+    bbox: outBox,
+    unit: { x: voxelGrid.unit.x * ex, y: voxelGrid.unit.y * ey, z: voxelGrid.unit.z * ez }
+  };
 }

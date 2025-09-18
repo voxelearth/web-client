@@ -107,6 +107,20 @@
       border: 2px solid rgba(0,0,0,.35);
       box-shadow: 0 0 0 1px rgba(255,255,255,.18);
     }
+    /* Options in dropdown */
+    option {
+      background: #15181c;
+      color: white;
+      padding: 8px 12px;
+      font-size: 14px;
+      border-radius: 8px;
+      outline: none;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      -moz-appearance: none;
+      box-shadow: 0 0 0 1px rgba(255,255,255,.18);
+    }
     
     /* Leaflet map in glass panels */
     #single-scene-panel .leaflet-container {
@@ -487,6 +501,20 @@
               </label>
             </div>
             <!-- Radius (meters) -->
+            <!-- Single Scene: Minecraft textures toggle -->
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-sm text-white/80">Minecraft textures</span>
+              <label class="inline-flex items-center cursor-pointer">
+                <div class="relative">
+                  <input id="single-scene-toggle-mc" type="checkbox" class="sr-only peer">
+                  <div class="w-9 h-5 bg-white/10 peer-checked:bg-green-500/80 rounded-full relative transition"></div>
+                  <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-4"></div>
+                </div>
+              </label>
+            </div>
+            <div class="text-xs opacity-60 -mt-1 mb-2">Toggle MC atlas (keeps voxel colors off).</div>
+
+            <!-- Radius (meters) -->
             <div class="mb-3">
               <label for="single-scene-radius" class="block text-sm font-medium text-white/80 mb-1">Radius</label>
               <input id="single-scene-radius" type="range" min="100" max="3000" step="50" value="500" class="w-full slider slider-lg">
@@ -548,6 +576,26 @@
           </div>
         </div>
 
+
+        <!-- Single Scene Export (Minecraft) -->
+        <div id="single-scene-export-row" class="mt-2">
+          <label class="block text-sm font-medium text-white/80 mb-1">Minecraft export</label>
+          <div class="flex items-center gap-2">
+            <select id="single-scene-export-format" class="bg-white/10 rounded-lg px-2 py-1 text-xs outline-none">
+              <option value="nbt">Structure (.nbt)</option>
+              <option value="schem">WorldEdit v2 (.schem)</option>
+              <option value="schematic">MCEdit legacy (.schematic)</option>
+              <option value="mcfunction">mcfunction (vanilla)</option>
+            </select>
+            <button id="single-scene-export-btn"
+                    class="bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-1.5 px-3 rounded-lg transition-colors text-xs">
+              Export
+            </button>
+          </div>
+          <div class="text-[11px] opacity-60 mt-1">
+            <b>.nbt</b> = structure block format (Java). <b>.schem</b> = WorldEdit v2. <b>.schematic</b> = legacy MCEdit. <b>.mcfunction</b> places blocks at ~x ~y ~z.
+          </div>
+        </div>
 
         <!-- Global Export GLB Button -->
         <div id="global-export-controls" class="mt-4">
