@@ -2,6 +2,10 @@
 // Drop‑in upgrade: shared atlas + OKLab + color cache (no 960px assumptions)
 
 import * as THREE from 'three';
+// Browser-safe NBT shim (pure JS). Provides write()/writeUncompressed().
+import * as _nbt from './nbt.js';
+const NBT = (_nbt?.write || _nbt?.writeUncompressed) ? _nbt : (_nbt?.default || _nbt);
+// Removed: minecraft-data and prismarine-schematic (now writing .schem via direct NBT)
 
 /*
 Globals:
@@ -470,7 +474,7 @@ function makeAtlasBasicMaterial(sharedAtlas) {
         vRect     = atlasRect;
   // pass per-face base (same for the whole triangle)
   vTileBase = tileBase;
-        vWorldPos = (modelMatrix * vec4(position,1.0)).xyz;`);
+  vWorldPos = (modelMatrix * vec4(position,1.0)).xyz;`);
 
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <uv_pars_fragment>', `
@@ -521,6 +525,11 @@ function makeAtlasBasicMaterial(sharedAtlas) {
     if (mat.userData.__gridMin) shader.uniforms.uGridMin.value.copy(mat.userData.__gridMin);
     if (typeof mat.userData.__voxelSize === 'number') shader.uniforms.uVoxelSize.value = mat.userData.__voxelSize;
   };
+  // Crisp defaults for pixel-art
+  mat.toneMapped = false;
+  mat.transparent = false;
+  mat.depthTest = true;
+  mat.depthWrite = true;
   return mat;
 }
 
@@ -575,10 +584,6 @@ export function setMinecraftPerBlockTiling(on){ MC_TILING_PER_BLOCK = !!on; }
 export function getMinecraftPerBlockTiling(){ return MC_TILING_PER_BLOCK; }
 
 function bakeAtlasUVsOnGeometry(geom, voxelGrid, blockIdxGrid, pickBlockForTriangle) {
-  // Convert to non-indexed so each triangle has unique vertices for per-triangle attributes
-  if (geom.getIndex && geom.getIndex()) {
-    geom = geom.toNonIndexed();
-  }
   const pos = geom.getAttribute('position');
   if (!pos) return;
   let uv = geom.getAttribute('uv');
@@ -725,19 +730,21 @@ export async function applyAtlasToExistingVoxelMesh(voxelMesh, voxelGrid) {
   await initBlockData();
   if (!kdTree || !BLOCKS.length || !voxelMesh) return;
   const blockIdxGrid = (voxelGrid && voxelGrid.gridSize) ? computeBlockIndexGrid(voxelGrid) : null;
+  // Compute world-space grid uniforms from the parent container (tilesContainer)
+  const parentWorld = (voxelMesh.parent && voxelMesh.parent.matrixWorld)
+    ? voxelMesh.parent.matrixWorld
+    : new THREE.Matrix4(); // identity fallback
+  const gridMinWorld = voxelGrid?.bbox?.min?.clone?.().applyMatrix4(parentWorld) ?? new THREE.Vector3();
+  const worldOrigin  = new THREE.Vector3().applyMatrix4(parentWorld);
+  const worldX       = new THREE.Vector3(1,0,0).applyMatrix4(parentWorld).sub(worldOrigin).length();
+  const voxelSizeWorld = (voxelGrid?.unit?.x ?? 1) * (worldX || 1);
+
   const atlas = await getSharedAtlasTexture();
-  const mcMat = makeAtlasBasicMaterial(atlas);
-  // Provide grid uniforms for world-position tiling
-  if (voxelGrid && voxelGrid.bbox && voxelGrid.unit) {
-    const min = voxelGrid.bbox.min; // THREE.Vector3
-    mcMat.userData.__gridMin = new THREE.Vector3(min.x, min.y, min.z);
-    mcMat.userData.__voxelSize = voxelGrid.unit.x; // assume cubic voxels
-    const sh = mcMat.userData?._shader;
-    if (sh) {
-      sh.uniforms.uGridMin.value.set(min.x, min.y, min.z);
-      sh.uniforms.uVoxelSize.value = voxelGrid.unit.x;
-    }
-  }
+  if ('colorSpace' in atlas) atlas.colorSpace = THREE.SRGBColorSpace;
+  atlas.needsUpdate = true;
+  const baseMat = makeAtlasBasicMaterial(atlas);
+  baseMat.userData.__gridMin   = gridMinWorld;
+  baseMat.userData.__voxelSize = voxelSizeWorld; // assume cubic voxels
   const allowApply = !!(voxelMesh.userData && voxelMesh.userData.__mcAllowApply);
   voxelMesh.traverse(n => {
     if (!n.isMesh || !n.geometry) return;
@@ -753,8 +760,18 @@ export async function applyAtlasToExistingVoxelMesh(voxelMesh, voxelGrid) {
     const picker = blockIdxGrid ? null : makeColorFallbackPicker('srgb');
     bakeAtlasUVsOnGeometry(n.geometry, voxelGrid || null, blockIdxGrid, picker);
     if (allowApply) {
+      // Clone per-geometry so attributes are bound at compile time
+      const mcMat = baseMat.clone();
+      mcMat.onBeforeCompile = baseMat.onBeforeCompile;
+  mcMat.userData = { ...baseMat.userData };
+  // Keep OES_standard_derivatives on clones across Three versions
+  mcMat.extensions = { derivatives: true };
+  // Ensure the shared atlas is bound and uploaded in this renderer context
+  mcMat.map = atlas;
+  if (mcMat.map) mcMat.map.needsUpdate = true;
       n.material = mcMat;
       n.userData.mcMat = mcMat; // allow toggling back without re-bake
+      n.material.needsUpdate = true;
     }
     n.frustumCulled = false;
   });
@@ -772,4 +789,240 @@ export function restoreVoxelOriginalMaterial(voxelMesh) {
       n.material = n.userData.origMat;
     }
   });
+}
+
+// ── EXPORT HELPERS ─────────────────────────────────────────────
+// Build a compact block grid (palette + indexed 3D array) from a voxelGrid.
+// Uses the same KD mapping as MC material assignment to ensure WYSIWYG.
+export function buildBlockGrid(voxelGrid) {
+  if (!voxelGrid) throw new Error('buildBlockGrid: voxelGrid required');
+  const idxGrid = computeBlockIndexGrid(voxelGrid); // Int32Array of BLOCK indices
+  const { x: SX, y: SY, z: SZ } = voxelGrid.gridSize;
+  const palette = [];
+  const remap   = new Map(); // BLOCK index -> palette idx
+  const data    = new Int32Array(idxGrid.length);
+
+  for (let i = 0; i < idxGrid.length; i++) {
+    const bIdx = idxGrid[i];
+    if (bIdx < 0 || !BLOCKS[bIdx]) { data[i] = -1; continue; }
+    let p = remap.get(bIdx);
+    if (p === undefined) { p = palette.length; palette.push(BLOCKS[bIdx].name); remap.set(bIdx, p); }
+    data[i] = p;
+  }
+  return { size: { x: SX, y: SY, z: SZ }, data, palette };
+}
+
+// vanilla-friendly: one /setblock per filled cell
+export function generateMcfunction(grid, origin = { x: 0, y: 0, z: 0 }) {
+  if (!grid) throw new Error('generateMcfunction: grid required');
+  const { size: { x: SX, y: SY, z: SZ }, data, palette } = grid;
+  const lines = [];
+  const at = (x, y, z) => x + SX * (y + SY * z);
+  for (let z = 0; z < SZ; z++) {
+    for (let y = 0; y < SY; y++) {
+      for (let x = 0; x < SX; x++) {
+        const p = data[at(x, y, z)];
+        if (p >= 0) {
+          const name = `minecraft:${palette[p]}`;
+          lines.push(`setblock ~${origin.x + x} ~${origin.y + y} ~${origin.z + z} ${name}`);
+        }
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+// palette+indices JSON (simple, easy to convert to .schem/.schematic with external tools)
+export function generatePaletteJSON(grid) {
+  if (!grid) throw new Error('generatePaletteJSON: grid required');
+  const { size, palette, data } = grid;
+  // Compact: RLE rows to keep files small
+  const rows = [];
+  const SX = size.x, SY = size.y, SZ = size.z;
+  const at = (x, y, z) => x + SX * (y + SY * z);
+  for (let z = 0; z < SZ; z++) {
+    for (let y = 0; y < SY; y++) {
+      let runVal = null, runLen = 0, row = [];
+      for (let x = 0; x < SX; x++) {
+        const v = data[at(x, y, z)];
+        if (runVal === v) runLen++;
+        else {
+          if (runVal !== null) row.push([runVal, runLen]);
+          runVal = v; runLen = 1;
+        }
+      }
+      if (runVal !== null) row.push([runVal, runLen]);
+      rows.push({ z, y, row });
+    }
+  }
+  return JSON.stringify({ size, palette, rle: rows }, null, 2);
+}
+
+// ── REAL EXPORTERS: Structure .nbt, Sponge .schem, Legacy .schematic ─────────
+
+// NBT write compatibility: prefer gzipped writer; fallback to writeUncompressed + browser gzip
+async function nbtWriteCompat(payload) {
+  // Prefer gzipped writer if available in shim
+  if (NBT && typeof NBT.write === 'function') {
+    const bytes = await NBT.write(payload);
+    return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  }
+  if (NBT && typeof NBT.writeUncompressed === 'function') {
+    const raw = NBT.writeUncompressed(payload);
+    // Try to gzip using browser API
+    try {
+      if (typeof CompressionStream !== 'undefined') {
+        const cs = new CompressionStream('gzip');
+        const blob = new Blob([raw]);
+        const stream = blob.stream().pipeThrough(cs);
+        const buf = await new Response(stream).arrayBuffer();
+        return new Uint8Array(buf);
+      }
+    } catch {}
+    return raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+  }
+  throw new Error('No NBT write()/writeUncompressed() available');
+}
+
+// Build sparse blocks from the dense grid returned by buildBlockGrid
+function denseToSparse(dense) {
+  const { size, data } = dense;
+  const blocks = [];
+  const SX = size.x|0, SY = size.y|0, SZ = size.z|0;
+  const at = (x, y, z) => x + SX * (y + SY * z);
+  for (let z = 0; z < SZ; z++)
+    for (let y = 0; y < SY; y++)
+      for (let x = 0; x < SX; x++) {
+        const p = data[at(x,y,z)];
+        if (p >= 0) blocks.push({ x, y, z, state: p });
+      }
+  return blocks;
+}
+
+// Java Structure Block .nbt (gzipped NBT)
+export async function writeStructureNBT(denseGrid, { dataVersion = 3955 } = {}) {
+  if (!denseGrid) throw new Error('writeStructureNBT: grid required');
+  const { size, palette } = denseGrid;
+  const blocks = denseToSparse(denseGrid);
+  const fullNames = palette.map(n => `minecraft:${n}`);
+
+  const nbtRoot = {
+    DataVersion: { type: 'int', value: dataVersion },
+    size:       { type: 'int[]', value: [size.x|0, size.y|0, size.z|0] },
+    palette: {
+      type: 'list',
+      value: { type: 'compound', value: fullNames.map(name => ({ Name: { type:'string', value: name } })) }
+    },
+    blocks: {
+      type: 'list',
+      value: { type: 'compound', value: blocks.map(b => ({
+        pos:   { type:'int[]', value:[b.x|0, b.y|0, b.z|0] },
+        state: { type:'int',   value:b.state|0 },
+      })) }
+    },
+    entities: { type: 'list', value: { type: 'end', value: [] } }
+  };
+
+  const payload = { type: 'compound', name: '', value: nbtRoot };
+  return await nbtWriteCompat(payload);
+}
+
+// VarInt encoding for Sponge .schem v2 BlockData
+function writeVarInt(num) {
+  const out = [];
+  let v = num >>> 0;
+  do {
+    let b = v & 0x7F;
+    v >>>= 7;
+    if (v !== 0) b |= 0x80;
+    out.push(b);
+  } while (v !== 0);
+  return out;
+}
+
+// Sponge WorldEdit .schem (v2) – dependency-free writer using prismarine-nbt
+export async function writeSpongeSchem(denseGrid, { dataVersion = 3955 } = {}) {
+  if (!denseGrid) throw new Error('writeSpongeSchem: grid required');
+  const { size, palette, data } = denseGrid;
+  const W = size.x|0, H = size.y|0, L = size.z|0;
+
+  // Build string->int palette; include air
+  const pal = { 'minecraft:air': 0 };
+  let next = 1;
+  for (const name of palette) {
+    const full = `minecraft:${name}`;
+    if (!(full in pal)) pal[full] = next++;
+  }
+  const paletteMax = next;
+
+  // Y-Z-X order VarInt stream
+  const at = (x,y,z) => x + W * (y + H * z);
+  const bytes = [];
+  for (let y=0;y<H;y++) {
+    for (let z=0;z<L;z++) {
+      for (let x=0;x<W;x++) {
+        const p = data[at(x,y,z)];
+        const key = (p >= 0) ? `minecraft:${palette[p]}` : 'minecraft:air';
+        const id = pal[key] ?? 0;
+        bytes.push(...writeVarInt(id));
+      }
+    }
+  }
+  const BlockData = new Uint8Array(bytes);
+
+  const root = {
+    Version:     { type:'int', value: 2 },
+    DataVersion: { type:'int', value: dataVersion },
+    Width:       { type:'short', value: W },
+    Height:      { type:'short', value: H },
+    Length:      { type:'short', value: L },
+    PaletteMax:  { type:'int', value: paletteMax },
+    Palette:     {
+      type:'compound',
+      value: Object.fromEntries(Object.entries(pal).map(([k,v]) => [k, {type:'int', value:v}]))
+    },
+    BlockData:   { type:'byte[]', value: BlockData },
+    Offset:      { type:'int[]', value: [0,0,0] }
+  };
+
+  const payload = { type:'compound', name:'Schematic', value: root };
+  return await nbtWriteCompat(payload);
+}
+
+// Legacy MCEdit .schematic (gzipped NBT)
+export async function writeMCEditSchematic(denseGrid) {
+  if (!denseGrid) throw new Error('writeMCEditSchematic: grid required');
+  const { size } = denseGrid;
+  const W = size.x|0, H = size.y|0, L = size.z|0;
+  const total = W * H * L;
+  const Blocks = new Uint8Array(total).fill(0);
+  const Data   = new Uint8Array(total).fill(0);
+
+  // Y-Z-X order for legacy schematic
+  const toIndex = (x, y, z) => y * L * W + z * W + x;
+  const SX = W, SY = H, SZ = L;
+  const at = (x, y, z) => x + SX * (y + SY * z);
+  for (let z = 0; z < SZ; z++)
+    for (let y = 0; y < SY; y++)
+      for (let x = 0; x < SX; x++) {
+        const p = denseGrid.data[at(x,y,z)];
+        if (p >= 0) {
+          // Use palette index as a placeholder numeric id (0..255)
+          Blocks[toIndex(x,y,z)] = (p & 255);
+          Data[toIndex(x,y,z)] = 0;
+        }
+      }
+
+  const root = {
+    Width:      { type:'short', value: W },
+    Height:     { type:'short', value: H },
+    Length:     { type:'short', value: L },
+    Materials:  { type:'string', value: 'Alpha' },
+    Blocks:     { type:'byte[]', value: Blocks },
+    Data:       { type:'byte[]', value: Data },
+    Entities:   { type:'list', value:{ type:'compound', value: [] } },
+    TileEntities:{ type:'list', value:{ type:'compound', value: [] } }
+  };
+  const payload = { type:'compound', name:'', value: root };
+  return await nbtWriteCompat(payload);
 }
