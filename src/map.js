@@ -22,6 +22,17 @@ import { initBlockData,
 import { SingleSceneViewer          } from './SingleSceneViewer.js';
 import { SingleSceneFetcher         } from './SingleSceneFetcher.js';
 
+// ---- Minecraft atlas bootstrap (idempotent) ----
+let __mcInit;
+async function ensureMinecraftReady() {
+  if (!__mcInit) {
+    __mcInit = (async () => {
+      try { await initBlockData?.(); } catch {}
+    })();
+  }
+  return __mcInit;
+}
+
 /* ─────────────────────────── ChatGPT-style HUD ───────────────────────── */
 class HUD {
   constructor() {
@@ -149,6 +160,47 @@ class HUD {
     this._initializeModelPicker();
   }
 
+  getSingleSceneRes() {
+    const resFine = document.querySelector('#single-scene-res-fine');
+    return parseInt(resFine?.value || '64', 10);
+  }
+
+  /** Mirror global Vox/Minecraft state into Single Scene.
+   *  Rebuild when MC turns on so atlas bakes pre-transform (no grey / misalign). */
+  async syncSingleSceneToGlobalVoxState(forceRebuild = false) {
+    const viewer    = window.singleSceneViewer;
+    const container = viewer?.tilesContainer;
+    if (!viewer || !container) return;
+
+    // Visibility mirrors global vox toggle
+    this._setSingleSceneVisibility(!!state.vox);
+
+    const vox = container.getObjectByName('singleSceneVoxels');
+    const res = this.getSingleSceneRes();
+
+    if (!state.vox) {
+      if (vox) { try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch {}
+      }
+      return;
+    }
+
+    // Voxels ON
+    if (!vox) {
+      await this._rebuildSingleSceneVoxels(res); // pre-bakes MC if state.mc
+      return;
+    }
+
+    if (state.mc) {
+      // Always rebuild when MC is enabled to bake in the correct frame
+      if (forceRebuild || !vox.userData.__mcApplied) {
+        await this._rebuildSingleSceneVoxels(res);
+      }
+    } else {
+      // MC off → restore vertex colors; keep geometry
+      try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch {}
+    }
+  }
+
   _initializeModelPicker() {
     const modelPickerBtn = document.querySelector('#model-picker-btn');
     const modelPickerMenu = document.querySelector('#model-picker-menu');
@@ -229,6 +281,8 @@ class HUD {
       
       // Initialize single scene viewer with empty scene immediately
       this.initializeSingleSceneViewer();
+      // Mirror global Vox/MC state on entry (set initial vis/materials)
+      this.syncSingleSceneToGlobalVoxState(false);
       
     } else {
       // Switch back to voxel earth mode
@@ -278,7 +332,6 @@ class HUD {
   _initializeSingleSceneControls() {
   const fetchBtn = document.querySelector('#single-scene-fetch');
   const downloadBtn = document.querySelector('#single-scene-download');
-  const toggleVoxels = document.querySelector('#single-scene-toggle-voxels');
   const debugTilesToggle = document.querySelector('#single-scene-debug-tiles');
   const radiusSlider = document.querySelector('#single-scene-radius');
   const rotSlider = document.querySelector('#single-scene-rot');
@@ -326,7 +379,7 @@ class HUD {
       const updateRot = () => { rotValue.textContent = `${parseInt(rotSlider.value||0,10)}°`; };
       rotSlider.addEventListener('input', async () => {
         updateRot();
-        if (document.querySelector('#single-scene-toggle-voxels')?.checked) {
+        if (state.vox && window.singleSceneViewer?.tilesContainer) {
           await this._rebuildSingleSceneVoxels(parseInt(resFine?.value||64,10));
         }
       });
@@ -345,8 +398,8 @@ class HUD {
         const res = parseInt(pill.dataset.res);
         if (resFine) resFine.value = res;
         highlightResPill(res);
-        // auto rebuild if single-scene voxels are on
-        if (document.querySelector('#single-scene-toggle-voxels')?.checked) {
+        // auto rebuild if global voxels are on
+        if (state.vox && window.singleSceneViewer?.tilesContainer) {
           await this._rebuildSingleSceneVoxels(res);
         }
       });
@@ -357,7 +410,7 @@ class HUD {
         const res = parseInt(val, 10) || 64;
         const closest = [32,64,128,256].reduce((p,c)=>Math.abs(c-res)<Math.abs(p-res)?c:p);
         highlightResPill(closest);
-        if (document.querySelector('#single-scene-toggle-voxels')?.checked) {
+        if (state.vox && window.singleSceneViewer?.tilesContainer) {
           await this._rebuildSingleSceneVoxels(res);
         }
       }, 200);
@@ -368,8 +421,7 @@ class HUD {
     // Initialize with medium resolution
     highlightResPill(64);
 
-  // Default voxels ON for Single Scene
-  if (toggleVoxels) toggleVoxels.checked = true;
+  // No local vox toggle; Single Scene mirrors global state
 
     // Fetch tiles button
     if (fetchBtn) {
@@ -432,17 +484,13 @@ class HUD {
             await window.singleSceneViewer.loadGLTFTiles(urls, this._logSingleScene.bind(this));
           }
 
+          // Mirror global Vox/MC state into Single Scene and pre-bake if needed
+          await this.syncSingleSceneToGlobalVoxState(true);
+
           // Show tile controls and enable voxels toggle
           document.querySelector('#single-scene-tile-controls')?.classList.remove('hidden');
           document.querySelector('#single-scene-tile-count').textContent = urls.length;
 
-          if (toggleVoxels) {
-            toggleVoxels.disabled = false;
-            if (toggleVoxels.checked) {
-              const res = parseInt(resFine?.value || 64, 10);
-              await this._rebuildSingleSceneVoxels(res);
-            }
-          }
           // Apply debug state to viewer if present
           if (debugTilesToggle && window.singleSceneViewer?.setDebugTiles) {
             window.singleSceneViewer.setDebugTiles(!!debugTilesToggle.checked);
@@ -480,36 +528,7 @@ class HUD {
       });
     }
 
-    // Voxelize button
-    // Remove the separate voxelize button and use the toggle as the only control
-    if (toggleVoxels) {
-      toggleVoxels.addEventListener('change', async () => {
-        const viewer = window.singleSceneViewer;
-        const container = viewer?.tilesContainer;
-        if (!viewer || !container) {
-          this._logSingleScene('❌ Error: No tiles loaded to voxelize');
-          toggleVoxels.checked = false;
-          return;
-        }
-
-        const wantOn = toggleVoxels.checked;
-        const res = parseInt(resFine?.value || 64, 10);
-
-        if (wantOn) {
-          const vox = container.getObjectByName('singleSceneVoxels');
-          const currRes = vox?.userData?.resolution;
-          if (!vox || currRes !== res) {
-            await this._rebuildSingleSceneVoxels(res);
-          } else {
-            this._setSingleSceneVisibility(true);
-            this._logSingleScene('✅ Voxels shown.');
-          }
-        } else {
-          this._setSingleSceneVisibility(false);
-          this._logSingleScene('✅ Original tiles shown.');
-        }
-      });
-    }
+    // No local voxelize toggle; rebuilding is driven by global state + controls
 
     // Download button (Single Scene panel)
     if (downloadBtn) {
@@ -540,60 +559,7 @@ class HUD {
       });
     }
 
-  // ── Single Scene: Minecraft textures toggle
-  let toggleSCMC = document.querySelector('#single-scene-toggle-mc');
-  if (!toggleSCMC) {
-    // Inject a neat little switch next to "Show voxels"
-    const panel = document.querySelector('#single-scene-panel') || document.body;
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:.5rem;margin:.25rem 0;';
-    row.innerHTML = `
-      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;">
-        <input id="single-scene-toggle-mc" type="checkbox" />
-        <span>Minecraft textures</span>
-      </label>
-    `;
-    panel.appendChild(row);
-    toggleSCMC = row.querySelector('#single-scene-toggle-mc');
-  }
-  toggleSCMC.checked = !!(window.state && window.state.mc);
-
-  // apply/remove MC material for the current Single Scene voxel mesh
-  const applySingleSceneMC = async (on) => {
-    const viewer = window.singleSceneViewer;
-    const container = viewer?.tilesContainer;
-    if (!viewer || !container) return;
-    const vox = container.getObjectByName('singleSceneVoxels');
-  const vgrid = viewer.voxelizer?._voxelGridRebased;
-    if (!vox) return;
-
-    window.state = window.state || {};
-    window.state.mc = !!on;
-
-    if (on) {
-      if (!vgrid) { console.warn('No voxel grid for Single Scene; cannot apply MC'); return; }
-      vox.userData.__mcAllowApply = true;
-      try { await applyAtlasToExistingVoxelMesh(vox, vgrid); vox.userData.__mcApplied = true; }
-      catch(e){ console.warn('MC apply failed', e); }
-    } else {
-      // restore vertex-color material (no atlas)
-      try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch {}
-    }
-  };
-
-  toggleSCMC.addEventListener('change', async () => {
-    await applySingleSceneMC(toggleSCMC.checked);
-  });
-
-  // If "Show voxels" toggles off, also turn off MC (to avoid grey surprises)
-  if (toggleVoxels) {
-    toggleVoxels.addEventListener('change', async (e) => {
-      if (!e.target.checked && toggleSCMC) {
-        toggleSCMC.checked = false;
-        await applySingleSceneMC(false);
-      }
-    });
-  }
+    // Single-Scene now mirrors global MC/vox; remove local MC toggle and handlers
 
   // ── Export row (format select + button)
   let exportRow = document.querySelector('#single-scene-export-row');
@@ -833,6 +799,26 @@ class HUD {
     }
 
     const voxelMesh = vox.voxelMesh;
+    const rawGrid   = vox._voxelGrid; // original grid in the mesh’s creation frame
+
+    // Preserve original vertex-color material BEFORE any MC swap
+    voxelMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
+
+    // If MC is on, bake atlas NOW while the mesh & grid still share a frame
+    const wantMC = !!(typeof state === 'object' ? state.mc : (window.state && window.state.mc));
+    if (wantMC && rawGrid) {
+      try {
+        await ensureMinecraftReady();
+        voxelMesh.userData.__mcAllowApply = true;
+        await applyAtlasToExistingVoxelMesh(voxelMesh, rawGrid);
+        voxelMesh.userData.__mcApplied = true;
+      } catch (e) {
+        console.warn('MC apply (pre-transform) failed:', e);
+      }
+    } else {
+      // keep vertex-color material
+      voxelMesh.traverse(n => { if (n.isMesh) n.material = n.userData.origMat; });
+    }
 
     // Prepare counter-rotation so only sampling orientation changes
     const containerBox = new THREE.Box3().setFromObject(container);
@@ -875,40 +861,17 @@ class HUD {
 
     // Save a voxelGrid that matches the transformed geometry
     try {
-      const rawGrid = vox._voxelGrid;
       const rebasedGrid = rawGrid ? rebaseVoxelGrid(rawGrid, Mreb) : null;
       viewer.voxelizer._voxelGridRebased = rebasedGrid;
     } catch (e) {
       console.warn('Failed to compute rebased voxelGrid:', e);
-      viewer.voxelizer._voxelGridRebased = vox._voxelGrid || null;
+      viewer.voxelizer._voxelGridRebased = rawGrid || null;
     }
 
-    // Preserve original materials so we can keep vertex-color rendering unless MC is enabled
-    voxelMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
+    // Materials already set earlier; no additional MC swap here
 
-    // Single Scene: only apply MC when MC mode is on (mirror main viewer behavior)
-    const wantMC = !!(typeof state === 'object' ? state.mc : (window.state && window.state.mc));
-  if (wantMC && viewer.voxelizer?._voxelGridRebased) {
-      try {
-        voxelMesh.userData.__mcAllowApply = true;
-    await applyAtlasToExistingVoxelMesh(voxelMesh, viewer.voxelizer._voxelGridRebased);
-        voxelMesh.userData.__mcApplied = true;
-      } catch (e) {
-        console.warn('MC apply (single-scene) failed:', e);
-      }
-    } else {
-      // Ensure we keep the original vertex-color material
-      voxelMesh.traverse(n => {
-        if (n.isMesh) {
-          if (!n.userData.origMat) n.userData.origMat = n.material; // preserve
-          n.material = n.userData.origMat;
-        }
-      });
-    }
-
-    // Respect current toggle
-    const on = document.querySelector('#single-scene-toggle-voxels')?.checked;
-    this._setSingleSceneVisibility(!!on);
+  // Respect global voxel visibility
+  this._setSingleSceneVisibility(!!state.vox);
 
     this._logSingleScene(`✅ Voxels ready (${vox.voxelCount ?? '—'}) @ ${resolution}`);
   }
@@ -1056,14 +1019,16 @@ class HUD {
           state.debugImagery = false;
           if (this.toggleDebugImagery) this.toggleDebugImagery.checked = false;
         }
-        updateVis();
+        updateVis();                          // main viewer
+        this.syncSingleSceneToGlobalVoxState(true);  // Single Scene mirrors global
       });
     }
 
     if (this.toggleMC) {
       this.toggleMC.addEventListener('change', e => {
         state.mc = e.target.checked;
-        updateVis();
+        updateVis();                          // main viewer
+        this.syncSingleSceneToGlobalVoxState(true);  // rebuild to pre-bake MC
       });
     }
 
@@ -1743,7 +1708,7 @@ function ensureTiles(root,key){
   if (tiles) return;
   tiles=new TilesRenderer(root);
   tiles.registerPlugin(new TileCompressionPlugin());
-  tiles.registerPlugin(new TilesFadePlugin());
+  // tiles.registerPlugin(new TilesFadePlugin());
   tiles.registerPlugin(new GLTFExtensionsPlugin({
     dracoLoader:new DRACOLoader()
       .setDecoderPath('https://unpkg.com/three@0.160/examples/jsm/libs/draco/gltf/')
