@@ -18,7 +18,7 @@ let kdTree = null;
 
 // Bias towards brighter/darker blocks during matching (OKLab L adjustment)
 // Recommended external usage range: -0.20 .. +0.20
-let MC_BRIGHTNESS_BIAS = 0.1; // Slightly brighter than normal! Helps the MC bias towards dark blocks
+let MC_BRIGHTNESS_BIAS = 0; // Slightly brighter than normal! Helps the MC bias towards dark blocks
 export function setMinecraftBrightnessBias(bias){
   MC_BRIGHTNESS_BIAS = Math.max(-0.5, Math.min(0.5, +bias || 0));
   console.log('[MC] brightness bias set to', MC_BRIGHTNESS_BIAS);
@@ -74,7 +74,8 @@ function atlasWindowFor(info, atlasW, atlasH, cellsPerRow) {
 // Compute normalized offset/repeat for `KHR_texture_transform`
 function uvTransformFromWindow(win, atlasW, atlasH) {
   const offsetX = win.sx / atlasW;
-  const offsetY = win.sy / atlasH;              // we set flipY=false, so top-left origin
+  // flipY=false means WebGL uses bottom-left UV origin; convert top-origin window y to bottom-origin UV
+  const offsetY = (atlasH - (win.sy + win.sh)) / atlasH;
   const repeatX = win.sw / atlasW;
   const repeatY = win.sh / atlasH;
   return { offsetX, offsetY, repeatX, repeatY };
@@ -85,7 +86,9 @@ function meanColorFromAtlasRegion(atlasImg, win) {
   const canvas = document.createElement('canvas');
   canvas.width = win.sw; canvas.height = win.sh;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(atlasImg, win.sx, win.sy, win.sw, win.sh, 0, 0, win.sw, win.sh);
+  // Read using bottom-left origin to match shader sampling (flip Y window)
+  const syBL = atlasImg.height - (win.sy + win.sh);
+  ctx.drawImage(atlasImg, win.sx, syBL, win.sw, win.sh, 0, 0, win.sw, win.sh);
   const data = ctx.getImageData(0, 0, win.sw, win.sh).data;
   let R = 0, G = 0, B = 0, Aw = 0;
   for (let i = 0; i < data.length; i += 4) {
@@ -109,6 +112,19 @@ function toLinear(c) {
 function rgbToOKLab(r, g, b) {
   // linearize first
   const rl = toLinear(r), gl = toLinear(g), bl = toLinear(b);
+  const l = 0.4122214708*rl + 0.5363325363*gl + 0.0514459929*bl;
+  const m = 0.2119034982*rl + 0.6806995451*gl + 0.1073969566*bl;
+  const s = 0.0883024619*rl + 0.2817188376*gl + 0.6299787005*bl;
+  const l_ = Math.cbrt(l), m_ = Math.cbrt(m), s_ = Math.cbrt(s);
+  return {
+    L: 0.2104542553*l_ + 0.7936177850*m_ - 0.0040720468*s_,
+    a: 1.9779984951*l_ - 2.4285922050*m_ + 0.4505937099*s_,
+    b: 0.0259040371*l_ + 0.7827717662*m_ - 0.8086757660*s_
+  };
+}
+
+// OKLab for inputs that are ALREADY linear RGB (0..1)
+function rgbLinearToOKLab(rl, gl, bl) {
   const l = 0.4122214708*rl + 0.5363325363*gl + 0.0514459929*bl;
   const m = 0.2119034982*rl + 0.6806995451*gl + 0.1073969566*bl;
   const s = 0.0883024619*rl + 0.2817188376*gl + 0.6299787005*bl;
@@ -315,13 +331,14 @@ export async function assignVoxelsToBlocks(glbDisplay) {
   };
 
   // Iterate voxels (alpha threshold handled during voxelization; we still check)
+  const clamp01 = (x) => Math.max(0, Math.min(1, x));
   for (let i = 0; i < total; i++) {
     const cnt = voxelCounts[i];
     if (!cnt) continue;
 
-    const r = voxelColors[i*4+0] / cnt;
-    const g = voxelColors[i*4+1] / cnt;
-    const b = voxelColors[i*4+2] / cnt;
+    const r = clamp01(voxelColors[i*4+0] / cnt);
+    const g = clamp01(voxelColors[i*4+1] / cnt);
+    const b = clamp01(voxelColors[i*4+2] / cnt);
     const a = voxelColors[i*4+3] / cnt;
     if (a < 0.1) continue;
 
@@ -429,39 +446,80 @@ export { BLOCKS };
 /* In-place atlas application (UV baking, no shader patch)             */
 /* ------------------------------------------------------------------ */
 
-// Basic atlas material (fragment derivative normal) – robust when voxel mesh lacks normals.
+// Basic atlas material that maps per-voxel tiling from world position (stable across greedy faces)
 function makeAtlasBasicMaterial(sharedAtlas) {
   const mat = new THREE.MeshBasicMaterial({ map: sharedAtlas });
   if ('colorSpace' in sharedAtlas) sharedAtlas.colorSpace = THREE.SRGBColorSpace;
   mat.extensions = { derivatives: true };
   mat.onBeforeCompile = (shader) => {
-    shader.uniforms.uGridMin = { value: new THREE.Vector3(0,0,0) };
+    // uniforms for world-pos tiling and atlas size
+    shader.uniforms.uGridMin   = { value: new THREE.Vector3(0,0,0) };
     shader.uniforms.uVoxelSize = { value: 1.0 };
-    shader.uniforms.uAtlasSize = { value: new THREE.Vector2(1,1) }; // (width, height) in texels
+    shader.uniforms.uAtlasSize = { value: new THREE.Vector2(1,1) };
+
     shader.vertexShader = shader.vertexShader
-      .replace(
-        '#include <uv_pars_vertex>',
-        `#include <uv_pars_vertex>\nattribute vec4 uv2;\nvarying vec4 vUvRect;\nvarying vec3 vWorldPos;`
-      )
-      .replace(
-        '#include <uv_vertex>',
-        `#include <uv_vertex>\nvUvRect = uv2;\nvWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;`
-      );
+      .replace('#include <uv_pars_vertex>', `
+        #include <uv_pars_vertex>
+        attribute vec4 atlasRect;       // (offX, offY, repX, repY) - custom attribute (avoid uv2 vec2 collision)
+        attribute vec2 tileBase;        // integer base cell (U0, V0) for the greedy face
+        varying   vec4 vRect;
+  varying   vec2 vTileBase;
+        varying   vec3 vWorldPos;`)
+      .replace('#include <uv_vertex>', `
+        #include <uv_vertex>
+        vRect     = atlasRect;
+  // pass per-face base (same for the whole triangle)
+  vTileBase = tileBase;
+        vWorldPos = (modelMatrix * vec4(position,1.0)).xyz;`);
+
     shader.fragmentShader = shader.fragmentShader
-      .replace(
-        '#include <uv_pars_fragment>',
-        `#include <uv_pars_fragment>\nvarying vec4 vUvRect;\nvarying vec3 vWorldPos;\nuniform vec3  uGridMin;\nuniform float uVoxelSize;\nuniform vec2 uAtlasSize;`
-      )
-      .replace(
-        '#include <map_fragment>',
-        `#ifdef USE_MAP\n  vec3 nrm = normalize(cross(dFdx(vWorldPos), dFdy(vWorldPos)));\n  vec3 an  = abs(nrm);\n  int axis = 0; if (an.y > an.x && an.y >= an.z) axis = 1; else if (an.z > an.x && an.z >= an.y) axis = 2;\n  vec3 vox = (vWorldPos - uGridMin) / uVoxelSize;\n  vec2 tileUV;\n  if (axis == 0) { tileUV = vec2(vox.z, vox.y); if (nrm.x < 0.0) tileUV.x = 1.0 - tileUV.x; }\n  else if (axis == 1) { tileUV = vec2(vox.x, vox.z); if (nrm.y < 0.0) tileUV.x = 1.0 - tileUV.x; }\n  else { tileUV = vec2(vox.x, vox.y); if (nrm.z < 0.0) tileUV.x = 1.0 - tileUV.x; }\n  // keep inside [0,1) and add a tiny epsilon so fract edge never equals 1.0\n  tileUV = fract(tileUV + 1e-6);\n  // half-texel size in normalized UV space\n  vec2 texel = 1.0 / uAtlasSize;\n  // shrink sub-rect by one texel and bias to pixel centers\n  vec2 atlasUV = vUvRect.xy + (tileUV * (vUvRect.zw - texel) + 0.5 * texel);\n  vec4 texelColor = texture2D(map, atlasUV);\n  diffuseColor *= texelColor;\n#endif`
-      );
+      .replace('#include <uv_pars_fragment>', `
+        #include <uv_pars_fragment>
+        varying vec4 vRect;
+        varying vec3 vWorldPos;
+        varying vec2 vTileBase;
+        uniform vec3  uGridMin;
+        uniform float uVoxelSize;
+        uniform vec2  uAtlasSize;`)
+      .replace('#include <map_fragment>', `
+        #ifdef USE_MAP
+          // Stable face axis via world pos derivatives
+          vec3 nrm = normalize(cross(dFdx(vWorldPos), dFdy(vWorldPos))); 
+          vec3 an  = abs(nrm);
+          int axis = 0;
+          if (an.y > an.x && an.y >= an.z) axis = 1; else if (an.z > an.x && an.z >= an.y) axis = 2;
+
+          // World -> voxel coordinates (1 unit per voxel)
+          vec3 vox = (vWorldPos - uGridMin) / uVoxelSize;
+
+          // Choose plane and flip U for back faces
+          vec2 uvGrid;
+          if (axis == 0) { uvGrid = vec2(vox.z, vox.y); if (nrm.x < 0.0) uvGrid.x = 1.0 - uvGrid.x; }
+          else if (axis == 1){ uvGrid = vec2(vox.x, vox.z); if (nrm.y < 0.0) uvGrid.x = 1.0 - uvGrid.x; }
+          else               { uvGrid = vec2(vox.x, vox.y); if (nrm.z < 0.0) uvGrid.x = 1.0 - uvGrid.x; }
+
+          // Make modulo local to the greedy face using the constant base cell
+          vec2 local  = uvGrid - vTileBase;
+          vec2 fracUV = fract(local + 1e-5); // keep in [0,1)
+          // Tiny clamp to avoid sampling outside due to precision
+          fracUV = clamp(fracUV, vec2(0.0), vec2(1.0 - 1.0/256.0));
+
+          // Sample centers of the 16x16 sub-rect
+          vec2 px = floor(fracUV * 16.0) + 0.5;   // 0.5..15.5
+          vec2 atlasUV = vRect.xy + (px / 16.0) * vRect.zw;
+
+          vec4 texelColor = texture2D(map, atlasUV);
+          diffuseColor *= texelColor;
+        #endif`);
+
+    // expose shader for later uniform updates; set atlas size if known
     mat.userData._shader = shader;
-    // Initialize atlas size if image already loaded
     const img = sharedAtlas.image;
-    if (img && img.width && img.height && shader.uniforms.uAtlasSize) {
-      shader.uniforms.uAtlasSize.value.set(img.width, img.height);
-    }
+    if (img && img.width && img.height) shader.uniforms.uAtlasSize.value.set(img.width, img.height);
+
+    // If caller attached pending grid info before compile, apply it now
+    if (mat.userData.__gridMin) shader.uniforms.uGridMin.value.copy(mat.userData.__gridMin);
+    if (typeof mat.userData.__voxelSize === 'number') shader.uniforms.uVoxelSize.value = mat.userData.__voxelSize;
   };
   return mat;
 }
@@ -480,11 +538,12 @@ function computeBlockIndexGrid(voxelGrid) {
     return R + LOOK.r*(G + LOOK.g*B);
   };
   const findNearest=(r,g,b)=>{ const k=keyFor(r,g,b); const c=cache[k]; if(c>=0) return c; const q=applyBrightnessBias(rgbToOKLab(r,g,b)); const best=nearestNeighbor(kdTree,q.L,q.a,q.b,{d2:Infinity,idx:-1}); cache[k]=best.idx; return best.idx; };
+  const clamp01 = (x) => Math.max(0, Math.min(1, x));
   for (let i=0;i<total;i++) {
     const cnt = voxelCounts[i]; if(!cnt) continue;
-    const r = voxelColors[i*4+0]/cnt;
-    const g = voxelColors[i*4+1]/cnt;
-    const b = voxelColors[i*4+2]/cnt;
+    const r = clamp01(voxelColors[i*4+0]/cnt);
+    const g = clamp01(voxelColors[i*4+1]/cnt);
+    const b = clamp01(voxelColors[i*4+2]/cnt);
     out[i] = findNearest(r,g,b);
   }
   return out;
@@ -495,10 +554,13 @@ function makeColorFallbackPicker(querySpace='srgb') {
   return (i0,i1,i2, geom) => {
     const col = geom.getAttribute('color');
     if (!col) return -1;
-    const r=(col.getX(i0)+col.getX(i1)+col.getX(i2))/3;
-    const g=(col.getY(i0)+col.getY(i1)+col.getY(i2))/3;
-    const b=(col.getZ(i0)+col.getZ(i1)+col.getZ(i2))/3;
-  const q = applyBrightnessBias(rgbToOKLab(r,g,b)); // already linearized inside + bias
+    const arr = col.array;
+    const isU8 = (arr instanceof Uint8Array) || (arr instanceof Uint8ClampedArray);
+    const s = isU8 ? 255 : 1;
+    const r=(col.getX(i0)+col.getX(i1)+col.getX(i2))/(3*s);
+    const g=(col.getY(i0)+col.getY(i1)+col.getY(i2))/(3*s);
+    const b=(col.getZ(i0)+col.getZ(i1)+col.getZ(i2))/(3*s);
+    const q = applyBrightnessBias(rgbToOKLab(r,g,b));
     const best = nearestNeighbor(kdTree, q.L, q.a, q.b, { d2:Infinity, idx:-1 });
     return best.idx;
   };
@@ -513,6 +575,10 @@ export function setMinecraftPerBlockTiling(on){ MC_TILING_PER_BLOCK = !!on; }
 export function getMinecraftPerBlockTiling(){ return MC_TILING_PER_BLOCK; }
 
 function bakeAtlasUVsOnGeometry(geom, voxelGrid, blockIdxGrid, pickBlockForTriangle) {
+  // Convert to non-indexed so each triangle has unique vertices for per-triangle attributes
+  if (geom.getIndex && geom.getIndex()) {
+    geom = geom.toNonIndexed();
+  }
   const pos = geom.getAttribute('position');
   if (!pos) return;
   let uv = geom.getAttribute('uv');
@@ -524,14 +590,21 @@ function bakeAtlasUVsOnGeometry(geom, voxelGrid, blockIdxGrid, pickBlockForTrian
   if (!geom.userData.__origUv) geom.userData.__origUv = uv.clone();
 
   const index = geom.getIndex();
-  // Prepare uv2 (offsetX, offsetY, repeatX, repeatY) per vertex for shader tiling.
-  let uv2Attr = geom.getAttribute('uv2');
-  if (!uv2Attr) {
-    uv2Attr = new THREE.BufferAttribute(new Float32Array(pos.count * 4), 4);
-    geom.setAttribute('uv2', uv2Attr);
-  }
   const triCount = index ? (index.count / 3 | 0) : (pos.count / 3 | 0);
   const getIdx = (k) => index ? index.getX(k) : k;
+
+  // Prepare atlasRect (offsetX, offsetY, repeatX, repeatY) per vertex for shader mapping
+  let rectAttr = geom.getAttribute('atlasRect');
+  if (!rectAttr) {
+    rectAttr = new THREE.BufferAttribute(new Float32Array(pos.count * 4), 4);
+    geom.setAttribute('atlasRect', rectAttr);
+  }
+  // Prepare tileBase (U0, V0) per vertex (constant per greedy face)
+  let baseAttr = geom.getAttribute('tileBase');
+  if (!baseAttr) {
+    baseAttr = new THREE.BufferAttribute(new Float32Array(pos.count * 2), 2);
+    geom.setAttribute('tileBase', baseAttr);
+  }
 
   let invUnit, bbMin, gSize;
   if (voxelGrid) {
@@ -555,46 +628,24 @@ function bakeAtlasUVsOnGeometry(geom, voxelGrid, blockIdxGrid, pickBlockForTrian
     return xi + gSize.x*(yi + gSize.y*zi);
   }
 
-  function writeFaceLocalUV(vi, axis, sign, cellI, p, baseCell, span) {
-    // baseCell: {x,y,z} min voxel indices of the greedy face area
-    // span: {x,y,z} number of voxels spanned along each axis (>=1)
-    let fx=0.5, fy=0.5, fz=0.5;
-    if (voxelGrid) {
-      fx = (p.x - bbMin.x) * invUnit.x; // in voxel coords
-      fy = (p.y - bbMin.y) * invUnit.y;
-      fz = (p.z - bbMin.z) * invUnit.z;
-      // Normalize within voxel-space rectangle
-      if (MC_TILING_PER_BLOCK) {
-        // Per-block tiling: subtract base then keep absolute for repeat count later
-        // We'll pass through raw fractional position (no division by span) so each voxel is 1.0 unit
-        fx -= baseCell.x;
-        fy -= baseCell.y;
-        fz -= baseCell.z;
-      } else {
-        // Original: localize to first voxel then divide by span for 0..1 stretch
-        fx = (fx - baseCell.x) / Math.max(1, span.x);
-        fy = (fy - baseCell.y) / Math.max(1, span.y);
-        fz = (fz - baseCell.z) / Math.max(1, span.z);
-      }
+  function writeTileSpaceUV(vi, axis, sign, p, baseCell) {
+    // world -> voxel continuous coords
+    const fx = (p.x - bbMin.x) * invUnit.x;
+    const fy = (p.y - bbMin.y) * invUnit.y;
+    const fz = (p.z - bbMin.z) * invUnit.z;
+
+    let U, V;
+    if (axis === 0) {           // X-face -> (Z,Y)
+      U = (sign > 0) ?  (fz - baseCell.z) : -(fz - baseCell.z);
+      V =                 (fy - baseCell.y);
+    } else if (axis === 1) {    // Y-face -> (X,Z)
+      U =                 (fx - baseCell.x);
+      V = (sign > 0) ?  (fz - baseCell.z) : -(fz - baseCell.z);
+    } else {                    // Z-face -> (X,Y)
+      U = (sign > 0) ?  (fx - baseCell.x) : -(fx - baseCell.x);
+      V =                 (fy - baseCell.y);
     }
-    let U,V;
-    if (axis===0) { // X normal, use z (depth) & y as plane axes
-      U = (sign>0)?fz: (MC_TILING_PER_BLOCK ? (span.z - fz) : 1 - fz);
-      V = fy;
-    } else if (axis===1) { // Y normal
-      U = fx;
-      V = (sign>0)?fz: (MC_TILING_PER_BLOCK ? (span.z - fz) : 1 - fz);
-    } else { // Z normal
-      U = (sign>0)?fx: (MC_TILING_PER_BLOCK ? (span.x - fx) : 1 - fx);
-      V = fy;
-    }
-    // For per-block tiling we keep U,V in voxel units (0..span) so later when applying
-    // atlas window we multiply by repeat (repeatX,repeatY) which is size of single tile; repeating emerges automatically.
-    if (!MC_TILING_PER_BLOCK) {
-      U = THREE.MathUtils.clamp(U,0,1);
-      V = THREE.MathUtils.clamp(V,0,1);
-    }
-    uv.setXY(vi, U, V);
+    uv.setXY(vi, U, V); // tile-space; can exceed 1 across greedy faces
   }
 
   for (let t=0; t<triCount; t++) {
@@ -618,7 +669,7 @@ function bakeAtlasUVsOnGeometry(geom, voxelGrid, blockIdxGrid, pickBlockForTrian
     if (blockIdx < 0) continue;
   const rect = BLOCKS[blockIdx].uv;
 
-    const p0 = new THREE.Vector3().fromBufferAttribute(pos,i0);
+  const p0 = new THREE.Vector3().fromBufferAttribute(pos,i0);
     const p1 = new THREE.Vector3().fromBufferAttribute(pos,i1);
     const p2 = new THREE.Vector3().fromBufferAttribute(pos,i2);
     const cellI = { x:0, y:0, z:0 };
@@ -632,38 +683,42 @@ function bakeAtlasUVsOnGeometry(geom, voxelGrid, blockIdxGrid, pickBlockForTrian
       const minX = Math.min(lx0,lx1,lx2), maxX = Math.max(lx0,lx1,lx2);
       const minY = Math.min(ly0,ly1,ly2), maxY = Math.max(ly0,ly1,ly2);
       const minZ = Math.min(lz0,lz1,lz2), maxZ = Math.max(lz0,lz1,lz2);
-      baseCell.x = Math.floor(minX); baseCell.y = Math.floor(minY); baseCell.z = Math.floor(minZ);
-      span.x = Math.max(1, Math.ceil(maxX) - baseCell.x);
-      span.y = Math.max(1, Math.ceil(maxY) - baseCell.y);
-      span.z = Math.max(1, Math.ceil(maxZ) - baseCell.z);
+  // add tiny epsilon to avoid off-by-one at exact integer boundaries
+  baseCell.x = Math.floor(minX + 1e-6); baseCell.y = Math.floor(minY + 1e-6); baseCell.z = Math.floor(minZ + 1e-6);
+  span.x = Math.max(1, Math.ceil(maxX - 1e-6) - baseCell.x);
+  span.y = Math.max(1, Math.ceil(maxY - 1e-6) - baseCell.y);
+  span.z = Math.max(1, Math.ceil(maxZ - 1e-6) - baseCell.z);
       // legacy single voxel reference (first vertex) for neighbor queries
       cellI.x = Math.floor(lx0); cellI.y = Math.floor(ly0); cellI.z = Math.floor(lz0);
     }
-    writeFaceLocalUV(i0, axis, sign, cellI, p0, baseCell, span);
-    writeFaceLocalUV(i1, axis, sign, cellI, p1, baseCell, span);
-    writeFaceLocalUV(i2, axis, sign, cellI, p2, baseCell, span);
-    // Apply atlas rect transform. If tiling per block, UVs may exceed 1 (span count).
-    let u0=uv.getX(i0), v0_=uv.getY(i0);
-    let u1=uv.getX(i1), v1_=uv.getY(i1);
-    let u2=uv.getX(i2), v2_=uv.getY(i2);
-    if (MC_TILING_PER_BLOCK) {
-      u0 = u0 - Math.floor(u0); v0_ = v0_ - Math.floor(v0_);
-      u1 = u1 - Math.floor(u1); v1_ = v1_ - Math.floor(v1_);
-      u2 = u2 - Math.floor(u2); v2_ = v2_ - Math.floor(v2_);
-    }
-    const repX = rect.repeatX; // sub-rect size
-    const repY = rect.repeatY;
-    uv.setXY(i0, rect.offsetX + u0*repX, rect.offsetY + v0_*repY);
-    uv.setXY(i1, rect.offsetX + u1*repX, rect.offsetY + v1_*repY);
-    uv.setXY(i2, rect.offsetX + u2*repX, rect.offsetY + v2_*repY);
-    // Store rect in uv2 for shader (same for all three verts)
-    uv2Attr.setXYZW(i0, rect.offsetX, rect.offsetY, rect.repeatX, rect.repeatY);
-    uv2Attr.setXYZW(i1, rect.offsetX, rect.offsetY, rect.repeatX, rect.repeatY);
-    uv2Attr.setXYZW(i2, rect.offsetX, rect.offsetY, rect.repeatX, rect.repeatY);
+    // write tile-space UVs
+    writeTileSpaceUV(i0, axis, sign, p0, baseCell);
+    writeTileSpaceUV(i1, axis, sign, p1, baseCell);
+    writeTileSpaceUV(i2, axis, sign, p2, baseCell);
+    // map 3D baseCell to the face's 2D plane to get integer (U0,V0)
+    let baseU = 0.0, baseV = 0.0;
+    if (axis === 0) { baseU = baseCell.z; baseV = baseCell.y; }
+    else if (axis === 1){ baseU = baseCell.x; baseV = baseCell.z; }
+    else               { baseU = baseCell.x; baseV = baseCell.y; }
+
+    // store base per-vertex (same for the triangle)
+    baseAttr.setXY(i0, baseU, baseV);
+    baseAttr.setXY(i1, baseU, baseV);
+    baseAttr.setXY(i2, baseU, baseV);
+
+    // store rect in custom atlasRect attribute for shader mapping
+    rectAttr.setXYZW(i0, rect.offsetX, rect.offsetY, rect.repeatX, rect.repeatY);
+    rectAttr.setXYZW(i1, rect.offsetX, rect.offsetY, rect.repeatX, rect.repeatY);
+    rectAttr.setXYZW(i2, rect.offsetX, rect.offsetY, rect.repeatX, rect.repeatY);
   }
   try { geom.computeBoundingSphere?.(); } catch {}
   geom.attributes.uv.needsUpdate = true;
-  geom.attributes.uv2.needsUpdate = true;
+  if (geom.attributes.atlasRect) geom.attributes.atlasRect.needsUpdate = true;
+  if (geom.attributes.tileBase)  geom.attributes.tileBase.needsUpdate = true;
+  // Remove any stale uv2 attribute to avoid conflicts with Three's built-in uv2 (vec2)
+  if (geom.getAttribute('uv2')) {
+    try { geom.deleteAttribute('uv2'); } catch {}
+  }
 }
 
 export async function applyAtlasToExistingVoxelMesh(voxelMesh, voxelGrid) {
@@ -672,22 +727,34 @@ export async function applyAtlasToExistingVoxelMesh(voxelMesh, voxelGrid) {
   const blockIdxGrid = (voxelGrid && voxelGrid.gridSize) ? computeBlockIndexGrid(voxelGrid) : null;
   const atlas = await getSharedAtlasTexture();
   const mcMat = makeAtlasBasicMaterial(atlas);
+  // Provide grid uniforms for world-position tiling
+  if (voxelGrid && voxelGrid.bbox && voxelGrid.unit) {
+    const min = voxelGrid.bbox.min; // THREE.Vector3
+    mcMat.userData.__gridMin = new THREE.Vector3(min.x, min.y, min.z);
+    mcMat.userData.__voxelSize = voxelGrid.unit.x; // assume cubic voxels
+    const sh = mcMat.userData?._shader;
+    if (sh) {
+      sh.uniforms.uGridMin.value.set(min.x, min.y, min.z);
+      sh.uniforms.uVoxelSize.value = voxelGrid.unit.x;
+    }
+  }
   const allowApply = !!(voxelMesh.userData && voxelMesh.userData.__mcAllowApply);
   voxelMesh.traverse(n => {
     if (!n.isMesh || !n.geometry) return;
+    // Ensure geometry is non-indexed so per-triangle attributes (atlasRect/tileBase)
+    // don't conflict on shared vertices across the two triangles of a greedy quad.
+    if (n.geometry.getIndex()) {
+      const oldGeom = n.geometry;
+      const nonIdx = oldGeom.toNonIndexed();
+      n.geometry = nonIdx;
+      try { oldGeom.dispose(); } catch {}
+    }
     if (!n.userData.origMat) n.userData.origMat = n.material;
     const picker = blockIdxGrid ? null : makeColorFallbackPicker('srgb');
     bakeAtlasUVsOnGeometry(n.geometry, voxelGrid || null, blockIdxGrid, picker);
     if (allowApply) {
       n.material = mcMat;
       n.userData.mcMat = mcMat; // allow toggling back without re-bake
-      // Update shader uniforms per mesh (voxel grid consistent across)
-      if (mcMat.userData && mcMat.userData._shader && voxelGrid) {
-        const sh = mcMat.userData._shader;
-        if (sh.uniforms.uGridMin) sh.uniforms.uGridMin.value.fromArray ? sh.uniforms.uGridMin.value.set(voxelGrid.bbox.min[0]||voxelGrid.bbox.min.x, voxelGrid.bbox.min[1]||voxelGrid.bbox.min.y, voxelGrid.bbox.min[2]||voxelGrid.bbox.min.z) : null;
-        if (sh.uniforms.uVoxelSize) sh.uniforms.uVoxelSize.value = voxelGrid.unit.x || voxelGrid.unit[0] || 1;
-        if (sh.uniforms.uEnablePerBlock) sh.uniforms.uEnablePerBlock.value = MC_TILING_PER_BLOCK ? 1 : 0;
-      }
     }
     n.frustumCulled = false;
   });

@@ -628,6 +628,10 @@ class WorkerVoxelizer {
       // 1) Build a compact grid of palette indices (+1, 0 = empty)
       const grid = new Uint16Array(total); // palette index + 1
       const idx = (x,y,z) => x + NX * (y + NY * z);
+    // Accumulate true per-voxel color averages in sRGB space for KD queries
+    const voxSum = new Float32Array(total * 4); // r,g,b,sumA (we store count in alpha slot)
+    const voxCnt = new Uint32Array(total);
+    const linToSRGB = (x) => (x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1/2.4) - 0.055);
       const v = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
       const uv0 = new THREE.Vector2(), uv1 = new THREE.Vector2(), uv2 = new THREE.Vector2();
       const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(), ep = new THREE.Vector3();
@@ -711,6 +715,17 @@ class WorkerVoxelizer {
         r = Math.min(1, Math.max(0, r));
         g = Math.min(1, Math.max(0, g));
         b = Math.min(1, Math.max(0, b));
+
+    // Record true per-voxel averages in sRGB space (for KD queries later)
+    const rr = Math.min(1, Math.max(0, linToSRGB(r)));
+    const gg = Math.min(1, Math.max(0, linToSRGB(g)));
+    const bb = Math.min(1, Math.max(0, linToSRGB(b)));
+    const ii = idx(gx, gy, gz);
+    voxSum[ii*4 + 0] += rr;
+    voxSum[ii*4 + 1] += gg;
+    voxSum[ii*4 + 2] += bb;
+    voxSum[ii*4 + 3] += 1.0;
+    voxCnt[ii] += 1;
 
         // choose nearest palette entry (use actual palette length!)
         let best = 0, bestD = Infinity;
@@ -929,6 +944,9 @@ class WorkerVoxelizer {
 
       // store palette grid for export (keep reference for voxel grid data)
       this.gridPalette = grid;
+      // expose per-voxel sRGB sums and counts for accurate KD matching
+      this._voxSum = voxSum;
+      this._voxCnt = voxCnt;
       return { geometries };
     }
     
@@ -945,18 +963,17 @@ class WorkerVoxelizer {
         const voxelColors = new Float32Array(tot * 4);
         const voxelCounts = new Uint32Array(tot);
 
-        if (this.gridPalette) {
-            // Export from palette grid (greedy meshing path)
-            const pal = this.palette; // Float32Array [r,g,b]*K
+        if (this._voxSum && this._voxCnt) {
+            // Prefer true per-voxel sRGB averages captured during greedy meshing
             for (let i = 0; i < tot; i++) {
-                const idxp = this.gridPalette[i]; // 0 = empty, >0 = paletteIndex+1
-                if (idxp) {
-                    const c = (idxp - 1) * 3;
-                    voxelCounts[i] = 1;
-                    voxelColors[i*4 + 0] = pal[c + 0];
-                    voxelColors[i*4 + 1] = pal[c + 1];
-                    voxelColors[i*4 + 2] = pal[c + 2];
-                    voxelColors[i*4 + 3] = 1.0;
+                const c = this._voxCnt[i] | 0;
+                voxelCounts[i] = c;
+                if (c) {
+                    const o = i * 4;
+                    voxelColors[o + 0] = this._voxSum[o + 0] / c;
+                    voxelColors[o + 1] = this._voxSum[o + 1] / c;
+                    voxelColors[o + 2] = this._voxSum[o + 2] / c;
+                    voxelColors[o + 3] = 1.0;
                 }
             }
         } else if (this.voxelMap) {
@@ -972,7 +989,7 @@ class WorkerVoxelizer {
                 voxelColors[i * 4 + 3] = 1.0;
             }
         } else {
-            // Nothing to export
+            // Nothing to export (avoid k-means centroid fallback to keep KD accurate)
             return null;
         }
 
