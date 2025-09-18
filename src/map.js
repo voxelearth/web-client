@@ -689,7 +689,7 @@ class HUD {
 
     let vox;
     try {
-  vox = await voxelizeModel({ model: container, renderer: viewer.renderer, scene: viewer.scene, resolution, needGrid: false, preRotateYDeg: rotDeg });
+  vox = await voxelizeModel({ model: container, renderer: viewer.renderer, scene: viewer.scene, resolution, needGrid: true, preRotateYDeg: rotDeg });
     } catch (e) {
       this._logSingleScene(`❌ Voxelization error: ${e?.message || e}`);
       return;
@@ -743,6 +743,16 @@ class HUD {
     container.add(voxelMesh);
     viewer.voxelMeshes = [voxelMesh];
     viewer.voxelizer = vox;
+
+    // Apply Minecraft atlas with consistent KD using the voxel grid (avoid linear vertex-color fallback)
+    if (vox._voxelGrid) {
+      try {
+        voxelMesh.userData.__mcAllowApply = true;
+        await applyAtlasToExistingVoxelMesh(voxelMesh, vox._voxelGrid);
+      } catch (e) {
+        console.warn('MC apply (single-scene) failed:', e);
+      }
+    }
 
     // Respect current toggle
     const on = document.querySelector('#single-scene-toggle-voxels')?.checked;
