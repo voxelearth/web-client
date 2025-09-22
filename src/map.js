@@ -880,7 +880,8 @@ class HUD {
     // Elements
     this.keyInput   = document.querySelector('#google-api-key');
     if (this.keyInput) {
-      this.keyInput.value = localStorage.getItem('token') ?? '';
+      const saved = (localStorage.getItem('token') || '').trim();
+      if (saved) this.keyInput.value = saved; // keep HTML default otherwise
     }
     const saveBtn = document.querySelector('#save-settings');
     if (saveBtn) {
