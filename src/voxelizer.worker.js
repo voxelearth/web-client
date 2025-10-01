@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const ALPHA_CUTOFF = 0.08; // skip texels with alpha below this to avoid black bleed
-const MAX_GRID_VOXELS = 4_000_000; // ~80MB worst case for counts+colors; adjust to taste
+const MAX_GRID_VOXELS = 40_000_000; // ~80MB worst case for counts+colors; adjust to taste
 const ALPHA_EPS = 1e-3; // minimum alpha for palette inclusion
 
 // returns [r,g,b, aWeighted] in *linear*; if no coverage, returns null
