@@ -36,6 +36,8 @@ const loader = new THREE.TextureLoader();
 const USE_OKLAB = true;                 // perceptual color space
 const ALPHA_MEAN_THRESHOLD = 0.10;      // ignore mostly transparent pixels in color avg
 const LOOKUP_QUANT = { r: 32, g: 64, b: 32 }; // 5-6-5 cache
+// If voxel colors are 0..255 instead of 0..1, convert on the fly
+function toUnit(cAvg) { return cAvg > 1.0001 ? (cAvg / 255) : cAvg; }
 // ----------------------------------------------------------------------
 
 // A single atlas texture we clone per material (shared image)
@@ -153,6 +155,9 @@ function makeBlockMaterial(sharedAtlas, uv) {
   tex.offset.set(uv.offsetX, uv.offsetY);
   tex.repeat.set(uv.repeatX, uv.repeatY);
   tex.center.set(0, 0);
+  // Ensure transform matrix is applied immediately on some drivers
+  tex.matrixAutoUpdate = true;
+  if (tex.updateMatrix) tex.updateMatrix();
   // Pixel-art settings (clone doesn’t inherit filters reliably on all drivers)
   tex.magFilter = THREE.NearestFilter;
   tex.minFilter = THREE.NearestFilter;
@@ -294,17 +299,11 @@ export async function assignVoxelsToBlocks(glbDisplay) {
   if (!voxelGrid) { console.error('No voxel grid. Run voxelize() first.'); return; }
 
   const { gridSize, unit, bbox, voxelColors, voxelCounts } = voxelGrid;
-  const total = gridSize.x * gridSize.y * gridSize.z;
+  const SX = gridSize.x|0, SY = gridSize.y|0, SZ = gridSize.z|0;
+  const total = SX * SY * SZ;
 
-  // --- quantized color cache (5-6-5) ---
-  const cache = new Int32Array(LOOKUP_QUANT.r * LOOKUP_QUANT.g * LOOKUP_QUANT.b);
-  cache.fill(-1);
-  const keyFor = (r, g, b) => {
-    const R = Math.min(LOOKUP_QUANT.r - 1, Math.max(0, (r * LOOKUP_QUANT.r) | 0));
-    const G = Math.min(LOOKUP_QUANT.g - 1, Math.max(0, (g * LOOKUP_QUANT.g) | 0));
-    const B = Math.min(LOOKUP_QUANT.b - 1, Math.max(0, (b * LOOKUP_QUANT.b) | 0));
-    return R + LOOKUP_QUANT.r * (G + LOOKUP_QUANT.g * B);
-  };
+  // 1) Build a dense block-index grid once (KD search per voxel, with the fast 5-6-5 cache)
+  const idxGrid = computeBlockIndexGrid(voxelGrid); // Int32Array; -1 = empty/transparent
 
   // Face templates
   const faceDefs = [
@@ -317,87 +316,123 @@ export async function assignVoxelsToBlocks(glbDisplay) {
   ];
   const uvTemplate = [0,0, 1,0, 1,1, 0,1];
 
-  function idxXYZ(x,y,z) { return x + gridSize.x*(y + gridSize.y*z); }
+  const at = (x,y,z) => x + SX*(y + SY*z);
 
-  // Groups per block index
-  const groups = {}; // bIdx -> { positions:[], uvs:[], indices:[], count:0 }
-
-  const findNearestBlockIdx = (r, g, b) => {
-    // cache key in sRGB space (input is already sRGB 0..1)
-    const k = keyFor(r, g, b);
-    const cached = cache[k];
-    if (cached >= 0) return cached;
-
-  const lab = USE_OKLAB ? applyBrightnessBias(rgbToOKLab(r,g,b)) : { L:r, a:g, b };
-  const best = nearestNeighbor(kdTree, lab.L, lab.a, lab.b);
-    cache[k] = best.idx;
-    return best.idx;
-  };
+  // 2) PASS 1 — exact neighbor culling with the index grid; count faces per block
+  const facesPerBlock = new Uint32Array(BLOCKS.length);
 
   // Iterate voxels (alpha threshold handled during voxelization; we still check)
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  for (let i = 0; i < total; i++) {
-    const cnt = voxelCounts[i];
-    if (!cnt) continue;
+  for (let z = 0; z < SZ; z++) {
+    for (let y = 0; y < SY; y++) {
+      for (let x = 0; x < SX; x++) {
+        const i = at(x,y,z);
+        const cnt = voxelCounts[i]; if (!cnt) continue;
+        const aAvg = voxelColors[i*4+3] / cnt; if (aAvg < 0.1) continue; // same viz threshold as before
+        const bIdx = idxGrid[i]; if (bIdx < 0) continue;
 
-    const r = clamp01(voxelColors[i*4+0] / cnt);
-    const g = clamp01(voxelColors[i*4+1] / cnt);
-    const b = clamp01(voxelColors[i*4+2] / cnt);
-    const a = voxelColors[i*4+3] / cnt;
-    if (a < 0.1) continue;
-
-    const bIdx = findNearestBlockIdx(r, g, b);
-    if (bIdx < 0) continue;
-
-    // find voxel xyz
-    const z = Math.floor(i / (gridSize.x * gridSize.y));
-    const rem = i - z * gridSize.x * gridSize.y;
-    const y = Math.floor(rem / gridSize.x);
-    const x = rem - y * gridSize.x;
-
-    const cx = bbox.min.x + (x + 0.5) * unit.x;
-    const cy = bbox.min.y + (y + 0.5) * unit.y;
-    const cz = bbox.min.z + (z + 0.5) * unit.z;
-
-    for (const face of faceDefs) {
-      const nx = x + face.nx, ny = y + face.ny, nz = z + face.nz;
-      if (
-        nx >= 0 && nx < gridSize.x &&
-        ny >= 0 && ny < gridSize.y &&
-        nz >= 0 && nz < gridSize.z
-      ) {
-        const ni = idxXYZ(nx, ny, nz);
-        // neighbor present and matched to same block? cull this face
-        const nCnt = voxelCounts[ni];
-        if (nCnt) {
-          // We don’t know neighbor’s block without re‑query. Use heuristic: if its color is very close to ours,
-          // we’ll likely map to the same block. This avoids a second k‑d lookup per neighbor.
-          const nr = voxelColors[ni*4+0] / nCnt;
-          const ng = voxelColors[ni*4+1] / nCnt;
-          const nb = voxelColors[ni*4+2] / nCnt;
-          const dr = nr - r, dg = ng - g, db = nb - b;
-          if (dr*dr + dg*dg + db*db < 1e-4) continue; // cull
-          // If you want exact culling, do: if (findNearestBlockIdx(nr,ng,nb) === bIdx) continue;
-        }
+        // 6-connected neighbors
+        // +Z
+        if (z+1 >= SZ || idxGrid[at(x,y,z+1)] !== bIdx) facesPerBlock[bIdx]++;
+        // -Z
+        if (z-1 <  0  || idxGrid[at(x,y,z-1)] !== bIdx) facesPerBlock[bIdx]++;
+        // +X
+        if (x+1 >= SX || idxGrid[at(x+1,y,z)] !== bIdx) facesPerBlock[bIdx]++;
+        // -X
+        if (x-1 <  0  || idxGrid[at(x-1,y,z)] !== bIdx) facesPerBlock[bIdx]++;
+        // +Y
+        if (y+1 >= SY || idxGrid[at(x,y+1,z)] !== bIdx) facesPerBlock[bIdx]++;
+        // -Y
+        if (y-1 <  0  || idxGrid[at(x,y-1,z)] !== bIdx) facesPerBlock[bIdx]++;
       }
-
-      const grp = (groups[bIdx] ||= { positions: [], uvs: [], indices: [], count: 0 });
-      for (let v = 0; v < 4; v++) {
-        const vert = face.verts[v];
-        grp.positions.push(
-          cx + vert[0]*unit.x,
-          cy + vert[1]*unit.y,
-          cz + vert[2]*unit.z
-        );
-      }
-      grp.uvs.push(...uvTemplate);
-      grp.indices.push(
-        grp.count, grp.count+1, grp.count+2,
-        grp.count, grp.count+2, grp.count+3
-      );
-      grp.count += 4;
     }
   }
+
+  // 3) Allocate typed arrays exactly once per block
+  const groups = new Array(BLOCKS.length);
+  for (let b = 0; b < BLOCKS.length; b++) {
+    const f = facesPerBlock[b] | 0;
+    if (!f) continue;
+    const vCount = f * 4;
+    const iCount = f * 6;
+    const IndexArray = (vCount > 65535) ? Uint32Array : Uint16Array;
+    groups[b] = {
+      pos: new Float32Array(vCount * 3),
+      uvs: new Float32Array(vCount * 2),
+      idx: new IndexArray(iCount),
+      vptr: 0, uptr: 0, iptr: 0, vtx: 0
+    };
+  }
+
+  // 4) PASS 2 — fill geometry
+  for (let z = 0; z < SZ; z++) {
+    for (let y = 0; y < SY; y++) {
+      for (let x = 0; x < SX; x++) {
+        const i = at(x,y,z);
+        const cnt = voxelCounts[i]; if (!cnt) continue;
+        const aAvg = voxelColors[i*4+3] / cnt; if (aAvg < 0.1) continue;
+        const bIdx = idxGrid[i]; if (bIdx < 0) continue;
+        const grp = groups[bIdx]; if (!grp) continue;
+
+        const cx = bbox.min.x + (x + 0.5) * unit.x;
+        const cy = bbox.min.y + (y + 0.5) * unit.y;
+        const cz = bbox.min.z + (z + 0.5) * unit.z;
+
+        // Emit faces whose neighbor differs (exact culling)
+        // order matches faceDefs above
+        // +Z
+        if (z+1 >= SZ || idxGrid[at(x,y,z+1)] !== bIdx) emitFace(grp, faceDefs[0], cx, cy, cz);
+        // -Z
+        if (z-1 <  0  || idxGrid[at(x,y,z-1)] !== bIdx) emitFace(grp, faceDefs[1], cx, cy, cz);
+        // +X
+        if (x+1 >= SX || idxGrid[at(x+1,y,z)] !== bIdx) emitFace(grp, faceDefs[2], cx, cy, cz);
+        // -X
+        if (x-1 <  0  || idxGrid[at(x-1,y,z)] !== bIdx) emitFace(grp, faceDefs[3], cx, cy, cz);
+        // +Y
+        if (y+1 >= SY || idxGrid[at(x,y+1,z)] !== bIdx) emitFace(grp, faceDefs[4], cx, cy, cz);
+        // -Y
+        if (y-1 <  0  || idxGrid[at(x,y-1,z)] !== bIdx) emitFace(grp, faceDefs[5], cx, cy, cz);
+      }
+    }
+  }
+
+  function emitFace(grp, face, cx, cy, cz){
+    const { pos, uvs, idx } = grp;
+    const vbase = grp.vtx;
+    // positions (4 verts)
+    for (let v = 0; v < 4; v++) {
+      const p = face.verts[v];
+      pos[grp.vptr++] = cx + p[0]*unit.x;
+      pos[grp.vptr++] = cy + p[1]*unit.y;
+      pos[grp.vptr++] = cz + p[2]*unit.z;
+    }
+    // uvs (baked 0..1 face, material does offset/repeat)
+    uvs[grp.uptr++] = 0; uvs[grp.uptr++] = 0;
+    uvs[grp.uptr++] = 1; uvs[grp.uptr++] = 0;
+    uvs[grp.uptr++] = 1; uvs[grp.uptr++] = 1;
+    uvs[grp.uptr++] = 0; uvs[grp.uptr++] = 1;
+    // indices
+    idx[grp.iptr++] = vbase;     idx[grp.iptr++] = vbase+1; idx[grp.iptr++] = vbase+2;
+    idx[grp.iptr++] = vbase;     idx[grp.iptr++] = vbase+2; idx[grp.iptr++] = vbase+3;
+    grp.vtx += 4;
+  }
+
+
+
+
+
+
+
+
+
+
+
+
+          // We don’t know neighbor’s block without re‑query. Use heuristic: if its color is very close to ours,
+          // we’ll likely map to the same block. This avoids a second k‑d lookup per neighbor.
+
+
+
 
   // Build final group with one mesh per block (all sampling the shared atlas)
   const voxelGroup = new THREE.Group();
@@ -405,15 +440,14 @@ export async function assignVoxelsToBlocks(glbDisplay) {
 
   const sharedAtlas = await getSharedAtlasTexture();
 
-  for (const idxStr in groups) {
-    const bIdx = parseInt(idxStr, 10);
-    const { positions, uvs, indices } = groups[idxStr];
-    if (!positions.length) continue;
+  for (let bIdx = 0; bIdx < groups.length; bIdx++) {
+    const g = groups[bIdx];
+    if (!g) continue;
 
     const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geom.setAttribute('uv',       new THREE.Float32BufferAttribute(uvs, 2));
-    geom.setIndex(indices);
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(g.pos, 3));
+    geom.setAttribute('uv',       new THREE.Float32BufferAttribute(g.uvs, 2));
+    geom.setIndex(new THREE.BufferAttribute(g.idx, 1));
     try {
       geom.computeBoundingSphere();
     } catch {}
@@ -550,9 +584,9 @@ function computeBlockIndexGrid(voxelGrid) {
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
   for (let i=0;i<total;i++) {
     const cnt = voxelCounts[i]; if(!cnt) continue;
-    const r = clamp01(voxelColors[i*4+0]/cnt);
-    const g = clamp01(voxelColors[i*4+1]/cnt);
-    const b = clamp01(voxelColors[i*4+2]/cnt);
+    const r = clamp01(toUnit(voxelColors[i*4+0]/cnt));
+    const g = clamp01(toUnit(voxelColors[i*4+1]/cnt));
+    const b = clamp01(toUnit(voxelColors[i*4+2]/cnt));
     out[i] = findNearest(r,g,b);
   }
   return out;
