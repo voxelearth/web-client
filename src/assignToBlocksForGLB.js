@@ -840,6 +840,7 @@ export function restoreVoxelOriginalMaterial(voxelMesh) {
       n.material = n.userData.origMat;
     }
   });
+  voxelMesh.userData.__mcApplied = false;
 }
 
 // ── EXPORT HELPERS ─────────────────────────────────────────────
