@@ -599,6 +599,8 @@ class HUD {
 
     try {
       const mod = await import('./assignToBlocksForGLB.js');
+      await ensureMinecraftReady();          // map.js helper (already in your file)
+      await mod.initBlockData?.();           // extra guard; no-op if already ready
       const dense = mod.buildBlockGrid(vgrid); // palette + dense indices
       const fmt  = exportFmt.value;
   if (fmt === 'mcfunction') {

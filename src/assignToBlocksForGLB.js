@@ -72,7 +72,8 @@ function atlasWindowFor(info, atlasW, atlasH, cellsPerRow) {
   const marginY = (cellH - BLOCK_SIZE) / 2;
 
   const sx = info.atlasColumn * cellW + marginX;
-  const sy = info.atlasRow    * cellH + marginY;
+  // const sy = info.atlasRow    * cellH + marginY;
+const sy = atlasH - (info.atlasRow * cellH + marginY + BLOCK_SIZE);
 
   return { sx, sy, sw: BLOCK_SIZE, sh: BLOCK_SIZE };
 }
@@ -150,7 +151,8 @@ function applyBrightnessBias(lab){
 
 // Build a per-block material that samples the shared atlas at a sub-rect
 function makeBlockMaterial(sharedAtlas, uv) {
-  const tex = sharedAtlas.clone(); // clones sampler/transform, keeps same image
+  const tex = new THREE.Texture();
+  tex.source = sharedAtlas.source;     // 👈 reuse image/source
   tex.needsUpdate = true;
   tex.offset.set(uv.offsetX, uv.offsetY);
   tex.repeat.set(uv.repeatX, uv.repeatY);
@@ -290,12 +292,16 @@ export async function initBlockData() {
  * to the **same** atlas image with offset/repeat (KHR_texture_transform).
  * Includes an O(1) color cache to avoid repeated k-d queries.
  */
-export async function assignVoxelsToBlocks(glbDisplay) {
+export async function assignVoxelsToBlocks(glbDisplay, voxelGridOverride = null) {
   if (!kdTree) {
     await initBlockData();
     if (!kdTree) return;
   }
-  const voxelGrid = glbDisplay._voxelGrid;
+  const voxelGrid =
+    voxelGridOverride ||
+    glbDisplay?._voxelGrid ||
+    glbDisplay?._voxelGridRebased ||
+    null;
   if (!voxelGrid) { console.error('No voxel grid. Run voxelize() first.'); return; }
 
   const { gridSize, unit, bbox, voxelColors, voxelCounts } = voxelGrid;
@@ -478,6 +484,17 @@ export async function assignVoxelsToBlocks(glbDisplay) {
   voxelGrid.assigned = undefined; // not needed anymore
 }
 
+export async function buildExportGroupFromVoxelGrid(voxelGrid) {
+  if (!voxelGrid) throw new Error('buildExportGroupFromVoxelGrid: voxelGrid required');
+  await initBlockData();
+  const root = new THREE.Group();
+  root.name = 'MinecraftExportRoot';
+  const baked = await assignVoxelsToBlocks(root, voxelGrid);
+  const exportGroup = baked || root.getObjectByName('voxelGroup');
+  if (exportGroup && exportGroup.parent) exportGroup.parent.remove(exportGroup);
+  return exportGroup || root;
+}
+
 export { BLOCKS };
 
 /* ------------------------------------------------------------------ */
@@ -584,9 +601,9 @@ function computeBlockIndexGrid(voxelGrid) {
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
   for (let i=0;i<total;i++) {
     const cnt = voxelCounts[i]; if(!cnt) continue;
-    const r = clamp01(toUnit(voxelColors[i*4+0]/cnt));
-    const g = clamp01(toUnit(voxelColors[i*4+1]/cnt));
-    const b = clamp01(toUnit(voxelColors[i*4+2]/cnt));
+    const r = clamp01(toUnit(voxelColors[i*4+0]));
+    const g = clamp01(toUnit(voxelColors[i*4+1]));
+    const b = clamp01(toUnit(voxelColors[i*4+2]));
     out[i] = findNearest(r,g,b);
   }
   return out;
