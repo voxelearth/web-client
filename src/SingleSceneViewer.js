@@ -58,7 +58,7 @@ export class SingleSceneViewer {
 	}
 
 	_makeGLTFLoader(renderer) {
-		const THREE_PATH = `https://unpkg.com/three@0.${THREE.REVISION}.x`;
+		const THREE_PATH = `https://unpkg.com/three@0.160`;
 		const draco = new DRACOLoader().setDecoderPath(`${THREE_PATH}/examples/jsm/libs/draco/gltf/`);
 		const ktx2  = new KTX2Loader().setTranscoderPath(`${THREE_PATH}/examples/jsm/libs/basis/`);
 		ktx2.detectSupport(renderer);
@@ -246,7 +246,7 @@ export class SingleSceneViewer {
 	}
 }
 
-const THREE_PATH = `https://unpkg.com/three@0.${THREE.REVISION}.x`;
+const THREE_PATH = `https://unpkg.com/three@0.160`;
 const DRACO_LOADER = new DRACOLoader().setDecoderPath(`${THREE_PATH}/examples/jsm/libs/draco/gltf/`);
 const gltfLoader = new GLTFLoader();
 gltfLoader.setDRACOLoader(DRACO_LOADER);

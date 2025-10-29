@@ -131,7 +131,7 @@ export class Viewer {
 
 /* ────────────────────────── helpers ──────────────────────────────── */
 
-const THREE_PATH   = `https://unpkg.com/three@0.${THREE.REVISION}.x`;
+const THREE_PATH   = `https://unpkg.com/three@0.160`;
 const DRACO_LOADER = new DRACOLoader().setDecoderPath(`${THREE_PATH}/examples/jsm/libs/draco/gltf/`);
 const gltfLoader   = new GLTFLoader().setDRACOLoader(DRACO_LOADER);
 
