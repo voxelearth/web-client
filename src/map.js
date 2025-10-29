@@ -22,6 +22,57 @@ import { initBlockData,
 import { SingleSceneViewer          } from './SingleSceneViewer.js';
 import { SingleSceneFetcher         } from './SingleSceneFetcher.js';
 
+const SESSION_MAX_AGE_MS = 2.5 * 60 * 60 * 1000;
+let __tilesSessionId = null;
+let __tilesSessionTs = 0;
+
+(function installPhotorealFetchGuard() {
+  if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
+  if (window.fetch.__photorealGuardInstalled) return;
+
+  const realFetch = window.fetch.bind(window);
+
+  const isTiles = (input) => {
+    try {
+      const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+      const url = new URL(raw, window.location.origin);
+      return url.hostname === 'tile.googleapis.com' && url.pathname.startsWith('/v1/3dtiles/');
+    } catch {
+      return false;
+    }
+  };
+
+  const clearRootCache = async () => {
+    try {
+      navigator.serviceWorker?.controller?.postMessage({ type: 'CLEAR_ROOT_CACHE' });
+    } catch {}
+  };
+
+  window.fetch = async (input, opts = {}) => {
+    if (!isTiles(input)) return realFetch(input, opts);
+
+    let response = await realFetch(input, opts);
+    if (response && (response.status === 400 || response.status === 401 || response.status === 403)) {
+      try {
+        const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
+        const url = new URL(raw, window.location.origin);
+        if (url.searchParams.has('session')) {
+          __tilesSessionId = null;
+          __tilesSessionTs = 0;
+          await clearRootCache();
+          url.searchParams.delete('session');
+          url.searchParams.set('_', String(Date.now()));
+          const retryOpts = { ...opts, cache: 'reload' };
+          response = await realFetch(url.toString(), retryOpts);
+        }
+      } catch {}
+    }
+    return response;
+  };
+
+  window.fetch.__photorealGuardInstalled = true;
+})();
+
 // ---- Minecraft atlas bootstrap (idempotent) ----
 let __mcInit;
 async function ensureMinecraftReady() {
@@ -1632,7 +1683,6 @@ if (document.readyState === 'loading') {
 
 /* ───────────────────────────────  Three.js set-up ─────────────────── */
 let scene,camera,controls,renderer,tiles=null;
-let tilesSessionId = null; // session from first root load (reused across requests)
 let isInteracting = false;
 let __desiredView = null; // populated by HUD._goTo
 let freecamUpdateFn = null; // Will be set by camera controls
@@ -1721,12 +1771,26 @@ function ensureTiles(root,key){
   tiles.fetchOptions = { cache: 'force-cache' };
 
   // keep single session id and key everywhere
-  tiles.preprocessURL = u=>{
-    if(u.startsWith('blob:')||u.startsWith('data:')) return u;
-    const url=new URL(u,'https://tile.googleapis.com');
-    if(url.searchParams.has('session')) tilesSessionId=url.searchParams.get('session');
-    if(tilesSessionId && !url.searchParams.has('session')) url.searchParams.set('session',tilesSessionId);
-    if(!url.searchParams.has('key'))     url.searchParams.set('key',key);
+  tiles.preprocessURL = (u) => {
+    if (u.startsWith('blob:') || u.startsWith('data:')) return u;
+    const url = new URL(u, 'https://tile.googleapis.com');
+
+    if (url.searchParams.has('session')) {
+      const s = url.searchParams.get('session');
+      if (s && s !== __tilesSessionId) {
+        __tilesSessionId = s;
+        __tilesSessionTs = Date.now();
+      }
+    }
+
+    if (__tilesSessionId && Date.now() - __tilesSessionTs > SESSION_MAX_AGE_MS) {
+      __tilesSessionId = null;
+    }
+
+    if (__tilesSessionId && !url.searchParams.has('session')) {
+      url.searchParams.set('session', __tilesSessionId);
+    }
+    if (!url.searchParams.has('key')) url.searchParams.set('key', key);
     return url.toString();
   };
 

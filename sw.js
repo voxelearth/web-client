@@ -14,6 +14,12 @@ self.addEventListener('activate', (evt) => {
   evt.waitUntil(self.clients.claim());
 });
 
+self.addEventListener('message', (evt) => {
+  if (evt.data && evt.data.type === 'CLEAR_ROOT_CACHE') {
+    evt.waitUntil(caches.delete(ROOT_CACHE));
+  }
+});
+
 function isRootJsonRequest(req) {
   try {
     const url = new URL(req.url);
@@ -51,8 +57,8 @@ self.addEventListener('fetch', (evt) => {
         cache.put(META_REQ, new Response(String(Date.now())));
         return network;
       }
-      // If non-OK but we have cache, use it
-      if (cached) return cached;
+      // If non-OK and cache is fresh, use it; stale cache should not mask errors
+      if (cached && age < TTL_MS) return cached;
       return network; // propagate error response
     } catch (e) {
       if (cached) return cached; // stale fallback offline
