@@ -29,6 +29,80 @@ export function setMinecraftBrightnessBias(bias){
 }
 export function getMinecraftBrightnessBias(){ return MC_BRIGHTNESS_BIAS; }
 
+// -- Block filtering (deny/allow with wildcard or RegExp) --------------------
+let BLOCK_ALLOW = null; // null means allow everything unless denied
+let BLOCK_DENY = [
+  /(^|_)ore$/,                         // all ores (incl. deepslate/nether)
+  /^ancient_debris$/,                  // netherite "ore"
+  /^raw_(iron|gold|copper)_block$/,    // raw-ore blocks
+  /^bookshelf$/,                       // library books
+  /coral/,                             // any coral block/fan
+  /^birch_log$/,                       // birch wood
+  /^glowstone$/,                       // glowstone
+  /_glazed_terracotta$/,               // all glazed terracotta (incl. the blue/orange ones)
+
+  // transparent & see-through
+  /(^|_)glass(_|$)/,          // glass, stained_glass, tinted_glass
+  /(^|_)pane(_|$)/,           // glass panes
+  /(^|_)ice$/,                // ice
+  /^frosted_ice$/,            // frosted ice
+  /^barrier$/,                // barrier (invisible)
+  /^slime_block$/,            // slime (translucent)
+  /^honey_block$/,            // honey (translucent)
+  /^sea_lantern$/,            // bright translucent
+  /^beacon$/,                 // glassy top
+  /^amethyst_cluster$/,       // semi-transparent shards
+  /^water$/, /^lava$/         // fluids
+];
+
+function _asRegex(rule) {
+  if (rule instanceof RegExp) return rule;
+  const s = String(rule).trim();
+  const esc = s.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp('^' + esc + '$');
+}
+
+function _matches(name, list) {
+  return list?.some(rx => _asRegex(rx).test(name));
+}
+
+export function setBlockDenylist(list = []) {
+  BLOCK_DENY = list.map(_asRegex);
+  BLOCKS = [];
+  kdTree = null;
+}
+
+export function setBlockAllowlist(list = null) {
+  BLOCK_ALLOW = list ? list.map(_asRegex) : null;
+  BLOCKS = [];
+  kdTree = null;
+}
+
+export function usePrettyPalette(on = true) {
+  if (!on) return setBlockAllowlist(null);
+  setBlockAllowlist([
+    '*_concrete',
+    '*_terracotta',
+    '*_wool',
+    '*_stained_glass',
+    '*_stained_glass_pane',
+    'quartz_block',
+    'smooth_quartz',
+    'stone',
+    'smooth_stone',
+    'stone_bricks',
+    'chiseled_stone_bricks',
+    'polished_*',
+    'sandstone',
+    'cut_sandstone',
+    'smooth_sandstone',
+    'red_sandstone',
+    'cut_red_sandstone',
+    'smooth_red_sandstone',
+    '*_planks'
+  ]);
+}
+
 const BLOCK_SIZE = 16; // 16×16 textures
 const loader = new THREE.TextureLoader();
 
@@ -194,6 +268,8 @@ async function loadAllBlocks() {
     const atlasKey = `minecraft:block/${raw}`;
     const info = VANILLA_ATLAS.textures?.[atlasKey];
     if (!info) return; // skip things not mapped in the atlas
+    if (BLOCK_ALLOW && BLOCK_ALLOW.length && !_matches(raw, BLOCK_ALLOW)) return;
+    if (BLOCK_DENY && BLOCK_DENY.length && _matches(raw, BLOCK_DENY)) return;
 
     // Compute 16×16 window and uv transform
     const win = atlasWindowFor(info, atlasW, atlasH, cells);
