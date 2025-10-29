@@ -951,6 +951,52 @@ function denseToSparse(dense) {
   return blocks;
 }
 
+const LEGACY_ID_META_FALLBACK = [1, 0];
+let legacyIdMapCache = null;
+let legacyIdMapPromise = null;
+
+function normalizeLegacyName(name) {
+  if (!name) return '';
+  return name.startsWith('minecraft:') ? name.slice('minecraft:'.length) : name;
+}
+
+async function ensureLegacyIdMap() {
+  if (legacyIdMapCache) return legacyIdMapCache;
+  if (!legacyIdMapPromise) {
+    legacyIdMapPromise = (async () => {
+      try {
+        const resp = await fetch('/legacy.json');
+        if (!resp?.ok) throw new Error(`HTTP ${resp?.status} ${resp?.statusText}`);
+        const legacyJson = await resp.json();
+        const map = {};
+        const entries = Object.entries(legacyJson?.blocks || {});
+        for (const [key, value] of entries) {
+          if (typeof value !== 'string') continue;
+          const [idPart, metaPart] = key.split(':');
+          const id = Number.parseInt(idPart, 10);
+          const meta = Number.parseInt(metaPart, 10);
+          if (!Number.isInteger(id) || !Number.isInteger(meta)) continue;
+          const name = normalizeLegacyName(value);
+          if (!name || map[name]) continue; // prefer first mapping encountered
+          map[name] = [id & 255, meta & 15];
+        }
+        legacyIdMapCache = map;
+      } catch (err) {
+        console.warn('writeMCEditSchematic: failed to load legacy palette', err);
+        legacyIdMapCache = {};
+      }
+      return legacyIdMapCache;
+    })();
+  }
+  await legacyIdMapPromise;
+  return legacyIdMapCache;
+}
+
+function legacyIdMetaForName(name, map) {
+  const normalized = normalizeLegacyName(name);
+  return (map && map[normalized]) || LEGACY_ID_META_FALLBACK;
+}
+
 // Java Structure Block .nbt (gzipped NBT)
 export async function writeStructureNBT(denseGrid, { dataVersion = 3955 } = {}) {
   if (!denseGrid) throw new Error('writeStructureNBT: grid required');
@@ -960,7 +1006,7 @@ export async function writeStructureNBT(denseGrid, { dataVersion = 3955 } = {}) 
 
   const nbtRoot = {
     DataVersion: { type: 'int', value: dataVersion },
-    size:       { type: 'int[]', value: [size.x|0, size.y|0, size.z|0] },
+    size:       { type: 'list', value: { type: 'int', value: [size.x|0, size.y|0, size.z|0] } },
     palette: {
       type: 'list',
       value: { type: 'compound', value: fullNames.map(name => ({ Name: { type:'string', value: name } })) }
@@ -968,11 +1014,11 @@ export async function writeStructureNBT(denseGrid, { dataVersion = 3955 } = {}) 
     blocks: {
       type: 'list',
       value: { type: 'compound', value: blocks.map(b => ({
-        pos:   { type:'int[]', value:[b.x|0, b.y|0, b.z|0] },
+        pos:   { type:'list', value: { type:'int', value:[b.x|0, b.y|0, b.z|0] } },
         state: { type:'int',   value:b.state|0 },
       })) }
     },
-    entities: { type: 'list', value: { type: 'end', value: [] } }
+    entities: { type: 'list', value: { type: 'compound', value: [] } }
   };
 
   const payload = { type: 'compound', name: '', value: nbtRoot };
@@ -1044,7 +1090,8 @@ export async function writeSpongeSchem(denseGrid, { dataVersion = 3955 } = {}) {
 // Legacy MCEdit .schematic (gzipped NBT)
 export async function writeMCEditSchematic(denseGrid) {
   if (!denseGrid) throw new Error('writeMCEditSchematic: grid required');
-  const { size } = denseGrid;
+  const { size, palette, data } = denseGrid;
+  const legacyMap = await ensureLegacyIdMap();
   const W = size.x|0, H = size.y|0, L = size.z|0;
   const total = W * H * L;
   const Blocks = new Uint8Array(total).fill(0);
@@ -1057,11 +1104,12 @@ export async function writeMCEditSchematic(denseGrid) {
   for (let z = 0; z < SZ; z++)
     for (let y = 0; y < SY; y++)
       for (let x = 0; x < SX; x++) {
-        const p = denseGrid.data[at(x,y,z)];
+        const p = data[at(x,y,z)];
         if (p >= 0) {
-          // Use palette index as a placeholder numeric id (0..255)
-          Blocks[toIndex(x,y,z)] = (p & 255);
-          Data[toIndex(x,y,z)] = 0;
+          const name = palette[p];
+          const [id, meta] = legacyIdMetaForName(name, legacyMap);
+          Blocks[toIndex(x,y,z)] = id & 255;
+          Data[toIndex(x,y,z)]   = meta & 15;
         }
       }
 
@@ -1070,8 +1118,8 @@ export async function writeMCEditSchematic(denseGrid) {
     Height:     { type:'short', value: H },
     Length:     { type:'short', value: L },
     Materials:  { type:'string', value: 'Alpha' },
-    Blocks:     { type:'byte[]', value: Blocks },
-    Data:       { type:'byte[]', value: Data },
+    Blocks:     { type:'byteArray', value: Blocks },
+    Data:       { type:'byteArray', value: Data },
     Entities:   { type:'list', value:{ type:'compound', value: [] } },
     TileEntities:{ type:'list', value:{ type:'compound', value: [] } }
   };

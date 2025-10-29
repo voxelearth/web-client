@@ -2,7 +2,7 @@
 // API: export function writeUncompressed(payload)
 // payload shape:
 // { type: 'compound', name: string, value: { key: {type:.., value:..}, ... } }
-// Supported types: 'end','byte','short','int','string','byte[]','int[]','list','compound'
+// Supported types: 'end','byte','short','int','string','byte[]','int[]','byteArray','intArray','list','compound'
 
 const TAG = {
   End: 0,
@@ -106,8 +106,10 @@ function typeNameToId(name){
     case 'short': return TAG.Short;
     case 'int': return TAG.Int;
     case 'string': return TAG.String;
-    case 'byte[]': return TAG.Byte_Array;
-    case 'int[]': return TAG.Int_Array;
+  case 'byte[]':
+  case 'byteArray': return TAG.Byte_Array;
+  case 'int[]':
+  case 'intArray': return TAG.Int_Array;
     case 'list': return TAG.List;
     case 'compound': return TAG.Compound;
     default: throw new Error(`Unsupported NBT type name '${name}'`);
