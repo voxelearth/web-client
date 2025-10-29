@@ -165,10 +165,24 @@ export class SingleSceneViewer {
 		controls.update();
 	}
 
-	generateCombineGltf() {
-		exportGLTF(this.scene, {
-			maxTextureSize: 4096
-		});
+	async generateCombineGltf({ preferMinecraft = true } = {}) {
+		const exporterOpts = { binary: true, maxTextureSize: 4096 };
+		if (preferMinecraft && this.voxelizer) {
+			const grid = this.voxelizer._voxelGridRebased || this.voxelizer._voxelGrid;
+			if (grid) {
+				try {
+					const { buildExportGroupFromVoxelGrid } = await import('./assignToBlocksForGLB.js');
+					const exportGroup = await buildExportGroupFromVoxelGrid(grid);
+					if (exportGroup) {
+						exportGLTF(exportGroup, exporterOpts);
+						return;
+					}
+				} catch (err) {
+					console.warn('Falling back to scene export after Minecraft bake error.', err);
+				}
+			}
+		}
+		exportGLTF(this.scene, exporterOpts);
 	}
 
 	destroy() {
