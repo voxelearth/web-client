@@ -166,8 +166,10 @@ export class SingleSceneViewer {
 	}
 
 	async generateCombineGltf({ preferMinecraft = true } = {}) {
-		const exporterOpts = { binary: true, maxTextureSize: 4096 };
-		if (preferMinecraft && this.voxelizer) {
+		const exporterOpts = { binary: true, maxTextureSize: 4096, onlyVisible: true };
+		const mcApplied = !!(this.voxelMeshes && this.voxelMeshes.some(m => m?.userData?.__mcApplied));
+		const useMinecraft = preferMinecraft && mcApplied;
+		if (useMinecraft && this.voxelizer) {
 			const grid = this.voxelizer._voxelGridRebased || this.voxelizer._voxelGrid;
 			if (grid) {
 				try {
