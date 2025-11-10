@@ -21,6 +21,7 @@
 
   <style>
     html,body { margin:0; height:100%; overflow:hidden; background:#0b0e11; touch-action: none; }
+    body.policy-locked { overflow:hidden; }
     canvas { position:fixed; inset:0 }
     .glass { backdrop-filter: blur(14px); background: rgba(21,24,28,.55) }
     .elev { box-shadow: 0 10px 30px rgba(0,0,0,.28), 0 1px 0 rgba(255,255,255,.04) }
@@ -51,6 +52,24 @@
     .single-scene-res-pill.active {
       background: white;
       color: #0b0e11;
+    }
+
+    /* Single Scene panel scrollbar */
+    #single-scene-panel .single-scene-scroll {
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,.4) rgba(255,255,255,.08);
+    }
+    #single-scene-panel .single-scene-scroll::-webkit-scrollbar {
+      width: 8px;
+    }
+    #single-scene-panel .single-scene-scroll::-webkit-scrollbar-track {
+      background: rgba(255,255,255,.08);
+      border-radius: 999px;
+    }
+    #single-scene-panel .single-scene-scroll::-webkit-scrollbar-thumb {
+      background: linear-gradient(180deg, rgba(255,255,255,.65), rgba(255,255,255,.35));
+      border-radius: 999px;
+      border: 1px solid rgba(11,14,17,.65);
     }
     
     /* Line clamp utility */
@@ -457,7 +476,7 @@
 
   <!-- Single Scene Panel (floating window) -->
   <div id="single-scene-panel" class="hidden fixed left-4 top-20 w-72 z-40 pointer-events-auto">
-    <div class="glass elev rounded-2xl p-4 space-y-4 max-h-[calc(100vh-6rem)] overflow-y-auto">
+    <div class="glass elev rounded-2xl p-4 space-y-4 max-h-[calc(100vh-6rem)] overflow-y-auto single-scene-scroll">
       <div class="mb-4">
         <h2 class="text-sm font-semibold text-white mb-1">Single Scene Export</h2>
         <p class="text-xs text-white/60">Load and voxelize a specific area</p>
@@ -560,18 +579,39 @@
         </div>
 
 
+        <!-- Single Scene export compliance -->
+        <div id="single-scene-compliance" class="mt-4 bg-white/5 border border-white/10 rounded-2xl p-3 space-y-2 text-xs text-white/70">
+          <p class="text-[11px] uppercase tracking-wide text-white/60">Before exporting</p>
+          <label class="flex items-start gap-3">
+            <input id="single-scene-confirm-no-photoreal" data-single-scene-compliance type="checkbox"
+                   class="mt-0.5 h-4 w-4 rounded border border-white/30 bg-transparent accent-white/80">
+            <span>I confirm the current scene contains no Google Photorealistic 3D Tiles or derivatives.</span>
+          </label>
+          <label class="flex items-start gap-3">
+            <input id="single-scene-confirm-rights" data-single-scene-compliance type="checkbox"
+                   class="mt-0.5 h-4 w-4 rounded border border-white/30 bg-transparent accent-white/80">
+            <span>I have the necessary rights to export, process, or redistribute every asset in this scene.</span>
+          </label>
+          <p class="text-[11px] text-amber-200/80 flex items-center gap-2">
+            <span class="material-symbols-rounded text-base">info</span>
+            Exports unlock once both confirmations are checked.
+          </p>
+        </div>
+
         <!-- Single Scene Export (Minecraft) -->
         <div id="single-scene-export-row" class="mt-2">
           <label class="block text-sm font-medium text-white/80 mb-1">Minecraft export</label>
           <div class="flex items-center gap-2">
-            <select id="single-scene-export-format" class="bg-white/10 rounded-lg px-2 py-1 text-xs outline-none">
+            <select id="single-scene-export-format" class="flex-1 min-w-0 bg-white/10 rounded-lg px-2 py-1 text-xs outline-none">
               <option value="nbt">Structure (.nbt)</option>
               <option value="schem">WorldEdit v2 (.schem)</option>
               <option value="schematic">MCEdit legacy (.schematic)</option>
               <option value="mcfunction">mcfunction (vanilla)</option>
             </select>
             <button id="single-scene-export-btn"
-                    class="bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-1.5 px-3 rounded-lg transition-colors text-xs">
+                    class="flex-none bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-1.5 px-3 rounded-lg transition-colors text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+                    disabled
+            >
               Export
             </button>
           </div>
@@ -582,13 +622,59 @@
 
         <!-- Global Export GLB Button -->
         <div id="global-export-controls" class="mt-4">
-          <button id="export-glb-btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm">
+          <button id="export-glb-btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm disabled:opacity-40 disabled:cursor-not-allowed" disabled>
             Export Current Scene as GLB
           </button>
         </div>
         
         <!-- Log -->
         <div id="single-scene-log" class="bg-black/20 rounded-lg p-2 text-xs text-white/80 font-mono max-h-20 overflow-y-auto hidden"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Google Maps / Photorealistic Tiles usage notice -->
+  <div id="policy-banner" class="hidden fixed inset-0 z-[60] flex items-center justify-center px-4 bg-black/80">
+    <div class="glass elev max-w-2xl w-full rounded-2xl p-6 md:p-8 text-white space-y-4">
+      <div>
+        <p class="text-xs uppercase tracking-widest text-white/60 mb-2">Voxel Earth Educational Preview</p>
+        <h2 class="text-xl font-semibold">Read & accept the Google Maps Platform usage notice</h2>
+      </div>
+      <div class="space-y-3 text-sm text-white/80 leading-relaxed">
+        <p>
+          This demo loads Google Photorealistic 3D Tiles through the Google Maps Platform Tiles API. It is provided for
+          educational and experimental use only (“Voxel Earth”) to illustrate how to request tiles, apply a screen-space
+          rendering pipeline, and study voxelization workflows.
+        </p>
+        <ul class="list-disc pl-5 space-y-2">
+          <li>
+            By continuing you confirm you have reviewed and will comply with the
+            <a href="https://cloud.google.com/maps-platform/terms" target="_blank" rel="noreferrer noopener" class="text-blue-300 underline">
+              Google Maps Platform Terms of Service
+            </a>
+            and the
+            <a href="https://developers.google.com/maps/documentation/tile/policies" target="_blank" rel="noreferrer noopener" class="text-blue-300 underline">
+              Map Tiles & Photorealistic 3D Tiles policies
+            </a>.
+          </li>
+          <li>You are fully responsible for how you access, render, process, or share Google data, and offline caching, redistribution, or creating derivative content outside Google&rsquo;s allowed use cases is strictly prohibited.</li>
+        </ul>
+        <p class="text-xs text-white/70">
+          If you cannot accept these requirements you may close this tab or review the official policies linked above for more details.
+        </p>
+      </div>
+      <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between pt-2 text-sm">
+        <button id="policy-accept" class="flex-1 bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2.5 rounded-lg transition-colors">
+          I understand & agree
+        </button>
+        <a id="policy-review"
+           href="https://developers.google.com/maps/documentation/tile/policies"
+           target="_blank"
+           rel="noreferrer noopener"
+           class="flex items-center justify-center gap-2 text-white/70 hover:text-white transition-colors">
+          <span class="material-symbols-rounded text-base">gavel</span>
+          <span>Review Google policies</span>
+        </a>
       </div>
     </div>
   </div>
@@ -600,6 +686,37 @@
   <pre id="fetch-log" class="hidden"></pre>
   <button id="download" class="hidden"></button>
 
+  <script>
+    (function () {
+      const overlay = document.getElementById('policy-banner');
+      if (!overlay) return;
+
+      const STORAGE_KEY = 'voxel-earth-policy-accepted';
+      const body = document.body;
+      const acceptBtn = document.getElementById('policy-accept');
+
+      const hideOverlay = () => {
+        overlay.classList.add('hidden');
+        body.classList.remove('policy-locked');
+      };
+      const showOverlay = () => {
+        overlay.classList.remove('hidden');
+        body.classList.add('policy-locked');
+      };
+
+      if (localStorage.getItem(STORAGE_KEY) === 'yes') {
+        hideOverlay();
+      } else {
+        showOverlay();
+      }
+
+      acceptBtn?.addEventListener('click', () => {
+        localStorage.setItem(STORAGE_KEY, 'yes');
+        hideOverlay();
+      });
+
+    })();
+  </script>
   <script type="module" src="/src/map.js"></script>
   <script>
     // Lightweight SW registrar; ignores errors (e.g., unsupported contexts)
