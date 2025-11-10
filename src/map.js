@@ -595,6 +595,10 @@ class HUD {
     const exportGlbBtn = document.getElementById('export-glb-btn');
     if (exportGlbBtn) {
       exportGlbBtn.addEventListener('click', () => {
+        if (exportGlbBtn.disabled) {
+          this._logSingleScene?.('Confirm the export requirements first.');
+          return;
+        }
         // Prefer Single Scene if active, else main viewer
         if (window.singleSceneViewer && window.singleSceneViewer.scene) {
           window.singleSceneViewer.generateCombineGltf();
@@ -643,7 +647,22 @@ class HUD {
     setTimeout(()=>URL.revokeObjectURL(a.href), 250);
   };
 
+  const complianceChecks = Array.from(document.querySelectorAll('[data-single-scene-compliance]'));
+  const applyComplianceState = () => {
+    const ready = complianceChecks.every(cb => cb.checked);
+    [exportBtn, exportGlbBtn].forEach(btn => {
+      if (!btn) return;
+      btn.disabled = !ready;
+    });
+  };
+  complianceChecks.forEach(cb => cb.addEventListener('change', applyComplianceState));
+  applyComplianceState();
+
   exportBtn.addEventListener('click', async () => {
+    if (exportBtn.disabled) {
+      this._logSingleScene?.('Confirm the export requirements first.');
+      return;
+    }
     const viewer = window.singleSceneViewer;
     const vgrid  = viewer?.voxelizer?._voxelGridRebased || viewer?.voxelizer?._voxelGrid;
     if (!viewer || !vgrid) { this._logSingleScene('❌ No voxel grid to export'); return; }
