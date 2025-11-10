@@ -71,6 +71,22 @@
       border-radius: 999px;
       border: 1px solid rgba(11,14,17,.65);
     }
+
+    /* Policy modal scroll region */
+    #policy-banner .policy-scroll {
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,.45) transparent;
+    }
+    #policy-banner .policy-scroll::-webkit-scrollbar {
+      width: 6px;
+    }
+    #policy-banner .policy-scroll::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    #policy-banner .policy-scroll::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,.45);
+      border-radius: 999px;
+    }
     
     /* Line clamp utility */
     .line-clamp-2 {
@@ -634,16 +650,16 @@
   </div>
 
   <!-- Google Maps / Photorealistic Tiles usage notice -->
-  <div id="policy-banner" class="hidden fixed inset-0 z-[60] flex items-center justify-center px-4 bg-black/80">
-    <div class="glass elev max-w-2xl w-full rounded-2xl p-6 md:p-8 text-white space-y-4">
-      <div>
+  <div id="policy-banner" class="hidden fixed inset-0 z-[60] flex items-start md:items-center justify-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-10 bg-black/80">
+    <div class="glass elev w-full max-w-[min(560px,96vw)] rounded-2xl p-5 sm:p-6 md:p-8 text-white flex flex-col gap-4 max-h-[calc(100vh-3rem)] overflow-hidden">
+      <div class="shrink-0">
         <p class="text-xs uppercase tracking-widest text-white/60 mb-2">Voxel Earth Educational Preview</p>
-        <h2 class="text-xl font-semibold">Read & accept the Google Maps Platform usage notice</h2>
+        <h2 class="text-lg sm:text-xl font-semibold leading-snug">Read & accept the Google Maps Platform usage notice</h2>
       </div>
-      <div class="space-y-3 text-sm text-white/80 leading-relaxed">
+      <div class="policy-scroll flex-1 min-h-0 space-y-3 text-sm text-white/80 leading-relaxed overflow-y-auto pr-1 sm:pr-2">
         <p>
           This demo loads Google Photorealistic 3D Tiles through the Google Maps Platform Tiles API. It is provided for
-          educational and experimental use only (“Voxel Earth”) to illustrate how to request tiles, apply a screen-space
+          educational and experimental use only ("Voxel Earth") to illustrate how to request tiles, apply a screen-space
           rendering pipeline, and study voxelization workflows.
         </p>
         <ul class="list-disc pl-5 space-y-2">
@@ -663,7 +679,7 @@
           If you cannot accept these requirements you may close this tab or review the official policies linked above for more details.
         </p>
       </div>
-      <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between pt-2 text-sm">
+      <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between text-sm shrink-0">
         <button id="policy-accept" class="flex-1 bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2.5 rounded-lg transition-colors">
           I understand & agree
         </button>
