@@ -1,0 +1,24 @@
+{
+  "name": "World-Voxel Map",
+  "short_name": "Voxel Map",
+  "description": "Voxel Earth educational preview for photorealistic Google 3D Tiles and voxel workflows.",
+  "icons": [
+    {
+      "src": "/icons/android-chrome-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/android-chrome-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "theme_color": "#0b0e11",
+  "background_color": "#0b0e11",
+  "display": "standalone",
+  "start_url": "/",
+  "scope": "/"
+}
