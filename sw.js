@@ -2,8 +2,8 @@
 // Scope: only caches successful GETs for root.json, relies on server Cache-Control / ETag.
 // It will serve from cache when fresh; otherwise falls back to network and updates cache.
 
-const ROOT_CACHE = 'root-json-v2';
-const TTL_MS = 2.75 * 60 * 60 * 1000; // ~2h45m within 3h session window
+const ROOT_CACHE = 'root-json-v3';
+const TTL_MS = 2.25 * 60 * 60 * 1000; // keep root < Google session window (2h15m)
 const META_REQ = new Request('/__g3dt_root_ts'); // local timestamp marker
 
 self.addEventListener('install', () => {
@@ -34,35 +34,54 @@ self.addEventListener('fetch', (evt) => {
   const { request } = evt;
   if (request.method !== 'GET' || !isRootJsonRequest(request)) return; // ignore others
 
-  evt.respondWith((async () => {
-    const cache = await caches.open(ROOT_CACHE);
-    const cached = await cache.match(request);
-    const tsRes  = await cache.match(META_REQ);
-    let ts = 0;
-    if (tsRes) {
-      try { ts = parseInt(await tsRes.text(), 10) || 0; } catch {}
-    }
-    const age = Date.now() - ts;
+  evt.respondWith(handleRootJson(request));
+});
 
-    // Serve cached immediately if within TTL
-    if (cached && age < TTL_MS) {
+async function handleRootJson(request) {
+  const cache = await caches.open(ROOT_CACHE);
+  const [cached, tsRes] = await Promise.all([
+    cache.match(request),
+    cache.match(META_REQ),
+  ]);
+
+  let ts = 0;
+  if (tsRes) {
+    try { ts = parseInt(await tsRes.text(), 10) || 0; } catch {}
+  }
+  const age = Date.now() - ts;
+
+  const cacheControl = request.headers.get('cache-control');
+  const wantsReload =
+    request.cache === 'reload' ||
+    (typeof cacheControl === 'string' && cacheControl.toLowerCase().includes('no-cache'));
+
+  if (cached && age < TTL_MS && !wantsReload) {
+    return cached;
+  }
+
+  try {
+    const network = await fetch(request, {
+      cache: wantsReload ? 'reload' : 'default',
+    });
+
+    if (network.ok) {
+      cache.put(request, network.clone());
+      cache.put(META_REQ, new Response(String(Date.now())));
+      return network;
+    }
+
+    if (network.status === 304 && cached) {
+      cache.put(META_REQ, new Response(String(Date.now())));
       return cached;
     }
 
-    // Otherwise try network; if it fails fallback to stale cache
-    try {
-      const network = await fetch(request, { cache: 'default' });
-      if (network.ok) {
-        cache.put(request, network.clone());
-        cache.put(META_REQ, new Response(String(Date.now())));
-        return network;
-      }
-      // If non-OK and cache is fresh, use it; stale cache should not mask errors
-      if (cached && age < TTL_MS) return cached;
-      return network; // propagate error response
-    } catch (e) {
-      if (cached) return cached; // stale fallback offline
-      throw e;
+    if (cached) {
+      return cached;
     }
-  })());
-});
+
+    return network;
+  } catch (err) {
+    if (cached) return cached;
+    throw err;
+  }
+}

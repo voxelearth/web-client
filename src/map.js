@@ -1806,9 +1806,12 @@ function ensureTiles(root,key){
       __tilesSessionId = null;
     }
 
-    if (__tilesSessionId && !url.searchParams.has('session')) {
+    if (__tilesSessionId) {
       url.searchParams.set('session', __tilesSessionId);
+    } else {
+      url.searchParams.delete('session');
     }
+
     if (!url.searchParams.has('key')) url.searchParams.set('key', key);
     return url.toString();
   };
