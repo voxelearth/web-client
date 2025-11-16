@@ -408,12 +408,46 @@ class HUD {
     document.querySelector('#single-scene-sse-row')?.classList.remove('hidden');
     document.querySelector('#single-scene-debug-row')?.classList.remove('hidden');
     // SSE slider update
-    if (sseSlider && sseValue) {
-      sseSlider.addEventListener('input', () => {
-        sseValue.textContent = sseSlider.value;
+    const bindSliderToNumericInput = (slider, input, opts = {}) => {
+      if (!slider || !input) return;
+      const minVal = Number.isFinite(+opts.min) ? +opts.min : Number.isFinite(+slider.min) ? +slider.min : undefined;
+      const maxVal = Number.isFinite(+opts.max) ? +opts.max : Number.isFinite(+slider.max) ? +slider.max : undefined;
+      const clamp = (raw) => {
+        if (typeof opts.valueClamp === 'function') return opts.valueClamp(raw);
+        let num = parseFloat(raw);
+        if (!Number.isFinite(num)) num = minVal !== undefined ? minVal : 0;
+        if (minVal !== undefined) num = Math.max(minVal, num);
+        if (maxVal !== undefined) num = Math.min(maxVal, num);
+        return num;
+      };
+      const syncFromSlider = () => {
+        if (slider.__suppressInputSync) return;
+        const val = clamp(slider.value);
+        input.value = val;
+      };
+      const syncFromInput = () => {
+        const val = clamp(input.value);
+        input.value = val;
+        const sliderMin = Number.isFinite(+slider.min) ? +slider.min : undefined;
+        const sliderMax = Number.isFinite(+slider.max) ? +slider.max : undefined;
+        let sliderVal = val;
+        if (sliderMin !== undefined) sliderVal = Math.max(sliderMin, sliderVal);
+        if (sliderMax !== undefined) sliderVal = Math.min(sliderMax, sliderVal);
+        slider.__suppressInputSync = true;
+        slider.value = String(sliderVal);
+        slider.dispatchEvent(new Event('input', { bubbles: true }));
+        queueMicrotask(() => { slider.__suppressInputSync = false; });
+      };
+      slider.addEventListener('input', syncFromSlider);
+      input.addEventListener('change', syncFromInput);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          syncFromInput();
+        }
       });
-      sseValue.textContent = sseSlider.value;
-    }
+      syncFromSlider();
+    };
 
     // Slider filled track updater
     const _setSliderFill = (el) => {
@@ -427,6 +461,16 @@ class HUD {
       _setSliderFill(el);
       el.addEventListener('input', () => _setSliderFill(el));
     });
+
+    const clampRadiusValue = (raw) => {
+      const num = parseFloat(raw);
+      if (!Number.isFinite(num)) return 0;
+      return Math.max(0, Math.min(3000, num));
+    };
+
+    bindSliderToNumericInput(sseSlider, sseValue, { min: 2, max: 64 });
+    bindSliderToNumericInput(radiusSlider, radiusValue, { valueClamp: clampRadiusValue });
+    bindSliderToNumericInput(rotSlider, rotValue, { min: 0, max: 360 });
 
     const presetResValues = [32,64,128,256];
     const clampResolution = (val) => {
@@ -461,23 +505,13 @@ class HUD {
     };
     updateResolutionUI(resInput?.value || resFine?.value || 64);
 
-    // Radius slider (meters) default 500
-    if (radiusSlider && radiusValue) {
-      const updateRadius = () => { radiusValue.textContent = `${parseInt(radiusSlider.value||500,10)} m`; };
-      radiusSlider.addEventListener('input', updateRadius);
-      updateRadius();
-    }
-
-    // Rotation (Y) slider
-    if (rotSlider && rotValue) {
-      const updateRot = () => { rotValue.textContent = `${parseInt(rotSlider.value||0,10)}°`; };
+    // Rotation slider updates (number inputs dispatch events through slider binding)
+    if (rotSlider) {
       rotSlider.addEventListener('input', async () => {
-        updateRot();
         if (state.vox && window.singleSceneViewer?.tilesContainer) {
           await this._rebuildSingleSceneVoxels(this.getSingleSceneRes());
         }
       });
-      updateRot();
     }
 
     // Resolution pills
@@ -538,7 +572,7 @@ class HUD {
         const sse = sseInput ? parseInt(sseInput.value) || 20 : 20;
 
   // Radius in meters (controls how large an area to fetch)
-  const radiusM = radiusSlider ? (parseInt(radiusSlider.value,10) || 500) : 500;
+    const radiusM = radiusSlider ? clampRadiusValue(radiusSlider.value) : 500;
 
         if (!apiKey) {
           this._showSingleSceneLog();

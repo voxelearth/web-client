@@ -22,10 +22,53 @@ const TAG = {
 
 const enc = new TextEncoder();
 
-function pushU8(buf, v){ buf.push(v & 0xFF); }
-function pushI16(buf, v){ v = (v<<16>>16); buf.push((v>>>8)&0xFF, v&0xFF); }
-function pushI32(buf, v){ v = v|0; buf.push((v>>>24)&0xFF, (v>>>16)&0xFF, (v>>>8)&0xFF, v&0xFF); }
-function pushStr(buf, s){ const b = enc.encode(s); pushI16(buf, b.length); for (let i=0;i<b.length;i++) buf.push(b[i]); }
+class ByteWriter {
+  constructor(initial = 1 << 16) {
+    this.buffer = new Uint8Array(initial);
+    this.length = 0;
+  }
+  ensure(extra) {
+    const needed = this.length + extra;
+    if (needed <= this.buffer.length) return;
+    let next = this.buffer.length || 1024;
+    while (next < needed) next <<= 1;
+    const nb = new Uint8Array(next);
+    nb.set(this.buffer, 0);
+    this.buffer = nb;
+  }
+  pushByte(v) {
+    this.ensure(1);
+    this.buffer[this.length++] = v & 0xFF;
+  }
+  pushI16(v) {
+    this.ensure(2);
+    v = (v << 16 >> 16);
+    this.buffer[this.length++] = (v >>> 8) & 0xFF;
+    this.buffer[this.length++] = v & 0xFF;
+  }
+  pushI32(v) {
+    this.ensure(4);
+    v = v | 0;
+    this.buffer[this.length++] = (v >>> 24) & 0xFF;
+    this.buffer[this.length++] = (v >>> 16) & 0xFF;
+    this.buffer[this.length++] = (v >>> 8) & 0xFF;
+    this.buffer[this.length++] = v & 0xFF;
+  }
+  pushBytes(arr = []) {
+    if (!arr.length) return;
+    this.ensure(arr.length);
+    this.buffer.set(arr, this.length);
+    this.length += arr.length;
+  }
+  toUint8Array() {
+    return this.buffer.slice(0, this.length);
+  }
+}
+
+function pushU8(buf, v){ buf.pushByte(v); }
+function pushI16(buf, v){ buf.pushI16(v); }
+function pushI32(buf, v){ buf.pushI32(v); }
+function pushStr(buf, s){ const b = enc.encode(s); pushI16(buf, b.length); buf.pushBytes(b); }
 
 function writeTagPayload(buf, type, value){
   switch(type){
@@ -36,7 +79,7 @@ function writeTagPayload(buf, type, value){
     case TAG.Byte_Array: {
       const arr = value instanceof Uint8Array ? value : new Uint8Array(value);
       pushI32(buf, arr.length);
-      for (let i=0;i<arr.length;i++) buf.push(arr[i]);
+      buf.pushBytes(arr);
       break;
     }
     case TAG.Int_Array: {
@@ -118,12 +161,12 @@ function typeNameToId(name){
 
 export function writeUncompressed(payload){
   if (!payload || payload.type !== 'compound') throw new Error('Root must be a compound');
-  const buf = [];
+  const buf = new ByteWriter();
   // Root tag header: type + name + payload
   pushU8(buf, TAG.Compound);
   pushStr(buf, payload.name || '');
   writeTagPayload(buf, TAG.Compound, payload.value || {});
-  return new Uint8Array(buf);
+  return buf.toUint8Array();
 }
 
 export async function write(payload){

@@ -490,16 +490,13 @@ class WorkerVoxelizer {
             materials
         };
     }
-    
+
     #cpuRasterize2D5() {
         const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const total = NX * NY * NZ;
 
         // Outputs (same as before)
-        const voxelTri  = new Int32Array(total);  voxelTri.fill(-1);
-        const voxelDist = new Float32Array(total); voxelDist.fill(Infinity);
-        const filled    = new Uint32Array(total); // worst-case list
-        let   filledCount = 0;
+        const voxelHits = new Map(); // key -> { tri, dist2 }
 
         // Helpers
         const index1D = (x,y,z) => x + NX * (y + NY * z);
@@ -616,10 +613,9 @@ class WorkerVoxelizer {
                             }
 
                             const lin = index1D(x|0, y|0, z|0);
-                            if (d2 < voxelDist[lin]) {
-                                voxelDist[lin] = d2;
-                                if (voxelTri[lin] === -1) filled[filledCount++] = lin;
-                                voxelTri[lin] = t;
+                            const prev = voxelHits.get(lin);
+                            if (!prev || d2 < prev.dist2) {
+                                voxelHits.set(lin, { tri: t, dist2: d2 });
                             }
                         }
 
@@ -635,10 +631,9 @@ class WorkerVoxelizer {
                                 const lin2 = index1D(x2|0, y2|0, z2|0);
                                 const d2b = (W - (w2 + 0.5)); // signed
                                 const d2n = d2b*d2b * distScale;
-                                if (d2n < voxelDist[lin2]) {
-                                    voxelDist[lin2] = d2n;
-                                    if (voxelTri[lin2] === -1) filled[filledCount++] = lin2;
-                                    voxelTri[lin2] = t;
+                                const prev2 = voxelHits.get(lin2);
+                                if (!prev2 || d2n < prev2.dist2) {
+                                    voxelHits.set(lin2, { tri: t, dist2: d2n });
                                 }
                             }
                         }
@@ -663,18 +658,16 @@ class WorkerVoxelizer {
             } // v
         } // tri loop
 
+        const filledCount = voxelHits.size;
         this.filledVoxelCount = filledCount;
-        this._rasterResult = { NX, NY, NZ, voxelTri, voxelDist, filled, filledCount };
+        this._rasterResult = { NX, NY, NZ, voxelHits, filledCount };
     }
 
     #cpuRasterize3DSAT() {
         const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const total = NX * NY * NZ;
         const index1D = (x,y,z) => x + NX * (y + NY * z);
-        const voxelTri  = new Int32Array(total);      voxelTri.fill(-1);
-        const voxelDist = new Float32Array(total);    voxelDist.fill(Infinity);
-        const filled    = new Uint32Array(total);     // worst-case list
-        let filledCount = 0;
+        const voxelHits = new Map();
 
         const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
         const triBox = new THREE.Box3();
@@ -744,17 +737,17 @@ class WorkerVoxelizer {
                         // Record closest triangle
                         const lin = index1D(x,y,z);
                         const dist2 = (n.dot(tv0) * n.dot(tv0)) / nn;
-                        if (dist2 < voxelDist[lin]) {
-                            voxelDist[lin] = dist2;
-                            if (voxelTri[lin] === -1) filled[filledCount++] = lin;
-                            voxelTri[lin] = i;
+                        const prev = voxelHits.get(lin);
+                        if (!prev || dist2 < prev.dist2) {
+                            voxelHits.set(lin, { tri: i, dist2 });
                         }
                     }
                 }
             }
         }
+        const filledCount = voxelHits.size;
         this.filledVoxelCount = filledCount;
-        this._rasterResult = { NX, NY, NZ, voxelTri, voxelDist, filled, filledCount };
+        this._rasterResult = { NX, NY, NZ, voxelHits, filledCount };
     }
 
     // Greedy meshing + chunked output (à la OptiFine/Sodium)
@@ -771,13 +764,20 @@ class WorkerVoxelizer {
       const uv0 = new THREE.Vector2(), uv1 = new THREE.Vector2(), uv2 = new THREE.Vector2();
       const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(), ep = new THREE.Vector3();
 
-      const { voxelTri, filled, filledCount } = this._rasterResult;
-      for (let k = 0; k < filledCount; k++) {
-        const lin = filled[k];
+      const { voxelHits } = this._rasterResult;
+      if (!voxelHits || voxelHits.size === 0) {
+        this._colorStore = colorStore;
+        return { geometries: [] };
+      }
+
+      for (const [linKey, hit] of voxelHits.entries()) {
+        const lin = typeof linKey === 'number' ? linKey : Number(linKey);
+        if (!Number.isFinite(lin)) continue;
         const gx = lin % NX;
         const gy = ((lin / NX) | 0) % NY;
         const gz = (lin / (NX*NY)) | 0;
-        const triId = voxelTri[lin];
+        const triId = hit?.tri;
+        if (triId == null || triId < 0) continue;
 
         // sample color for voxel center using triangle triId
         const i0 = this.indices[triId*3], i1 = this.indices[triId*3+1], i2 = this.indices[triId*3+2];
