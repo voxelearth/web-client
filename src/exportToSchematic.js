@@ -3,8 +3,9 @@ import { Schematic }  from 'prismarine-schematic';
 import mcData         from 'minecraft-data';
 import { saveAs }     from 'file-saver';
 
-export async function exportToSchematic(voxelGrid, BLOCKS, mcVersion = '1.20') {
-  const size = voxelGrid.gridSize;                 // THREE.Vector3 {x,y,z}
+export async function exportToSchematic(denseGrid, mcVersion = '1.20') {
+  if (!denseGrid) throw new Error('exportToSchematic: grid required');
+  const size = denseGrid.size;
   const total = size.x * size.y * size.z;
 
   // Sponge v3 wants blocks ordered Y-Z-X.
@@ -16,25 +17,34 @@ export async function exportToSchematic(voxelGrid, BLOCKS, mcVersion = '1.20') {
   const palette      = [];                   // array of stateIds
   const paletteIndex = new Map();            // blockName → palette slot
   const blocks       = new Uint16Array(total);
+  const normalizeName = (name) => {
+    if (!name) return 'air';
+    return name.startsWith('minecraft:') ? name.slice('minecraft:'.length) : name;
+  };
 
   const airSlot = 0;
   palette.push(idFor('air'));                // palette[0] = air
   paletteIndex.set('air', airSlot);
 
   const addToPalette = name => {
-    if (paletteIndex.has(name)) return paletteIndex.get(name);
-    const idx = palette.push(idFor(name)) - 1;
-    paletteIndex.set(name, idx);
+    const key = normalizeName(name);
+    if (paletteIndex.has(key)) return paletteIndex.get(key);
+    const idx = palette.push(idFor(key)) - 1;
+    paletteIndex.set(key, idx);
     return idx;
   };
 
-  const { assigned } = voxelGrid;            // Int32Array of block indices
+  const paletteNames = denseGrid.palette || [];
+  const data = denseGrid.data;
+  if (!data) throw new Error('exportToSchematic: dense grid missing data');
+
   for (let x = 0; x < size.x; x++)
     for (let y = 0; y < size.y; y++)
       for (let z = 0; z < size.z; z++) {
         const vIdx = x + size.x * (y + size.y * z);
-        const blk  = assigned[vIdx] >= 0 ? BLOCKS[assigned[vIdx]].name : 'air';
-        blocks[toIndex(x, y, z)] = addToPalette(blk);
+        const paletteIdx = data[vIdx];
+        const blkName  = paletteIdx >= 0 ? paletteNames[paletteIdx] : 'air';
+        blocks[toIndex(x, y, z)] = addToPalette(blkName || 'air');
       }
 
   // Assemble and write the schematic

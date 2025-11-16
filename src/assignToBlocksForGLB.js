@@ -110,6 +110,7 @@ const loader = new THREE.TextureLoader();
 const USE_OKLAB = true;                 // perceptual color space
 const ALPHA_MEAN_THRESHOLD = 0.10;      // ignore mostly transparent pixels in color avg
 const LOOKUP_QUANT = { r: 32, g: 64, b: 32 }; // 5-6-5 cache
+const VOX_CHUNK_SIZE = 32;
 // If voxel colors are 0..255 instead of 0..1, convert on the fly
 function toUnit(cAvg) { return cAvg > 1.0001 ? (cAvg / 255) : cAvg; }
 // ----------------------------------------------------------------------
@@ -347,6 +348,225 @@ function buildBlockKDTree() {
   kdTree = buildKDTree(idx, 0);
 }
 
+function iterateVoxelSamples(voxelGrid, fn) {
+  if (!voxelGrid || !voxelGrid.gridSize || typeof fn !== 'function') return;
+  const NX = voxelGrid.gridSize.x | 0;
+  const NY = voxelGrid.gridSize.y | 0;
+  const NZ = voxelGrid.gridSize.z | 0;
+  const total = NX * NY * NZ;
+  const counts = voxelGrid.voxelCounts;
+  const colors = voxelGrid.voxelColors;
+  if (counts && colors) {
+    const len = Math.min(counts.length, total);
+    for (let i = 0; i < len; i++) {
+      const cnt = counts[i];
+      if (!cnt) continue;
+      const base = i * 4;
+      const x = i % NX;
+      const y = ((i / NX) | 0) % NY;
+      const z = (i / (NX * NY)) | 0;
+      fn({
+        x, y, z,
+        linearIndex: i,
+        count: cnt,
+        r: colors[base + 0],
+        g: colors[base + 1],
+        b: colors[base + 2],
+        alpha: colors[base + 3] ?? 1
+      });
+    }
+    return;
+  }
+
+  const chunked = voxelGrid?.chunked;
+  if (!chunked || !Array.isArray(chunked.chunks)) return;
+  const chunkSize = chunked.chunkSize || VOX_CHUNK_SIZE;
+  const layer = chunkSize * chunkSize;
+  for (const chunk of chunked.chunks) {
+    const colorsArr = chunk.colors;
+    const alphasArr = chunk.alphas;
+    const countsArr = chunk.counts;
+    if (!colorsArr || !countsArr) continue;
+    const coord = chunk.coord || [0,0,0];
+    const cx = coord[0] | 0;
+    const cy = coord[1] | 0;
+    const cz = coord[2] | 0;
+    const baseX = cx * chunkSize;
+    const baseY = cy * chunkSize;
+    const baseZ = cz * chunkSize;
+    const len = countsArr.length;
+    for (let i = 0; i < len; i++) {
+      const cnt = countsArr[i];
+      if (!cnt) continue;
+      const lx = i % chunkSize;
+      const ly = ((i / chunkSize) | 0) % chunkSize;
+      const lz = (i / layer) | 0;
+      const x = baseX + lx;
+      const y = baseY + ly;
+      const z = baseZ + lz;
+      if (x < 0 || y < 0 || z < 0 || x >= NX || y >= NY || z >= NZ) continue;
+      const linear = x + NX * (y + NY * z);
+      const base = i * 3;
+      fn({
+        x, y, z,
+        linearIndex: linear,
+        count: cnt,
+        r: colorsArr[base + 0] / cnt,
+        g: colorsArr[base + 1] / cnt,
+        b: colorsArr[base + 2] / cnt,
+        alpha: alphasArr ? (alphasArr[i] / cnt) : 1
+      });
+    }
+  }
+}
+
+class ChunkedIntGrid {
+  constructor(gridSize, chunkSize = VOX_CHUNK_SIZE) {
+    this.size = gridSize;
+    this.nx = gridSize.x | 0;
+    this.ny = gridSize.y | 0;
+    this.nz = gridSize.z | 0;
+    this.chunkSize = chunkSize;
+    this.chunkCountX = Math.max(1, Math.ceil(this.nx / chunkSize));
+    this.chunkCountY = Math.max(1, Math.ceil(this.ny / chunkSize));
+    this.chunkCountZ = Math.max(1, Math.ceil(this.nz / chunkSize));
+    this.layerSize = chunkSize * chunkSize;
+    this.chunkVolume = chunkSize * chunkSize * chunkSize;
+    this.chunks = new Map();
+  }
+
+  _key(cx, cy, cz) {
+    return cx + this.chunkCountX * (cy + this.chunkCountY * cz);
+  }
+
+  _locate(x, y, z) {
+    if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) return null;
+    const cx = Math.floor(x / this.chunkSize);
+    const cy = Math.floor(y / this.chunkSize);
+    const cz = Math.floor(z / this.chunkSize);
+    const lx = x - cx * this.chunkSize;
+    const ly = y - cy * this.chunkSize;
+    const lz = z - cz * this.chunkSize;
+    const idx = lx + this.chunkSize * (ly + this.chunkSize * lz);
+    return { key: this._key(cx, cy, cz), cx, cy, cz, idx };
+  }
+
+  _ensureChunk(loc) {
+    let chunk = this.chunks.get(loc.key);
+    if (!chunk) {
+      chunk = { cx: loc.cx, cy: loc.cy, cz: loc.cz, data: new Int32Array(this.chunkVolume) };
+      chunk.data.fill(-1);
+      this.chunks.set(loc.key, chunk);
+    }
+    return chunk;
+  }
+
+  set(x, y, z, value) {
+    const loc = this._locate(x, y, z);
+    if (!loc) return;
+    const chunk = this._ensureChunk(loc);
+    chunk.data[loc.idx] = value;
+  }
+
+  get(x, y, z) {
+    const loc = this._locate(x, y, z);
+    if (!loc) return -1;
+    const chunk = this.chunks.get(loc.key);
+    if (!chunk) return -1;
+    return chunk.data[loc.idx];
+  }
+
+  copyToDense(target) {
+    for (const chunk of this.chunks.values()) {
+      const baseX = chunk.cx * this.chunkSize;
+      const baseY = chunk.cy * this.chunkSize;
+      const baseZ = chunk.cz * this.chunkSize;
+      const data = chunk.data;
+      for (let i = 0; i < this.chunkVolume; i++) {
+        const val = data[i];
+        if (val < 0) continue;
+        const lx = i % this.chunkSize;
+        const ly = ((i / this.chunkSize) | 0) % this.chunkSize;
+        const lz = (i / this.layerSize) | 0;
+        const x = baseX + lx;
+        const y = baseY + ly;
+        const z = baseZ + lz;
+        if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) continue;
+        const idx = x + this.nx * (y + this.ny * z);
+        target[idx] = val;
+      }
+    }
+  }
+}
+
+class BlockIndexGrid {
+  constructor(gridSize, preferDense = true) {
+    this.size = gridSize;
+    this.nx = gridSize.x | 0;
+    this.ny = gridSize.y | 0;
+    this.nz = gridSize.z | 0;
+    this.total = Math.max(0, this.nx * this.ny * this.nz);
+    this.useDense = !!preferDense;
+    if (this.useDense) {
+      this.data = new Int32Array(this.total);
+      this.data.fill(-1);
+    } else {
+      this.chunked = new ChunkedIntGrid(gridSize, VOX_CHUNK_SIZE);
+    }
+  }
+
+  _index(x, y, z) {
+    return x + this.nx * (y + this.ny * z);
+  }
+
+  _decode(idx) {
+    if (idx < 0 || idx >= this.total) return null;
+    const x = idx % this.nx;
+    const y = ((idx / this.nx) | 0) % this.ny;
+    const z = (idx / (this.nx * this.ny)) | 0;
+    return { x, y, z };
+  }
+
+  setXYZ(x, y, z, value) {
+    if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) return;
+    if (this.useDense) this.data[this._index(x, y, z)] = value;
+    else this.chunked.set(x, y, z, value);
+  }
+
+  setLinear(idx, value) {
+    if (this.useDense) {
+      if (idx >= 0 && idx < this.data.length) this.data[idx] = value;
+    } else {
+      const coords = this._decode(idx);
+      if (coords) this.chunked.set(coords.x, coords.y, coords.z, value);
+    }
+  }
+
+  get(x, y, z) {
+    if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) return -1;
+    if (this.useDense) return this.data[this._index(x, y, z)];
+    return this.chunked.get(x, y, z);
+  }
+
+  getLinear(idx) {
+    if (this.useDense) {
+      if (idx < 0 || idx >= this.data.length) return -1;
+      return this.data[idx];
+    }
+    const coords = this._decode(idx);
+    if (!coords) return -1;
+    return this.chunked.get(coords.x, coords.y, coords.z);
+  }
+
+  toDense() {
+    if (this.useDense) return this.data;
+    const dense = new Int32Array(this.total);
+    dense.fill(-1);
+    this.chunked.copyToDense(dense);
+    return dense;
+  }
+}
+
 /*******************************************************
  * 3) PUBLIC: init + assign
  ******************************************************/
@@ -380,9 +600,8 @@ export async function assignVoxelsToBlocks(glbDisplay, voxelGridOverride = null)
     null;
   if (!voxelGrid) { console.error('No voxel grid. Run voxelize() first.'); return; }
 
-  const { gridSize, unit, bbox, voxelColors, voxelCounts } = voxelGrid;
+  const { gridSize, unit, bbox } = voxelGrid;
   const SX = gridSize.x|0, SY = gridSize.y|0, SZ = gridSize.z|0;
-  const total = SX * SY * SZ;
 
   // 1) Build a dense block-index grid once (KD search per voxel, with the fast 5-6-5 cache)
   const idxGrid = computeBlockIndexGrid(voxelGrid); // Int32Array; -1 = empty/transparent
@@ -398,37 +617,23 @@ export async function assignVoxelsToBlocks(glbDisplay, voxelGridOverride = null)
   ];
   const uvTemplate = [0,0, 1,0, 1,1, 0,1];
 
-  const at = (x,y,z) => x + SX*(y + SY*z);
+  const neighborDiffers = (x,y,z,bIdx) => idxGrid.get(x,y,z) !== bIdx;
 
   // 2) PASS 1 — exact neighbor culling with the index grid; count faces per block
   const facesPerBlock = new Uint32Array(BLOCKS.length);
 
-  // Iterate voxels (alpha threshold handled during voxelization; we still check)
-  const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  for (let z = 0; z < SZ; z++) {
-    for (let y = 0; y < SY; y++) {
-      for (let x = 0; x < SX; x++) {
-        const i = at(x,y,z);
-        const cnt = voxelCounts[i]; if (!cnt) continue;
-        const aAvg = voxelColors[i*4+3] / cnt; if (aAvg < 0.1) continue; // same viz threshold as before
-        const bIdx = idxGrid[i]; if (bIdx < 0) continue;
+  iterateVoxelSamples(voxelGrid, ({ x, y, z, alpha = 1, linearIndex }) => {
+    if (alpha < 0.1) return;
+    const bIdx = idxGrid.getLinear(linearIndex);
+    if (bIdx < 0) return;
 
-        // 6-connected neighbors
-        // +Z
-        if (z+1 >= SZ || idxGrid[at(x,y,z+1)] !== bIdx) facesPerBlock[bIdx]++;
-        // -Z
-        if (z-1 <  0  || idxGrid[at(x,y,z-1)] !== bIdx) facesPerBlock[bIdx]++;
-        // +X
-        if (x+1 >= SX || idxGrid[at(x+1,y,z)] !== bIdx) facesPerBlock[bIdx]++;
-        // -X
-        if (x-1 <  0  || idxGrid[at(x-1,y,z)] !== bIdx) facesPerBlock[bIdx]++;
-        // +Y
-        if (y+1 >= SY || idxGrid[at(x,y+1,z)] !== bIdx) facesPerBlock[bIdx]++;
-        // -Y
-        if (y-1 <  0  || idxGrid[at(x,y-1,z)] !== bIdx) facesPerBlock[bIdx]++;
-      }
-    }
-  }
+    if (z+1 >= SZ || neighborDiffers(x, y, z+1, bIdx)) facesPerBlock[bIdx]++;
+    if (z-1 <  0  || neighborDiffers(x, y, z-1, bIdx)) facesPerBlock[bIdx]++;
+    if (x+1 >= SX || neighborDiffers(x+1, y, z, bIdx)) facesPerBlock[bIdx]++;
+    if (x-1 <  0  || neighborDiffers(x-1, y, z, bIdx)) facesPerBlock[bIdx]++;
+    if (y+1 >= SY || neighborDiffers(x, y+1, z, bIdx)) facesPerBlock[bIdx]++;
+    if (y-1 <  0  || neighborDiffers(x, y-1, z, bIdx)) facesPerBlock[bIdx]++;
+  });
 
   // 3) Allocate typed arrays exactly once per block
   const groups = new Array(BLOCKS.length);
@@ -447,36 +652,24 @@ export async function assignVoxelsToBlocks(glbDisplay, voxelGridOverride = null)
   }
 
   // 4) PASS 2 — fill geometry
-  for (let z = 0; z < SZ; z++) {
-    for (let y = 0; y < SY; y++) {
-      for (let x = 0; x < SX; x++) {
-        const i = at(x,y,z);
-        const cnt = voxelCounts[i]; if (!cnt) continue;
-        const aAvg = voxelColors[i*4+3] / cnt; if (aAvg < 0.1) continue;
-        const bIdx = idxGrid[i]; if (bIdx < 0) continue;
-        const grp = groups[bIdx]; if (!grp) continue;
+  iterateVoxelSamples(voxelGrid, ({ x, y, z, alpha = 1, linearIndex }) => {
+    if (alpha < 0.1) return;
+    const bIdx = idxGrid.getLinear(linearIndex);
+    if (bIdx < 0) return;
+    const grp = groups[bIdx];
+    if (!grp) return;
 
-        const cx = bbox.min.x + (x + 0.5) * unit.x;
-        const cy = bbox.min.y + (y + 0.5) * unit.y;
-        const cz = bbox.min.z + (z + 0.5) * unit.z;
+    const cx = bbox.min.x + (x + 0.5) * unit.x;
+    const cy = bbox.min.y + (y + 0.5) * unit.y;
+    const cz = bbox.min.z + (z + 0.5) * unit.z;
 
-        // Emit faces whose neighbor differs (exact culling)
-        // order matches faceDefs above
-        // +Z
-        if (z+1 >= SZ || idxGrid[at(x,y,z+1)] !== bIdx) emitFace(grp, faceDefs[0], cx, cy, cz);
-        // -Z
-        if (z-1 <  0  || idxGrid[at(x,y,z-1)] !== bIdx) emitFace(grp, faceDefs[1], cx, cy, cz);
-        // +X
-        if (x+1 >= SX || idxGrid[at(x+1,y,z)] !== bIdx) emitFace(grp, faceDefs[2], cx, cy, cz);
-        // -X
-        if (x-1 <  0  || idxGrid[at(x-1,y,z)] !== bIdx) emitFace(grp, faceDefs[3], cx, cy, cz);
-        // +Y
-        if (y+1 >= SY || idxGrid[at(x,y+1,z)] !== bIdx) emitFace(grp, faceDefs[4], cx, cy, cz);
-        // -Y
-        if (y-1 <  0  || idxGrid[at(x,y-1,z)] !== bIdx) emitFace(grp, faceDefs[5], cx, cy, cz);
-      }
-    }
-  }
+    if (z+1 >= SZ || neighborDiffers(x, y, z+1, bIdx)) emitFace(grp, faceDefs[0], cx, cy, cz);
+    if (z-1 <  0  || neighborDiffers(x, y, z-1, bIdx)) emitFace(grp, faceDefs[1], cx, cy, cz);
+    if (x+1 >= SX || neighborDiffers(x+1, y, z, bIdx)) emitFace(grp, faceDefs[2], cx, cy, cz);
+    if (x-1 <  0  || neighborDiffers(x-1, y, z, bIdx)) emitFace(grp, faceDefs[3], cx, cy, cz);
+    if (y+1 >= SY || neighborDiffers(x, y+1, z, bIdx)) emitFace(grp, faceDefs[4], cx, cy, cz);
+    if (y-1 <  0  || neighborDiffers(x, y-1, z, bIdx)) emitFace(grp, faceDefs[5], cx, cy, cz);
+  });
 
   function emitFace(grp, face, cx, cy, cz){
     const { pos, uvs, idx } = grp;
@@ -662,9 +855,9 @@ function makeAtlasBasicMaterial(sharedAtlas) {
 
 // Quantized color cache for per-voxel block indexing
 function computeBlockIndexGrid(voxelGrid) {
-  const { gridSize, voxelColors, voxelCounts } = voxelGrid;
-  const total = gridSize.x * gridSize.y * gridSize.z;
-  const out = new Int32Array(total); out.fill(-1);
+  const { gridSize } = voxelGrid;
+  const preferDense = !!(voxelGrid.voxelColors && voxelGrid.voxelCounts);
+  const out = new BlockIndexGrid(gridSize, preferDense);
   const LOOK = { r:32, g:64, b:32 };
   const cache = new Int32Array(LOOK.r*LOOK.g*LOOK.b); cache.fill(-1);
   const keyFor = (r,g,b)=>{
@@ -675,13 +868,12 @@ function computeBlockIndexGrid(voxelGrid) {
   };
   const findNearest=(r,g,b)=>{ const k=keyFor(r,g,b); const c=cache[k]; if(c>=0) return c; const q=applyBrightnessBias(rgbToOKLab(r,g,b)); const best=nearestNeighbor(kdTree,q.L,q.a,q.b,{d2:Infinity,idx:-1}); cache[k]=best.idx; return best.idx; };
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  for (let i=0;i<total;i++) {
-    const cnt = voxelCounts[i]; if(!cnt) continue;
-    const r = clamp01(toUnit(voxelColors[i*4+0]));
-    const g = clamp01(toUnit(voxelColors[i*4+1]));
-    const b = clamp01(toUnit(voxelColors[i*4+2]));
-    out[i] = findNearest(r,g,b);
-  }
+  iterateVoxelSamples(voxelGrid, ({ linearIndex, r, g, b }) => {
+    const rr = clamp01(toUnit(r));
+    const gg = clamp01(toUnit(g));
+    const bb = clamp01(toUnit(b));
+    out.setLinear(linearIndex, findNearest(rr,gg,bb));
+  });
   return out;
 }
 
@@ -750,14 +942,14 @@ function bakeAtlasUVsOnGeometry(geom, voxelGrid, blockIdxGrid, pickBlockForTrian
   const tmp=new THREE.Vector3();
   const eps = 1e-4;
   function voxelIndexFromPoint(p, normal) {
-    if (!voxelGrid) return -1;
+    if (!voxelGrid) return null;
     tmp.copy(p).addScaledVector(normal, -eps);
     const lx=(tmp.x-bbMin.x)*invUnit.x;
     const ly=(tmp.y-bbMin.y)*invUnit.y;
     const lz=(tmp.z-bbMin.z)*invUnit.z;
     const xi=Math.floor(lx), yi=Math.floor(ly), zi=Math.floor(lz);
-    if (xi<0||yi<0||zi<0||xi>=gSize.x||yi>=gSize.y||zi>=gSize.z) return -1;
-    return xi + gSize.x*(yi + gSize.y*zi);
+    if (xi<0||yi<0||zi<0||xi>=gSize.x||yi>=gSize.y||zi>=gSize.z) return null;
+    return { index: xi + gSize.x*(yi + gSize.y*zi), x: xi, y: yi, z: zi };
   }
 
   function writeTileSpaceUV(vi, axis, sign, p, baseCell) {
@@ -794,7 +986,7 @@ function bakeAtlasUVsOnGeometry(geom, voxelGrid, blockIdxGrid, pickBlockForTrian
     if (voxelGrid && blockIdxGrid) {
       const cx=(v0.x+v1.x+v2.x)/3, cy=(v0.y+v1.y+v2.y)/3, cz=(v0.z+v1.z+v2.z)/3;
       const cell = voxelIndexFromPoint(tmp.set(cx,cy,cz), n);
-      if (cell>=0) blockIdx = blockIdxGrid[cell];
+      if (cell) blockIdx = blockIdxGrid.getLinear(cell.index);
     } else if (pickBlockForTriangle) {
       blockIdx = pickBlockForTriangle(i0,i1,i2, geom);
     }
@@ -924,14 +1116,15 @@ export function restoreVoxelOriginalMaterial(voxelMesh) {
 // Uses the same KD mapping as MC material assignment to ensure WYSIWYG.
 export function buildBlockGrid(voxelGrid) {
   if (!voxelGrid) throw new Error('buildBlockGrid: voxelGrid required');
-  const idxGrid = computeBlockIndexGrid(voxelGrid); // Int32Array of BLOCK indices
+  const idxGrid = computeBlockIndexGrid(voxelGrid);
+  const denseIdx = idxGrid.toDense();
   const { x: SX, y: SY, z: SZ } = voxelGrid.gridSize;
   const palette = [];
   const remap   = new Map(); // BLOCK index -> palette idx
-  const data    = new Int32Array(idxGrid.length);
+  const data    = new Int32Array(denseIdx.length);
 
-  for (let i = 0; i < idxGrid.length; i++) {
-    const bIdx = idxGrid[i];
+  for (let i = 0; i < denseIdx.length; i++) {
+    const bIdx = denseIdx[i];
     if (bIdx < 0 || !BLOCKS[bIdx]) { data[i] = -1; continue; }
     let p = remap.get(bIdx);
     if (p === undefined) { p = palette.length; palette.push(BLOCKS[bIdx].name); remap.set(bIdx, p); }

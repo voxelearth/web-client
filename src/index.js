@@ -185,7 +185,8 @@ async function exportCurrentSchematic () {
 
   try {
     ui.log('💾 Exporting .schem …');
-    await exportToSchematicFn(viewer.voxelizer._voxelGrid, BlockLib.BLOCKS);
+    const denseGrid = BlockLib.buildBlockGrid(viewer.voxelizer._voxelGrid);
+    await exportToSchematicFn(denseGrid);
     ui.log('✅ Schematic saved');
   } catch (e) {
     console.error(e);

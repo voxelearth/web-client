@@ -1,4 +1,4 @@
-/* ====================================================================
+﻿/* ====================================================================
  * map.js – Google Photorealistic 3D-tiles ⇄ on-demand voxel / MC view
  * ===================================================================*/
 
@@ -25,6 +25,10 @@ import { SingleSceneFetcher         } from './SingleSceneFetcher.js';
 const SESSION_MAX_AGE_MS = 2.5 * 60 * 60 * 1000;
 let __tilesSessionId = null;
 let __tilesSessionTs = 0;
+if (typeof window !== 'undefined' && window.__photorealSession?.id) {
+  __tilesSessionId = window.__photorealSession.id;
+  __tilesSessionTs = window.__photorealSession.ts || Date.now();
+}
 
 (function installPhotorealFetchGuard() {
   if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
@@ -59,6 +63,7 @@ let __tilesSessionTs = 0;
         if (url.searchParams.has('session')) {
           __tilesSessionId = null;
           __tilesSessionTs = 0;
+          window.__photorealSession = null;
           await clearRootCache();
           url.searchParams.delete('session');
           url.searchParams.set('_', String(Date.now()));
@@ -212,8 +217,12 @@ class HUD {
   }
 
   getSingleSceneRes() {
+    const numInput = document.querySelector('#single-scene-res-input');
     const resFine = document.querySelector('#single-scene-res-fine');
-    return parseInt(resFine?.value || '64', 10);
+    const raw = numInput?.value || resFine?.value || '64';
+    const val = parseInt(raw, 10);
+    if (!Number.isFinite(val)) return 64;
+    return Math.max(8, Math.min(1024, val));
   }
 
   /** Mirror global Vox/Minecraft state into Single Scene.
@@ -389,6 +398,7 @@ class HUD {
   const tileSlider = document.querySelector('#single-scene-tile-slider');
   const resPills = document.querySelectorAll('.single-scene-res-pill');
   const resFine = document.querySelector('#single-scene-res-fine');
+  const resInput = document.querySelector('#single-scene-res-input');
   const sseSlider = document.querySelector('#single-scene-sse');
   const sseValue  = document.querySelector('#single-scene-sse-value');
   const radiusValue = document.querySelector('#single-scene-radius-value');
@@ -418,6 +428,39 @@ class HUD {
       el.addEventListener('input', () => _setSliderFill(el));
     });
 
+    const presetResValues = [32,64,128,256];
+    const clampResolution = (val) => {
+      const num = parseInt(val, 10);
+      if (!Number.isFinite(num)) return 64;
+      return Math.max(8, Math.min(1024, num));
+    };
+    const nearestPreset = (val) => presetResValues.reduce((prev, curr) => Math.abs(curr - val) < Math.abs(prev - val) ? curr : prev);
+    const highlightResPill = (val) => {
+      resPills.forEach(pill => pill.classList.remove('active'));
+      const active = document.querySelector(`.single-scene-res-pill[data-res="${val}"]`);
+      if (active) active.classList.add('active');
+    };
+    const updateResolutionUI = (value) => {
+      const res = clampResolution(value);
+      if (resFine) {
+        resFine.value = res;
+        _setSliderFill(resFine);
+      }
+      if (resInput && document.activeElement !== resInput) {
+        resInput.value = res;
+      }
+      highlightResPill(nearestPreset(res));
+      return res;
+    };
+    const applyResolutionChange = async (value, { rebuild = true } = {}) => {
+      const res = updateResolutionUI(value);
+      if (rebuild && state.vox && window.singleSceneViewer?.tilesContainer) {
+        await this._rebuildSingleSceneVoxels(res);
+      }
+      return res;
+    };
+    updateResolutionUI(resInput?.value || resFine?.value || 64);
+
     // Radius slider (meters) default 500
     if (radiusSlider && radiusValue) {
       const updateRadius = () => { radiusValue.textContent = `${parseInt(radiusSlider.value||500,10)} m`; };
@@ -431,46 +474,45 @@ class HUD {
       rotSlider.addEventListener('input', async () => {
         updateRot();
         if (state.vox && window.singleSceneViewer?.tilesContainer) {
-          await this._rebuildSingleSceneVoxels(parseInt(resFine?.value||64,10));
+          await this._rebuildSingleSceneVoxels(this.getSingleSceneRes());
         }
       });
       updateRot();
     }
 
     // Resolution pills
-    const highlightResPill = (val) => {
-      resPills.forEach(pill => pill.classList.remove('active'));
-      const active = document.querySelector(`.single-scene-res-pill[data-res="${val}"]`);
-      if (active) active.classList.add('active');
-    };
-
     resPills.forEach(pill => {
       pill.addEventListener('click', async () => {
-        const res = parseInt(pill.dataset.res);
-        if (resFine) resFine.value = res;
-        highlightResPill(res);
-        // auto rebuild if global voxels are on
-        if (state.vox && window.singleSceneViewer?.tilesContainer) {
-          await this._rebuildSingleSceneVoxels(res);
-        }
+        const res = parseInt(pill.dataset.res, 10);
+        await applyResolutionChange(res);
       });
     });
 
     if (resFine) {
-      const debounced = ((fn, ms)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; })(async val=>{
-        const res = parseInt(val, 10) || 64;
-        const closest = [32,64,128,256].reduce((p,c)=>Math.abs(c-res)<Math.abs(p-res)?c:p);
-        highlightResPill(closest);
+      const debouncedRebuild = ((fn, ms)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; })(async res=>{
         if (state.vox && window.singleSceneViewer?.tilesContainer) {
           await this._rebuildSingleSceneVoxels(res);
         }
       }, 200);
 
-      resFine.addEventListener('input', e => debounced(e.target.value));
+      resFine.addEventListener('input', e => {
+        const res = updateResolutionUI(e.target.value);
+        debouncedRebuild(res);
+      });
     }
 
-    // Initialize with medium resolution
-    highlightResPill(64);
+    if (resInput) {
+      const commit = async () => {
+        await applyResolutionChange(resInput.value);
+      };
+      resInput.addEventListener('change', commit);
+      resInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          commit();
+        }
+      });
+    }
 
   // No local vox toggle; Single Scene mirrors global state
 
@@ -521,7 +563,8 @@ class HUD {
           this._showSingleSceneLog();
           this._logSingleScene('Fetching tiles...');
 
-          const fetcher = new SingleSceneFetcher();
+          if (!this._singleSceneFetcher) this._singleSceneFetcher = new SingleSceneFetcher();
+          const fetcher = this._singleSceneFetcher;
           // zoom auto-computed from radius; pass null for zoom and provide radiusM
           const urls = await fetcher.fetch3DTiles(lat, lon, null, sse, apiKey, this._logSingleScene.bind(this), radiusM);
 
@@ -823,8 +866,8 @@ class HUD {
   async _rebuildSingleSceneVoxels(resolution) {
     const viewer = window.singleSceneViewer;
     const container = viewer?.tilesContainer;
-    if (!viewer || !container) { this._logSingleScene('❌ No tiles loaded'); return; }
-  const rotDeg = parseInt(document.querySelector('#single-scene-rot')?.value || '0', 10) || 0; // degrees to sample at
+    if (!viewer || !container) { this._logSingleScene('? No tiles loaded'); return; }
+    const rotDeg = parseInt(document.querySelector('#single-scene-rot')?.value || '0', 10) || 0; // degrees to sample at
 
     this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
     const myVersion = this._ssVoxVersion;
@@ -846,14 +889,40 @@ class HUD {
     // Show originals while rebuilding
     container.children.forEach(ch => { if (ch.name !== 'singleSceneVoxels') ch.visible = true; });
 
-    this._logSingleScene(`🔄 (Re)voxelizing @ ${resolution}…`);
     container.updateMatrixWorld(true);
+    const containerBox = new THREE.Box3().setFromObject(container);
+    const containerSize = containerBox.getSize(new THREE.Vector3());
+    const maxDim = Math.max(containerSize.x, containerSize.y, containerSize.z, 1);
+
+    const childDiags = [];
+    for (const child of container.children) {
+      if (!child || child.name === 'singleSceneVoxels') continue;
+      const box = new THREE.Box3().setFromObject(child);
+      if (box.isEmpty()) continue;
+      const diag = box.getSize(new THREE.Vector3()).length();
+      if (Number.isFinite(diag) && diag > 0) childDiags.push(diag);
+    }
+    childDiags.sort((a,b)=>a-b);
+    const medianDiag = childDiags.length ? childDiags[Math.floor(childDiags.length/2)] : maxDim;
+    const tileDiag = Math.max(medianDiag, 1e-3);
+    const densitySetting = Math.max(1, Number(resolution) || 64);
+    const tilesAcross = Math.max(1, maxDim / tileDiag);
+    const computedResolution = Math.max(8, Math.round(densitySetting * tilesAcross));
+    const approxVoxelMeters = tileDiag / densitySetting;
+    this._logSingleScene(`?? (Re)voxelizing @ ${computedResolution} (~${approxVoxelMeters.toFixed(2)} m voxels per tile).`);
 
     let vox;
     try {
-  vox = await voxelizeModel({ model: container, renderer: viewer.renderer, scene: viewer.scene, resolution, needGrid: true, preRotateYDeg: rotDeg });
+      vox = await voxelizeModel({
+        model: container,
+        renderer: viewer.renderer,
+        scene: viewer.scene,
+        resolution: computedResolution,
+        needGrid: true,
+        preRotateYDeg: rotDeg
+      });
     } catch (e) {
-      this._logSingleScene(`❌ Voxelization error: ${e?.message || e}`);
+      this._logSingleScene(`? Voxelization error: ${e?.message || e}`);
       return;
     }
 
@@ -866,10 +935,9 @@ class HUD {
     }
 
     if (!vox || !vox.voxelMesh) {
-      this._logSingleScene('❌ Voxelizer returned no geometry');
+      this._logSingleScene('? Voxelizer returned no geometry');
       return;
     }
-
     const voxelMesh = vox.voxelMesh;
     const rawGrid   = vox._voxelGrid; // original grid in the mesh’s creation frame
 
@@ -893,7 +961,6 @@ class HUD {
     }
 
     // Prepare counter-rotation so only sampling orientation changes
-    const containerBox = new THREE.Box3().setFromObject(container);
     const pivot = containerBox.getCenter(new THREE.Vector3());
     const Tneg  = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
     const RyInv = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(-rotDeg));
@@ -1794,22 +1861,34 @@ function ensureTiles(root,key){
     if (u.startsWith('blob:') || u.startsWith('data:')) return u;
     const url = new URL(u, 'https://tile.googleapis.com');
 
+    if (typeof window !== 'undefined' && window.__photorealSession?.id) {
+      const shared = window.__photorealSession;
+      if (!__tilesSessionId || shared.id !== __tilesSessionId) {
+        __tilesSessionId = shared.id;
+        __tilesSessionTs = shared.ts || Date.now();
+      }
+    }
+
     if (url.searchParams.has('session')) {
       const s = url.searchParams.get('session');
       if (s && s !== __tilesSessionId) {
         __tilesSessionId = s;
         __tilesSessionTs = Date.now();
+        window.__photorealSession = { id: __tilesSessionId, ts: __tilesSessionTs };
       }
     }
 
     if (__tilesSessionId && Date.now() - __tilesSessionTs > SESSION_MAX_AGE_MS) {
       __tilesSessionId = null;
+      window.__photorealSession = null;
     }
 
     if (__tilesSessionId) {
       url.searchParams.set('session', __tilesSessionId);
+      window.__photorealSession = { id: __tilesSessionId, ts: __tilesSessionTs };
     } else {
       url.searchParams.delete('session');
+      window.__photorealSession = null;
     }
 
     if (!url.searchParams.has('key')) url.searchParams.set('key', key);
@@ -2268,3 +2347,6 @@ function rebaseVoxelGrid(voxelGrid, M) {
     unit: { x: voxelGrid.unit.x * ex, y: voxelGrid.unit.y * ey, z: voxelGrid.unit.z * ez }
   };
 }
+
+
+

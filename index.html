@@ -607,17 +607,23 @@
               <div class="text-xs opacity-60 mt-1">Show tile bounds/helpers in the Single Scene viewer.</div>
             </div>
 
-            <!-- Resolution -->
+            <!-- Resolution / Density -->
             <div class="mt-2">
-              <label class="block text-sm font-medium text-white/80 mb-2">Voxel Resolution</label>
+              <label class="block text-sm font-medium text-white/80 mb-2">Voxel Density</label>
               <div class="grid grid-cols-2 gap-1 bg-white/5 rounded-lg p-1 mb-2">
                 <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="32">Low</button>
                 <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="64">Med</button>
                 <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="128">High</button>
                 <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="256">Ultra</button>
               </div>
-              <input id="single-scene-res-fine" type="range" min="8" max="512" value="64" class="w-full slider slider-lg">
-              <div class="text-xs opacity-60 mt-1">Fine-tune resolution</div>
+              <input id="single-scene-res-fine" type="range" min="8" max="1024" value="64" class="w-full slider slider-lg">
+              <div class="flex items-center gap-2 mt-2">
+                <input id="single-scene-res-input" type="number" min="8" max="2048" step="1"
+                       class="flex-1 rounded-lg bg-white/10 px-2 py-1 text-xs outline-none"
+                       placeholder="Enter custom resolution" value="64" />
+                <span class="text-xs opacity-60 whitespace-nowrap">voxels</span>
+              </div>
+              <div class="text-xs opacity-60 mt-1">Fine-tune per-tile density. Larger capture areas automatically add more voxels.</div>
             </div>
           </div>
         </div>
