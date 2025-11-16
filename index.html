@@ -564,10 +564,15 @@
             <!-- Radius (meters) -->
             <div class="mb-1">
               <label for="single-scene-radius" class="block text-sm font-medium text-white/80 mb-1">Radius</label>
-              <input id="single-scene-radius" type="range" min="100" max="3000" step="50" value="500" class="w-full slider slider-lg">
-              <div class="flex justify-between text-xs opacity-60 mt-1">
-                <span>100 m</span>
-                <span id="single-scene-radius-value">500 m</span>
+              <input id="single-scene-radius" type="range" min="20" max="3000" step="50" value="500" class="w-full slider slider-lg">
+              <div class="flex justify-between items-center text-xs opacity-60 mt-1 gap-2">
+                <span>20 m</span>
+                <label class="flex items-center gap-1 text-white/90">
+                  <input id="single-scene-radius-value" type="number" min="0" max="3000" value="500"
+                         class="w-20 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
+                         inputmode="numeric" />
+                  <span>m</span>
+                </label>
                 <span>3 km</span>
               </div>
             </div>
@@ -576,9 +581,11 @@
             <div id="single-scene-sse-row" class="mb-1">
               <label for="single-scene-sse" class="block text-sm font-medium text-white/80 mb-1">Screen Space Error (SSE)</label>
               <input id="single-scene-sse" type="range" min="2" max="64" value="20" class="w-full slider slider-lg">
-              <div class="flex justify-between text-xs opacity-60 mt-1">
+              <div class="flex justify-between items-center text-xs opacity-60 mt-1 gap-2">
                 <span>High detail</span>
-                <span id="single-scene-sse-value">20</span>
+                <input id="single-scene-sse-value" type="number" min="2" max="64" value="20"
+                       class="w-16 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
+                       inputmode="numeric" />
                 <span>Low detail</span>
               </div>
             </div>
@@ -587,8 +594,15 @@
             <div class="mb-1">
               <label for="single-scene-rot" class="block text-sm font-medium text-white/80 mb-1">Rotation (Y)</label>
               <input id="single-scene-rot" type="range" min="0" max="360" step="1" value="0" class="w-full slider slider-lg">
-              <div class="flex justify-between text-xs opacity-60 mt-1">
-                <span>0°</span><span id="single-scene-rot-value">0°</span><span>360°</span>
+              <div class="flex justify-between items-center text-xs opacity-60 mt-1 gap-2">
+                <span>0°</span>
+                <label class="flex items-center gap-1 text-white/90">
+                  <input id="single-scene-rot-value" type="number" min="0" max="360" value="0"
+                         class="w-16 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
+                         inputmode="numeric" />
+                  <span>°</span>
+                </label>
+                <span>360°</span>
               </div>
             </div>
 

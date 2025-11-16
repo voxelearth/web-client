@@ -111,6 +111,8 @@ const USE_OKLAB = true;                 // perceptual color space
 const ALPHA_MEAN_THRESHOLD = 0.10;      // ignore mostly transparent pixels in color avg
 const LOOKUP_QUANT = { r: 32, g: 64, b: 32 }; // 5-6-5 cache
 const VOX_CHUNK_SIZE = 32;
+const MAX_DENSE_BLOCK_GRID = 50_000_000; // >200MB for Int32Array, so fallback to chunked beyond this
+const BLOCKDATA_CHUNK_BYTES = 1 << 20; // stream .schem data in ~1MB chunks
 // If voxel colors are 0..255 instead of 0..1, convert on the fly
 function toUnit(cAvg) { return cAvg > 1.0001 ? (cAvg / 255) : cAvg; }
 // ----------------------------------------------------------------------
@@ -476,7 +478,7 @@ class ChunkedIntGrid {
     return chunk.data[loc.idx];
   }
 
-  copyToDense(target) {
+    copyToDense(target) {
     for (const chunk of this.chunks.values()) {
       const baseX = chunk.cx * this.chunkSize;
       const baseY = chunk.cy * this.chunkSize;
@@ -496,24 +498,52 @@ class ChunkedIntGrid {
         target[idx] = val;
       }
     }
-  }
-}
+    }
 
-class BlockIndexGrid {
-  constructor(gridSize, preferDense = true) {
-    this.size = gridSize;
-    this.nx = gridSize.x | 0;
-    this.ny = gridSize.y | 0;
-    this.nz = gridSize.z | 0;
-    this.total = Math.max(0, this.nx * this.ny * this.nz);
-    this.useDense = !!preferDense;
-    if (this.useDense) {
-      this.data = new Int32Array(this.total);
-      this.data.fill(-1);
-    } else {
-      this.chunked = new ChunkedIntGrid(gridSize, VOX_CHUNK_SIZE);
+    forEachFilled(cb) {
+      if (typeof cb !== 'function') return;
+      for (const chunk of this.chunks.values()) {
+        const baseX = chunk.cx * this.chunkSize;
+        const baseY = chunk.cy * this.chunkSize;
+        const baseZ = chunk.cz * this.chunkSize;
+        const data = chunk.data;
+        for (let i = 0; i < this.chunkVolume; i++) {
+          const val = data[i];
+          if (val < 0) continue;
+          const lx = i % this.chunkSize;
+          const ly = ((i / this.chunkSize) | 0) % this.chunkSize;
+          const lz = (i / this.layerSize) | 0;
+          const x = baseX + lx;
+          const y = baseY + ly;
+          const z = baseZ + lz;
+          if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) continue;
+          cb(x, y, z, val);
+        }
+      }
     }
   }
+
+  class BlockIndexGrid {
+    constructor(gridSize, preferDense = true) {
+      this.size = gridSize;
+      this.nx = gridSize.x | 0;
+      this.ny = gridSize.y | 0;
+      this.nz = gridSize.z | 0;
+      this.total = Math.max(0, this.nx * this.ny * this.nz);
+      this.minX = this.nx;
+      this.minY = this.ny;
+      this.minZ = this.nz;
+      this.maxX = -1;
+      this.maxY = -1;
+      this.maxZ = -1;
+      this.useDense = !!preferDense && this.total <= MAX_DENSE_BLOCK_GRID;
+      if (this.useDense) {
+        this.data = new Int32Array(this.total);
+        this.data.fill(-1);
+      } else {
+        this.chunked = new ChunkedIntGrid(gridSize, VOX_CHUNK_SIZE);
+      }
+    }
 
   _index(x, y, z) {
     return x + this.nx * (y + this.ny * z);
@@ -527,20 +557,28 @@ class BlockIndexGrid {
     return { x, y, z };
   }
 
-  setXYZ(x, y, z, value) {
-    if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) return;
-    if (this.useDense) this.data[this._index(x, y, z)] = value;
-    else this.chunked.set(x, y, z, value);
-  }
-
-  setLinear(idx, value) {
-    if (this.useDense) {
-      if (idx >= 0 && idx < this.data.length) this.data[idx] = value;
-    } else {
-      const coords = this._decode(idx);
-      if (coords) this.chunked.set(coords.x, coords.y, coords.z, value);
+    _markFilled(x, y, z) {
+      if (x < this.minX) this.minX = x;
+      if (y < this.minY) this.minY = y;
+      if (z < this.minZ) this.minZ = z;
+      if (x > this.maxX) this.maxX = x;
+      if (y > this.maxY) this.maxY = y;
+      if (z > this.maxZ) this.maxZ = z;
     }
-  }
+
+    setXYZ(x, y, z, value) {
+      if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) return;
+      if (value >= 0) this._markFilled(x, y, z);
+      if (this.useDense) this.data[this._index(x, y, z)] = value;
+      else this.chunked.set(x, y, z, value);
+    }
+
+    setLinear(idx, value) {
+      if (idx < 0 || idx >= this.total) return;
+      const coords = this._decode(idx);
+      if (!coords) return;
+      this.setXYZ(coords.x, coords.y, coords.z, value);
+    }
 
   get(x, y, z) {
     if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) return -1;
@@ -558,14 +596,46 @@ class BlockIndexGrid {
     return this.chunked.get(coords.x, coords.y, coords.z);
   }
 
-  toDense() {
-    if (this.useDense) return this.data;
-    const dense = new Int32Array(this.total);
-    dense.fill(-1);
-    this.chunked.copyToDense(dense);
-    return dense;
+    toDense() {
+      if (this.useDense) return this.data;
+      const dense = new Int32Array(this.total);
+      dense.fill(-1);
+      this.chunked.copyToDense(dense);
+      return dense;
+    }
+
+    forEachFilled(cb) {
+      if (typeof cb !== 'function') return;
+      if (this.useDense) {
+        const data = this.data;
+        const NX = this.nx;
+        const NY = this.ny;
+        const nzStride = NX * NY;
+        for (let idx = 0; idx < data.length; idx++) {
+          const val = data[idx];
+          if (val < 0) continue;
+          const x = idx % NX;
+          const y = ((idx / NX) | 0) % NY;
+          const z = (idx / nzStride) | 0;
+          cb(x, y, z, val);
+        }
+      } else if (this.chunked) {
+        this.chunked.forEachFilled(cb);
+      }
+    }
+
+    getBounds() {
+      if (this.maxX < this.minX || this.maxY < this.minY || this.maxZ < this.minZ) return null;
+      const min = { x: this.minX, y: this.minY, z: this.minZ };
+      const max = { x: this.maxX, y: this.maxY, z: this.maxZ };
+      const size = {
+        x: (max.x - min.x + 1) || 1,
+        y: (max.y - min.y + 1) || 1,
+        z: (max.z - min.z + 1) || 1,
+      };
+      return { min, max, size };
+    }
   }
-}
 
 /*******************************************************
  * 3) PUBLIC: init + assign
@@ -868,14 +938,14 @@ function computeBlockIndexGrid(voxelGrid) {
   };
   const findNearest=(r,g,b)=>{ const k=keyFor(r,g,b); const c=cache[k]; if(c>=0) return c; const q=applyBrightnessBias(rgbToOKLab(r,g,b)); const best=nearestNeighbor(kdTree,q.L,q.a,q.b,{d2:Infinity,idx:-1}); cache[k]=best.idx; return best.idx; };
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  iterateVoxelSamples(voxelGrid, ({ linearIndex, r, g, b }) => {
-    const rr = clamp01(toUnit(r));
-    const gg = clamp01(toUnit(g));
-    const bb = clamp01(toUnit(b));
-    out.setLinear(linearIndex, findNearest(rr,gg,bb));
-  });
-  return out;
-}
+    iterateVoxelSamples(voxelGrid, ({ x, y, z, linearIndex, r, g, b }) => {
+      const rr = clamp01(toUnit(r));
+      const gg = clamp01(toUnit(g));
+      const bb = clamp01(toUnit(b));
+      out.setXYZ(x, y, z, findNearest(rr,gg,bb));
+    });
+    return out;
+  }
 
 // Optional fallback triangle picker (if voxelGrid missing) using existing vertex colors
 function makeColorFallbackPicker(querySpace='srgb') {
@@ -1117,20 +1187,42 @@ export function restoreVoxelOriginalMaterial(voxelMesh) {
 export function buildBlockGrid(voxelGrid) {
   if (!voxelGrid) throw new Error('buildBlockGrid: voxelGrid required');
   const idxGrid = computeBlockIndexGrid(voxelGrid);
-  const denseIdx = idxGrid.toDense();
-  const { x: SX, y: SY, z: SZ } = voxelGrid.gridSize;
+  const bounds = idxGrid.getBounds();
+  const hasData = !!bounds;
+  const min = hasData ? bounds.min : { x: 0, y: 0, z: 0 };
+  const size = hasData ? bounds.size : { x: 1, y: 1, z: 1 };
+  const SX = size.x | 0;
+  const SY = size.y | 0;
+  const SZ = size.z | 0;
+  const total = Math.max(1, SX * SY * SZ);
   const palette = [];
   const remap   = new Map(); // BLOCK index -> palette idx
-  const data    = new Int32Array(denseIdx.length);
+  const data    = new Int32Array(total);
+  data.fill(-1);
 
-  for (let i = 0; i < denseIdx.length; i++) {
-    const bIdx = denseIdx[i];
-    if (bIdx < 0 || !BLOCKS[bIdx]) { data[i] = -1; continue; }
-    let p = remap.get(bIdx);
-    if (p === undefined) { p = palette.length; palette.push(BLOCKS[bIdx].name); remap.set(bIdx, p); }
-    data[i] = p;
+  if (hasData) {
+    idxGrid.forEachFilled((x, y, z, bIdx) => {
+      if (bIdx < 0 || !BLOCKS[bIdx]) return;
+      const lx = x - min.x;
+      const ly = y - min.y;
+      const lz = z - min.z;
+      if (lx < 0 || ly < 0 || lz < 0 || lx >= SX || ly >= SY || lz >= SZ) return;
+      const lin = lx + SX * (ly + SY * lz);
+      let p = remap.get(bIdx);
+      if (p === undefined) {
+        p = palette.length;
+        palette.push(BLOCKS[bIdx].name);
+        remap.set(bIdx, p);
+      }
+      data[lin] = p;
+    });
   }
-  return { size: { x: SX, y: SY, z: SZ }, data, palette };
+  return {
+    size: { x: SX, y: SY, z: SZ },
+    offset: { x: min.x, y: min.y, z: min.z },
+    data,
+    palette
+  };
 }
 
 // vanilla-friendly: one /setblock per filled cell
@@ -1208,8 +1300,8 @@ async function nbtWriteCompat(payload) {
 // Build sparse blocks from the dense grid returned by buildBlockGrid
 function denseToSparse(dense) {
   const { size, data } = dense;
+  const { W: SX, H: SY, L: SZ } = getGridMetrics(size, data, 'denseToSparse');
   const blocks = [];
-  const SX = size.x|0, SY = size.y|0, SZ = size.z|0;
   const at = (x, y, z) => x + SX * (y + SY * z);
   for (let z = 0; z < SZ; z++)
     for (let y = 0; y < SY; y++)
@@ -1266,12 +1358,93 @@ function legacyIdMetaForName(name, map) {
   return (map && map[normalized]) || LEGACY_ID_META_FALLBACK;
 }
 
+const LEGACY_SCHEM_AXIS_MAX = 0x7fff; // legacy .schematic stores shorts (signed 16-bit)
+
+function getGridMetrics(size, data, ctx = 'grid') {
+  if (!size) throw new Error(`${ctx}: missing grid size`);
+  const W = size.x | 0;
+  const H = size.y | 0;
+  const L = size.z | 0;
+  if (W <= 0 || H <= 0 || L <= 0) {
+    throw new Error(`${ctx}: invalid grid dimensions (${W}x${H}x${L})`);
+  }
+  const total = W * H * L;
+  if (!Number.isSafeInteger(total)) {
+    throw new Error(`${ctx}: grid too large (${W}x${H}x${L}) – reduce resolution or export a chunked grid`);
+  }
+  if (!data) {
+    throw new Error(`${ctx}: dense grid missing data`);
+  }
+  if (data.length !== total) {
+    throw new Error(`${ctx}: dense grid data mismatch (expected ${total}, got ${data.length})`);
+  }
+  return { W, H, L, total };
+}
+
+function encodeVarIntBlockData(metrics, data, paletteIds) {
+  const { W, H, L, total } = metrics;
+  const chunkBytes = Math.min(BLOCKDATA_CHUNK_BYTES, Math.max(1024, total + 16));
+  let chunk = new Uint8Array(chunkBytes);
+  let offset = 0;
+  const chunks = [];
+  let totalBytes = 0;
+
+  const pushChunk = (view) => {
+    chunks.push(view);
+    totalBytes += view.length;
+  };
+
+  const writeByte = (byte) => {
+    if (offset >= chunk.length) {
+      pushChunk(chunk);
+      chunk = new Uint8Array(chunkBytes);
+      offset = 0;
+    }
+    chunk[offset++] = byte;
+  };
+
+  const writeVarInt = (value) => {
+    let v = value >>> 0;
+    do {
+      let b = v & 0x7F;
+      v >>>= 7;
+      if (v !== 0) b |= 0x80;
+      writeByte(b);
+    } while (v !== 0);
+  };
+
+  const at = (x, y, z) => x + W * (y + H * z);
+  for (let y = 0; y < H; y++) {
+    for (let z = 0; z < L; z++) {
+      for (let x = 0; x < W; x++) {
+        const p = data[at(x, y, z)];
+        const id = (p >= 0 && p < paletteIds.length) ? paletteIds[p] : 0;
+        writeVarInt(id);
+      }
+    }
+  }
+
+  if (offset > 0) {
+    pushChunk(chunk.subarray(0, offset));
+  }
+
+  const BlockData = new Uint8Array(totalBytes);
+  let cursor = 0;
+  for (const view of chunks) {
+    BlockData.set(view, cursor);
+    cursor += view.length;
+  }
+  return BlockData;
+}
+
 // Java Structure Block .nbt (gzipped NBT)
 export async function writeStructureNBT(denseGrid, { dataVersion = 3955 } = {}) {
   if (!denseGrid) throw new Error('writeStructureNBT: grid required');
   const { size, palette } = denseGrid;
+  getGridMetrics(size, denseGrid.data, 'writeStructureNBT');
+  const paletteNames = Array.isArray(palette) ? palette : [];
   const blocks = denseToSparse(denseGrid);
-  const fullNames = palette.map(n => `minecraft:${n}`);
+  const fullNames = paletteNames.map(n => `minecraft:${n}`);
 
   const nbtRoot = {
     DataVersion: { type: 'int', value: dataVersion },
@@ -1294,48 +1467,27 @@ export async function writeStructureNBT(denseGrid, { dataVersion = 3955 } = {}) 
   return await nbtWriteCompat(payload);
 }
 
-// VarInt encoding for Sponge .schem v2 BlockData
-function writeVarInt(num) {
-  const out = [];
-  let v = num >>> 0;
-  do {
-    let b = v & 0x7F;
-    v >>>= 7;
-    if (v !== 0) b |= 0x80;
-    out.push(b);
-  } while (v !== 0);
-  return out;
-}
-
 // Sponge WorldEdit .schem (v2) – dependency-free writer using prismarine-nbt
 export async function writeSpongeSchem(denseGrid, { dataVersion = 3955 } = {}) {
   if (!denseGrid) throw new Error('writeSpongeSchem: grid required');
   const { size, palette, data } = denseGrid;
-  const W = size.x|0, H = size.y|0, L = size.z|0;
+  const paletteNames = Array.isArray(palette) ? palette : [];
+  const metrics = getGridMetrics(size, data, 'writeSpongeSchem');
+  const { W, H, L } = metrics;
 
   // Build string->int palette; include air
   const pal = { 'minecraft:air': 0 };
   let next = 1;
-  for (const name of palette) {
+  const paletteIds = new Int32Array(paletteNames.length);
+  for (let i = 0; i < paletteNames.length; i++) {
+    const name = paletteNames[i];
     const full = `minecraft:${name}`;
     if (!(full in pal)) pal[full] = next++;
+    paletteIds[i] = pal[full];
   }
   const paletteMax = next;
 
-  // Y-Z-X order VarInt stream
-  const at = (x,y,z) => x + W * (y + H * z);
-  const bytes = [];
-  for (let y=0;y<H;y++) {
-    for (let z=0;z<L;z++) {
-      for (let x=0;x<W;x++) {
-        const p = data[at(x,y,z)];
-        const key = (p >= 0) ? `minecraft:${palette[p]}` : 'minecraft:air';
-        const id = pal[key] ?? 0;
-        bytes.push(...writeVarInt(id));
-      }
-    }
-  }
-  const BlockData = new Uint8Array(bytes);
+  const BlockData = encodeVarIntBlockData(metrics, data, paletteIds);
 
   const root = {
     Version:     { type:'int', value: 2 },
@@ -1360,25 +1512,36 @@ export async function writeSpongeSchem(denseGrid, { dataVersion = 3955 } = {}) {
 export async function writeMCEditSchematic(denseGrid) {
   if (!denseGrid) throw new Error('writeMCEditSchematic: grid required');
   const { size, palette, data } = denseGrid;
+  const paletteNames = Array.isArray(palette) ? palette : [];
   const legacyMap = await ensureLegacyIdMap();
-  const W = size.x|0, H = size.y|0, L = size.z|0;
-  const total = W * H * L;
-  const Blocks = new Uint8Array(total).fill(0);
-  const Data   = new Uint8Array(total).fill(0);
+  const metrics = getGridMetrics(size, data, 'writeMCEditSchematic');
+  const { W, H, L, total } = metrics;
+
+  if (W > LEGACY_SCHEM_AXIS_MAX || H > LEGACY_SCHEM_AXIS_MAX || L > LEGACY_SCHEM_AXIS_MAX) {
+    throw new Error(`writeMCEditSchematic: ${W}x${H}x${L} exceeds the legacy 32k-per-axis limit. Use .schem or reduce resolution.`);
+  }
+
+  let Blocks, DataArray;
+  try {
+    Blocks = new Uint8Array(total);
+    DataArray = new Uint8Array(total);
+  } catch (err) {
+    throw new Error(`writeMCEditSchematic: failed to allocate ${total.toLocaleString()} voxels (${(total/1e6).toFixed(1)}M). Try .schem export or lower detail. Original error: ${err?.message || err}`);
+  }
 
   // Y-Z-X order for legacy schematic
   const toIndex = (x, y, z) => y * L * W + z * W + x;
-  const SX = W, SY = H, SZ = L;
-  const at = (x, y, z) => x + SX * (y + SY * z);
-  for (let z = 0; z < SZ; z++)
-    for (let y = 0; y < SY; y++)
-      for (let x = 0; x < SX; x++) {
+  const at = (x, y, z) => x + W * (y + H * z);
+  for (let z = 0; z < L; z++)
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
         const p = data[at(x,y,z)];
-        if (p >= 0) {
-          const name = palette[p];
+        if (p >= 0 && p < paletteNames.length) {
+          const name = paletteNames[p];
           const [id, meta] = legacyIdMetaForName(name, legacyMap);
-          Blocks[toIndex(x,y,z)] = id & 255;
-          Data[toIndex(x,y,z)]   = meta & 15;
+          const idx = toIndex(x,y,z);
+          Blocks[idx] = id & 255;
+          DataArray[idx] = meta & 15;
         }
       }
 
@@ -1388,7 +1551,7 @@ export async function writeMCEditSchematic(denseGrid) {
     Length:     { type:'short', value: L },
     Materials:  { type:'string', value: 'Alpha' },
     Blocks:     { type:'byteArray', value: Blocks },
-    Data:       { type:'byteArray', value: Data },
+    Data:       { type:'byteArray', value: DataArray },
     Entities:   { type:'list', value:{ type:'compound', value: [] } },
     TileEntities:{ type:'list', value:{ type:'compound', value: [] } }
   };
