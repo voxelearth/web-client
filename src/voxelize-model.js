@@ -19,10 +19,10 @@ function textureToPixels(tex) {
 
   /* draw → readPixels (works for CORS-clean images) */
   const canvas = document.createElement('canvas');
-  canvas.width  = img.width;
+  canvas.width = img.width;
   canvas.height = img.height;
   try {
-    const ctx = canvas.getContext('2d', { willReadFrequently:true });
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     ctx.drawImage(img, 0, 0);
     return ctx.getImageData(0, 0, img.width, img.height);   // Uint8ClampedArray
   } catch {
@@ -34,9 +34,9 @@ function textureToPixels(tex) {
 /* 1️⃣  serialise the model                                         */
 /* --------------------------------------------------------------- */
 function serializeModel(model, { preRotateYDeg = 0 } = {}) {
-  const meshes        = [];
+  const meshes = [];
   const materialStore = new Map();   // uuid → serialised material
-  const imageStore    = new Map();   // uuid → ImageData
+  const imageStore = new Map();   // uuid → ImageData
 
   model.updateWorldMatrix(true, true);
 
@@ -49,10 +49,10 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
       if (!mat || materialStore.has(mat.uuid)) continue;
 
       const m = {
-        uuid     : mat.uuid,
-        type     : mat.type,
-        color    : mat.color    ? mat.color.getHex()    : undefined,
-        emissive : mat.emissive ? mat.emissive.getHex() : undefined,
+        uuid: mat.uuid,
+        type: mat.type,
+        color: mat.color ? mat.color.getHex() : undefined,
+        emissive: mat.emissive ? mat.emissive.getHex() : undefined,
       };
 
       for (const key of ['map', 'emissiveMap', 'alphaMap']) {
@@ -64,15 +64,15 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
           if (!imageStore.has(t.source.uuid)) imageStore.set(t.source.uuid, idata);
 
           m[key] = {
-            imageUuid : t.source.uuid,
-            encoding  : t.encoding,
-            flipY     : t.flipY,
-            wrapS     : t.wrapS,
-            wrapT     : t.wrapT,
-            offset    : t.offset.toArray(),
-            repeat    : t.repeat.toArray(),
-            rotation  : t.rotation,
-            center    : t.center.toArray(),
+            imageUuid: t.source.uuid,
+            encoding: t.encoding,
+            flipY: t.flipY,
+            wrapS: t.wrapS,
+            wrapT: t.wrapT,
+            offset: t.offset.toArray(),
+            repeat: t.repeat.toArray(),
+            rotation: t.rotation,
+            center: t.center.toArray(),
           };
         }
       }
@@ -80,7 +80,7 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
     }
 
     /* ── geometry (preserve typed-array class) ───────────────────── */
-    const g          = o.geometry;
+    const g = o.geometry;
     const attributes = {};
     for (const [name, attr] of Object.entries(g.attributes)) {
       const clone = new (attr.array.constructor)(attr.array);
@@ -88,13 +88,13 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
     }
 
     meshes.push({
-      geometry : {
+      geometry: {
         attributes,
-        groups : g.groups,
-        index  : g.index ? { array: new (g.index.array.constructor)(g.index.array) } : null
+        groups: g.groups,
+        index: g.index ? { array: new (g.index.array.constructor)(g.index.array) } : null
       },
-      materials   : mats.map(m => m.uuid),
-      matrixWorld : o.matrixWorld.toArray()
+      materials: mats.map(m => m.uuid),
+      matrixWorld: o.matrixWorld.toArray()
     });
   });
 
@@ -132,111 +132,93 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
 
   return {
     meshes,
-    materials  : Array.from(materialStore.values()),
-    imageDatas : Array.from(imageStore.entries()),     // [uuid, ImageData]
-    bbox       : { min: bbox.min.toArray(), max: bbox.max.toArray() }
+    materials: Array.from(materialStore.values()),
+    imageDatas: Array.from(imageStore.entries()),     // [uuid, ImageData]
+    bbox: { min: bbox.min.toArray(), max: bbox.max.toArray() }
   };
 }
 
 /* --------------------------------------------------------------- */
 /* 2️⃣  send to worker, receive voxel mesh back                     */
 /* --------------------------------------------------------------- */
-export function voxelizeModel({ model, resolution = 200, needGrid = false, method = '2.5d-scan', onStart, preRotateYDeg = 0 }) {
+/* --------------------------------------------------------------- */
+/* 2️⃣  send to worker, receive voxel mesh back                     */
+/* --------------------------------------------------------------- */
+export function voxelizeModel({ model, resolution = 200, needGrid = false, method = '2.5d-scan', onStart, onProgress, onChunk, preRotateYDeg = 0 }) {
   return new Promise((resolve, reject) => {
 
     const worker = new Worker(
       new URL('./voxelizer.worker.js', import.meta.url),
-      { type:'module' }
+      { type: 'module' }
     );
-    if (onStart) try { onStart(worker); } catch {}
+    if (onStart) try { onStart(worker); } catch { }
+
+    const chunks = [];
+    let totalVoxels = 0;
 
     worker.onmessage = e => {
-      const { status, result, message, stack } = e.data;
-      worker.terminate();
+      const { status, result, geometry, processed, total, message, stack } = e.data;
 
       if (status === 'error') {
+        worker.terminate();
         console.error('[voxelizer.worker] error:', message, stack);
         return reject(new Error(message));
       }
 
-      /* rebuild THREE geometries with chunk bounds for frustum culling */
-      const group = new THREE.Group();
-      for (const g of result.geometries) {
+      if (status === 'progress') {
+        if (onProgress) onProgress(processed, total);
+        return;
+      }
+
+      if (status === 'chunk') {
+        // Rehydrate geometry
         const geom = new THREE.BufferGeometry();
-        geom.setAttribute('position', new THREE.BufferAttribute(g.positions, 3));
+        geom.setAttribute('position', new THREE.BufferAttribute(geometry.positions, 3));
+        geom.setAttribute('color', new THREE.BufferAttribute(geometry.colors8, 4, true));
+        geom.setIndex(new THREE.BufferAttribute(geometry.indices, 1));
 
-        // Prefer worker-packed RGBA8 colors (normalized) else fallback pack here
-        if (g.colors8) {
-          geom.setAttribute('color', new THREE.BufferAttribute(g.colors8, 4, true));
-        } else if (g.colors) {
-          const srcColors = g.colors;
-            const vertCount = srcColors.length / 3;
-            const c8 = new Uint8Array(vertCount * 4);
-            for (let v = 0; v < vertCount; v++) {
-              let r = srcColors[v*3+0], g1 = srcColors[v*3+1], b = srcColors[v*3+2];
-              if (!Number.isFinite(r) || !Number.isFinite(g1) || !Number.isFinite(b)) { r = g1 = b = 1; }
-              c8[v*4+0] = (r * 255) & 255;
-              c8[v*4+1] = (g1 * 255) & 255;
-              c8[v*4+2] = (b * 255) & 255;
-              c8[v*4+3] = 255;
-            }
-            geom.setAttribute('color', new THREE.BufferAttribute(c8, 4, true));
-        } else {
-          const vertCount = g.positions.length / 3;
-          const c8 = new Uint8Array(vertCount * 4);
-          for (let v = 0; v < vertCount; v++) { c8[v*4+0]=c8[v*4+1]=c8[v*4+2]=c8[v*4+3]=255; }
-          geom.setAttribute('color', new THREE.BufferAttribute(c8, 4, true));
-        }
-
-        if (g.normals) geom.setAttribute('normal', new THREE.BufferAttribute(g.normals, 3));
-        geom.setIndex(new THREE.BufferAttribute(g.indices, 1));
-
-        // Fast bounds (avoid computeBoundingSphere per chunk)
-        if (g.bounds) {
-          const min = new THREE.Vector3(g.bounds.min[0], g.bounds.min[1], g.bounds.min[2]);
-          const max = new THREE.Vector3(g.bounds.max[0], g.bounds.max[1], g.bounds.max[2]);
-          geom.boundingBox = new THREE.Box3(min, max);
-          const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
-          const radius = min.distanceTo(max) * 0.5;
-          geom.boundingSphere = new THREE.Sphere(center, radius);
-        } else {
-          geom.computeBoundingBox?.();
-          geom.computeBoundingSphere?.();
-        }
+        // Bounds
+        const min = new THREE.Vector3().fromArray(geometry.bounds.min);
+        const max = new THREE.Vector3().fromArray(geometry.bounds.max);
+        geom.boundingBox = new THREE.Box3(min, max);
+        geom.boundingSphere = new THREE.Sphere(
+          min.clone().add(max).multiplyScalar(0.5),
+          min.distanceTo(max) * 0.5
+        );
 
         const mesh = new THREE.Mesh(
           geom,
           new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false })
         );
-        if (g.bounds) {
-          mesh.userData.chunkBounds = {
-            min: new THREE.Vector3(g.bounds.min[0], g.bounds.min[1], g.bounds.min[2]),
-            max: new THREE.Vector3(g.bounds.max[0], g.bounds.max[1], g.bounds.max[2])
-          };
+        mesh.userData.chunkBounds = geometry.bounds;
+
+        if (onChunk) {
+          onChunk(mesh);
+        } else {
+          chunks.push(mesh);
         }
-        group.add(mesh);
+        return;
       }
 
-      resolve({
-        voxelMesh : group,
-        voxelCount: result.voxelCount,
-        _voxelGrid: result.voxelGrid
-          ? {
-              ...result.voxelGrid,
-              bbox     : new THREE.Box3(
-                new THREE.Vector3().fromArray(result.voxelGrid.bbox.min),
-                new THREE.Vector3().fromArray(result.voxelGrid.bbox.max)
-              ),
-              gridSize : new THREE.Vector3(result.voxelGrid.gridSize.x, result.voxelGrid.gridSize.y, result.voxelGrid.gridSize.z),
-              unit     : new THREE.Vector3(result.voxelGrid.unit.x, result.voxelGrid.unit.y, result.voxelGrid.unit.z)
-            }
-          : null
-      });
+      if (status === 'done') {
+        worker.terminate();
+
+        // If streaming (onChunk provided), we resolve with null/empty group as chunks are already handled
+        // If not streaming, we return the group of all chunks
+        const group = new THREE.Group();
+        chunks.forEach(c => group.add(c));
+
+        resolve({
+          voxelMesh: group,
+          voxelCount: 0, // TODO: track count if needed
+          _voxelGrid: null // Grid export not fully supported in streaming mode yet
+        });
+      }
     };
 
     worker.onerror = err => { worker.terminate(); reject(err); };
 
-  const payload = serializeModel(model, { preRotateYDeg });
+    const payload = serializeModel(model, { preRotateYDeg });
 
     /* collect ArrayBuffers for zero-copy transfer */
     const transfers = [];
@@ -246,6 +228,6 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
     });
     payload.imageDatas.forEach(([uuid, idata]) => transfers.push(idata.data.buffer));
 
-        worker.postMessage({ modelData: payload, resolution, needGrid, method }, transfers);
+    worker.postMessage({ modelData: payload, resolution, needGrid, method }, transfers);
   });
 }

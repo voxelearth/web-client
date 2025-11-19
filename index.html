@@ -526,6 +526,17 @@
         <p class="text-xs text-white/60">Load and voxelize a specific area</p>
       </div>
       
+      <!-- Progress Bar (Hidden by default) -->
+      <div id="single-scene-progress-container" class="hidden mb-4 bg-white/5 rounded-lg p-3 border border-white/10">
+        <div class="flex justify-between text-xs mb-1">
+          <span class="text-white/90 font-medium">Voxelizing...</span>
+          <span id="single-scene-progress-text" class="text-blue-400 font-mono">0%</span>
+        </div>
+        <div class="h-1.5 bg-white/10 rounded-full overflow-hidden">
+          <div id="single-scene-progress-bar" class="h-full bg-blue-500 transition-all duration-200 ease-out" style="width: 0%"></div>
+        </div>
+      </div>
+
       <!-- Controls -->
       <div class="space-y-3">
         <div class="flex gap-2">

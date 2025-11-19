@@ -2,25 +2,29 @@
  * map.js – Google Photorealistic 3D-tiles ⇄ on-demand voxel / MC view
  * ===================================================================*/
 
-import * as THREE                   from 'three';
-import { OrbitControls }            from 'three/examples/jsm/controls/OrbitControls.js';
-import { WebGPURenderer }           from 'three/webgpu';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { WebGPURenderer } from 'three/webgpu';
 
-import { TilesRenderer }            from '3d-tiles-renderer';
-import { TileCompressionPlugin,
-         TilesFadePlugin,
-         GLTFExtensionsPlugin       } from '3d-tiles-renderer/plugins';
-import { DRACOLoader                } from 'three/examples/jsm/loaders/DRACOLoader.js';
+import { TilesRenderer } from '3d-tiles-renderer';
+import {
+  TileCompressionPlugin,
+  TilesFadePlugin,
+  GLTFExtensionsPlugin
+} from '3d-tiles-renderer/plugins';
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 
-import { voxelizeModel              } from './voxelize-model.js';
-import { initBlockData,
-         assignVoxelsToBlocks,
-         applyAtlasToExistingVoxelMesh,
-         restoreVoxelOriginalMaterial,
-         setMinecraftBrightnessBias,
-         getMinecraftBrightnessBias } from './assignToBlocksForGLB.js';
-import { SingleSceneViewer          } from './SingleSceneViewer.js';
-import { SingleSceneFetcher         } from './SingleSceneFetcher.js';
+import { voxelizeModel } from './voxelize-model.js';
+import {
+  initBlockData,
+  assignVoxelsToBlocks,
+  applyAtlasToExistingVoxelMesh,
+  restoreVoxelOriginalMaterial,
+  setMinecraftBrightnessBias,
+  getMinecraftBrightnessBias
+} from './assignToBlocksForGLB.js';
+import { SingleSceneViewer } from './SingleSceneViewer.js';
+import { SingleSceneFetcher } from './SingleSceneFetcher.js';
 
 const SESSION_MAX_AGE_MS = 2.5 * 60 * 60 * 1000;
 let __tilesSessionId = null;
@@ -49,7 +53,7 @@ if (typeof window !== 'undefined' && window.__photorealSession?.id) {
   const clearRootCache = async () => {
     try {
       navigator.serviceWorker?.controller?.postMessage({ type: 'CLEAR_ROOT_CACHE' });
-    } catch {}
+    } catch { }
   };
 
   window.fetch = async (input, opts = {}) => {
@@ -70,7 +74,7 @@ if (typeof window !== 'undefined' && window.__photorealSession?.id) {
           const retryOpts = { ...opts, cache: 'reload' };
           response = await realFetch(url.toString(), retryOpts);
         }
-      } catch {}
+      } catch { }
     }
     return response;
   };
@@ -83,7 +87,7 @@ let __mcInit;
 async function ensureMinecraftReady() {
   if (!__mcInit) {
     __mcInit = (async () => {
-      try { await initBlockData?.(); } catch {}
+      try { await initBlockData?.(); } catch { }
     })();
   }
   return __mcInit;
@@ -95,26 +99,26 @@ class HUD {
     // Debug: check what elements we can find
     console.log('DOM ready state:', document.readyState);
     console.log('Body children:', document.body?.children?.length);
-    
+
     // Settings menu popup
-    const menu         = document.querySelector('#settings-menu');
+    const menu = document.querySelector('#settings-menu');
     const composerPlus = document.querySelector('#composer-plus');
-    const closeMenu    = document.querySelector('#menu-close');
-    
+    const closeMenu = document.querySelector('#menu-close');
+
     // Voxelization methods menu
     const voxelMethodsMenu = document.querySelector('#voxel-methods-menu');
-    const voxelMethodsBtn  = document.querySelector('#voxel-methods-btn');
+    const voxelMethodsBtn = document.querySelector('#voxel-methods-btn');
     const voxelMethodsBack = document.querySelector('#voxel-methods-back');
     const voxelMethodsClose = document.querySelector('#voxel-methods-close');
 
-    console.log('Elements found:', { 
+    console.log('Elements found:', {
       menu: !!menu, composerPlus: !!composerPlus, closeMenu: !!closeMenu,
       voxelMethodsMenu: !!voxelMethodsMenu, voxelMethodsBtn: !!voxelMethodsBtn, voxelMethodsBack: !!voxelMethodsBack, voxelMethodsClose: !!voxelMethodsClose
     });
 
-  // Single Scene mini-map handles (populated in _initializeSingleSceneMap)
-  this._singleMap = null;
-  this._singleMapMarker = null;
+    // Single Scene mini-map handles (populated in _initializeSingleSceneMap)
+    this._singleMap = null;
+    this._singleMapMarker = null;
 
     if (!menu || !composerPlus || !closeMenu) {
       console.error('Missing menu elements:', { menu, composerPlus, closeMenu });
@@ -123,17 +127,17 @@ class HUD {
       return;
     }
 
-    const openMenu          = () => { 
+    const openMenu = () => {
       console.log('Opening menu');
-      menu.classList.remove('hidden'); 
+      menu.classList.remove('hidden');
       voxelMethodsMenu?.classList.add('hidden');
     };
-    const hideMenu          = () => { 
+    const hideMenu = () => {
       console.log('Closing menu');
-      menu.classList.add('hidden'); 
+      menu.classList.add('hidden');
       voxelMethodsMenu?.classList.add('hidden');
     };
-    const openVoxelMethods  = () => {
+    const openVoxelMethods = () => {
       console.log('Opening voxel methods menu');
       menu?.classList.add('hidden');
       voxelMethodsMenu?.classList.remove('hidden');
@@ -147,7 +151,7 @@ class HUD {
       voxelMethodsMenu?.classList.add('hidden');
       menu?.classList.remove('hidden');
     };
-    
+
     // Add event listeners with proper event handling
     composerPlus.addEventListener('click', (e) => {
       e.preventDefault();
@@ -159,7 +163,7 @@ class HUD {
         hideMenu();
       }
     });
-    
+
     closeMenu.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -193,10 +197,10 @@ class HUD {
 
     // Close menus when clicking outside
     document.addEventListener('click', (e) => {
-      if (!menu.contains(e.target) && 
-          !voxelMethodsMenu?.contains(e.target) &&
-          e.target !== composerPlus && 
-          !composerPlus.contains(e.target)) {
+      if (!menu.contains(e.target) &&
+        !voxelMethodsMenu?.contains(e.target) &&
+        e.target !== composerPlus &&
+        !composerPlus.contains(e.target)) {
         hideMenu();
       }
     });
@@ -228,7 +232,7 @@ class HUD {
   /** Mirror global Vox/Minecraft state into Single Scene.
    *  Rebuild when MC turns on so atlas bakes pre-transform (no grey / misalign). */
   async syncSingleSceneToGlobalVoxState(forceRebuild = false) {
-    const viewer    = window.singleSceneViewer;
+    const viewer = window.singleSceneViewer;
     const container = viewer?.tilesContainer;
     if (!viewer || !container) return;
 
@@ -239,7 +243,8 @@ class HUD {
     const res = this.getSingleSceneRes();
 
     if (!state.vox) {
-      if (vox) { try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch {}
+      if (vox) {
+        try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch { }
       }
       return;
     }
@@ -257,7 +262,7 @@ class HUD {
       }
     } else {
       // MC off → restore vertex colors; keep geometry
-      try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch {}
+      try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch { }
     }
   }
 
@@ -274,7 +279,7 @@ class HUD {
     modelPickerBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const isHidden = modelPickerMenu.classList.contains('hidden');
-      
+
       if (isHidden) {
         modelPickerMenu.classList.remove('hidden');
         modelPickerArrow.style.transform = 'rotate(180deg)';
@@ -297,15 +302,15 @@ class HUD {
       option.addEventListener('click', (e) => {
         e.preventDefault();
         const selectedModel = option.dataset.model;
-        
+
         // Update UI selection state
         modelOptions.forEach(opt => opt.classList.remove('selected'));
         option.classList.add('selected');
-        
+
         // Close dropdown
         modelPickerMenu.classList.add('hidden');
         modelPickerArrow.style.transform = 'rotate(0deg)';
-        
+
         // Handle model switch
         this.switchToModel(selectedModel);
       });
@@ -317,13 +322,13 @@ class HUD {
   switchToModel(modelType) {
     const singleScenePanel = document.querySelector('#single-scene-panel');
     const modelPickerBtn = document.querySelector('#model-picker-btn');
-    
+
     if (modelType === 'single-scene') {
       // Hide the main 3D tiles and show single scene interface
       this.setStatus('Single Scene Mode - Ready');
       singleScenePanel.classList.remove('hidden');
-  this._scheduleMiniMapInvalidate?.();
-      
+      this._scheduleMiniMapInvalidate?.();
+
       // Update model picker button text
       if (modelPickerBtn) {
         const titleEl = modelPickerBtn.querySelector('.text-sm.font-medium');
@@ -331,24 +336,24 @@ class HUD {
         if (titleEl) titleEl.textContent = 'Single Scene';
         if (subtitleEl) subtitleEl.textContent = 'export specific area';
       }
-      
+
       // Clean up existing tiles if any
       if (window.tiles) {
         scene.remove(window.tiles.group);
         window.tiles.dispose();
         window.tiles = null;
       }
-      
+
       // Initialize single scene viewer with empty scene immediately
       this.initializeSingleSceneViewer();
       // Mirror global Vox/MC state on entry (set initial vis/materials)
       this.syncSingleSceneToGlobalVoxState(false);
-      
+
     } else {
       // Switch back to voxel earth mode
       singleScenePanel.classList.add('hidden');
       this.setStatus('Voxel Earth Mode');
-      
+
       // Update model picker button text
       if (modelPickerBtn) {
         const titleEl = modelPickerBtn.querySelector('.text-sm.font-medium');
@@ -356,21 +361,21 @@ class HUD {
         if (titleEl) titleEl.textContent = 'Voxel Earth 1.0';
         if (subtitleEl) subtitleEl.textContent = 'with Google Earth tiles';
       }
-      
+
       // Clean up single scene viewer if exists
       if (window.singleSceneViewer) {
         window.singleSceneViewer.destroy();
         window.singleSceneViewer = null;
       }
-      
+
       // Reinitialize main tiles if we have an API key
       const key = this.getKey();
       if (key) {
         const [lat, lon] = this.getLatLon();
         const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
-  this.setStatus('Loading tiles...');
-  ensureTiles(root, key);
-  retargetTiles(lat, lon);
+        this.setStatus('Loading tiles...');
+        ensureTiles(root, key);
+        retargetTiles(lat, lon);
       }
     }
   }
@@ -379,8 +384,8 @@ class HUD {
     // Create a basic SingleSceneViewer instance for the empty scene
     if (!window.singleSceneViewer) {
       window.singleSceneViewer = new SingleSceneViewer();
-  // Reflect initial debug tiles state if toggle exists
-  document.querySelector('#single-scene-debug-tiles')?.dispatchEvent(new Event('change'));
+      // Reflect initial debug tiles state if toggle exists
+      document.querySelector('#single-scene-debug-tiles')?.dispatchEvent(new Event('change'));
     }
   }
 
@@ -390,19 +395,19 @@ class HUD {
   }
 
   _initializeSingleSceneControls() {
-  const fetchBtn = document.querySelector('#single-scene-fetch');
-  const downloadBtn = document.querySelector('#single-scene-download');
-  const debugTilesToggle = document.querySelector('#single-scene-debug-tiles');
-  const radiusSlider = document.querySelector('#single-scene-radius');
-  const rotSlider = document.querySelector('#single-scene-rot');
-  const tileSlider = document.querySelector('#single-scene-tile-slider');
-  const resPills = document.querySelectorAll('.single-scene-res-pill');
-  const resFine = document.querySelector('#single-scene-res-fine');
-  const resInput = document.querySelector('#single-scene-res-input');
-  const sseSlider = document.querySelector('#single-scene-sse');
-  const sseValue  = document.querySelector('#single-scene-sse-value');
-  const radiusValue = document.querySelector('#single-scene-radius-value');
-  const rotValue = document.querySelector('#single-scene-rot-value');
+    const fetchBtn = document.querySelector('#single-scene-fetch');
+    const downloadBtn = document.querySelector('#single-scene-download');
+    const debugTilesToggle = document.querySelector('#single-scene-debug-tiles');
+    const radiusSlider = document.querySelector('#single-scene-radius');
+    const rotSlider = document.querySelector('#single-scene-rot');
+    const tileSlider = document.querySelector('#single-scene-tile-slider');
+    const resPills = document.querySelectorAll('.single-scene-res-pill');
+    const resFine = document.querySelector('#single-scene-res-fine');
+    const resInput = document.querySelector('#single-scene-res-input');
+    const sseSlider = document.querySelector('#single-scene-sse');
+    const sseValue = document.querySelector('#single-scene-sse-value');
+    const radiusValue = document.querySelector('#single-scene-radius-value');
+    const rotValue = document.querySelector('#single-scene-rot-value');
 
     // Unhide rows if present (SSE + Debug)
     document.querySelector('#single-scene-sse-row')?.classList.remove('hidden');
@@ -472,7 +477,7 @@ class HUD {
     bindSliderToNumericInput(radiusSlider, radiusValue, { valueClamp: clampRadiusValue });
     bindSliderToNumericInput(rotSlider, rotValue, { min: 0, max: 360 });
 
-    const presetResValues = [32,64,128,256];
+    const presetResValues = [32, 64, 128, 256];
     const clampResolution = (val) => {
       const num = parseInt(val, 10);
       if (!Number.isFinite(num)) return 64;
@@ -523,7 +528,7 @@ class HUD {
     });
 
     if (resFine) {
-      const debouncedRebuild = ((fn, ms)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; })(async res=>{
+      const debouncedRebuild = ((fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; })(async res => {
         if (state.vox && window.singleSceneViewer?.tilesContainer) {
           await this._rebuildSingleSceneVoxels(res);
         }
@@ -548,7 +553,7 @@ class HUD {
       });
     }
 
-  // No local vox toggle; Single Scene mirrors global state
+    // No local vox toggle; Single Scene mirrors global state
 
     // Fetch tiles button
     if (fetchBtn) {
@@ -571,8 +576,8 @@ class HUD {
         // Get SSE from the slider (default 20)
         const sse = sseInput ? parseInt(sseInput.value) || 20 : 20;
 
-  // Radius in meters (controls how large an area to fetch)
-    const radiusM = radiusSlider ? clampRadiusValue(radiusSlider.value) : 500;
+        // Radius in meters (controls how large an area to fetch)
+        const radiusM = radiusSlider ? clampRadiusValue(radiusSlider.value) : 500;
 
         if (!apiKey) {
           this._showSingleSceneLog();
@@ -693,14 +698,14 @@ class HUD {
 
     // Single-Scene now mirrors global MC/vox; remove local MC toggle and handlers
 
-  // ── Export row (format select + button)
-  let exportRow = document.querySelector('#single-scene-export-row');
-  if (!exportRow) {
-    const panel = document.querySelector('#single-scene-panel') || document.body;
-    exportRow = document.createElement('div');
-    exportRow.id = 'single-scene-export-row';
-    exportRow.style.cssText = 'display:flex;align-items:center;gap:.5rem;margin:.5rem 0;';
-    exportRow.innerHTML = `
+    // ── Export row (format select + button)
+    let exportRow = document.querySelector('#single-scene-export-row');
+    if (!exportRow) {
+      const panel = document.querySelector('#single-scene-panel') || document.body;
+      exportRow = document.createElement('div');
+      exportRow.id = 'single-scene-export-row';
+      exportRow.style.cssText = 'display:flex;align-items:center;gap:.5rem;margin:.5rem 0;';
+      exportRow.innerHTML = `
       <select id="single-scene-export-format" style="padding:.25rem;">
         <option value="mcfunction">mcfunction (vanilla)</option>
         <option value="palette.json">palette JSON (.schem-ready)</option>
@@ -710,76 +715,76 @@ class HUD {
       </select>
       <button id="single-scene-export-btn" style="padding:.35rem .6rem;">Export</button>
     `;
-    panel.appendChild(exportRow);
-  }
-  const exportBtn = exportRow.querySelector('#single-scene-export-btn');
-  const exportFmt = exportRow.querySelector('#single-scene-export-format');
-
-  const downloadText = (filename, text) => {
-    const blob = new Blob([text], { type:'text/plain' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    a.click();
-    setTimeout(()=>URL.revokeObjectURL(a.href), 250);
-  };
-
-  const complianceChecks = Array.from(document.querySelectorAll('[data-single-scene-compliance]'));
-  const applyComplianceState = () => {
-    const ready = complianceChecks.every(cb => cb.checked);
-    [exportBtn, exportGlbBtn].forEach(btn => {
-      if (!btn) return;
-      btn.disabled = !ready;
-    });
-  };
-  complianceChecks.forEach(cb => cb.addEventListener('change', applyComplianceState));
-  applyComplianceState();
-
-  exportBtn.addEventListener('click', async () => {
-    if (exportBtn.disabled) {
-      this._logSingleScene?.('Confirm the export requirements first.');
-      return;
+      panel.appendChild(exportRow);
     }
-    const viewer = window.singleSceneViewer;
-    const vgrid  = viewer?.voxelizer?._voxelGridRebased || viewer?.voxelizer?._voxelGrid;
-    if (!viewer || !vgrid) { this._logSingleScene('❌ No voxel grid to export'); return; }
+    const exportBtn = exportRow.querySelector('#single-scene-export-btn');
+    const exportFmt = exportRow.querySelector('#single-scene-export-format');
 
-    try {
-      const mod = await import('./assignToBlocksForGLB.js');
-      await ensureMinecraftReady();          // map.js helper (already in your file)
-      await mod.initBlockData?.();           // extra guard; no-op if already ready
-      const dense = mod.buildBlockGrid(vgrid); // palette + dense indices
-      const fmt  = exportFmt.value;
-  if (fmt === 'mcfunction') {
-        const txt = mod.generateMcfunction(dense, { x:0,y:0,z:0 });
-        downloadText('structure.mcfunction', txt);
-        this._logSingleScene('✅ Exported mcfunction');
-      } else if (fmt === 'nbt') {
-        const bytes = await mod.writeStructureNBT(dense, { dataVersion: 3955 });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([bytes], { type:'application/octet-stream' }));
-        a.download = 'structure.nbt'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),250);
-        this._logSingleScene('✅ Exported Structure .nbt');
-      } else if (fmt === 'schem') {
-        const bytes = await mod.writeSpongeSchem(dense, { mcVersion: '1.20' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([bytes], { type:'application/octet-stream' }));
-        a.download = 'structure.schem'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),250);
-        this._logSingleScene('✅ Exported .schem');
-      } else if (fmt === 'schematic') {
-        const bytes = await mod.writeMCEditSchematic(dense);
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([bytes], { type:'application/octet-stream' }));
-        a.download = 'structure.schematic'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),250);
-        this._logSingleScene('✅ Exported legacy .schematic');
+    const downloadText = (filename, text) => {
+      const blob = new Blob([text], { type: 'text/plain' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 250);
+    };
+
+    const complianceChecks = Array.from(document.querySelectorAll('[data-single-scene-compliance]'));
+    const applyComplianceState = () => {
+      const ready = complianceChecks.every(cb => cb.checked);
+      [exportBtn, exportGlbBtn].forEach(btn => {
+        if (!btn) return;
+        btn.disabled = !ready;
+      });
+    };
+    complianceChecks.forEach(cb => cb.addEventListener('change', applyComplianceState));
+    applyComplianceState();
+
+    exportBtn.addEventListener('click', async () => {
+      if (exportBtn.disabled) {
+        this._logSingleScene?.('Confirm the export requirements first.');
+        return;
       }
-    } catch (e) {
-      console.error(e);
-      this._logSingleScene('❌ Export failed');
-    }
-  });
+      const viewer = window.singleSceneViewer;
+      const vgrid = viewer?.voxelizer?._voxelGridRebased || viewer?.voxelizer?._voxelGrid;
+      if (!viewer || !vgrid) { this._logSingleScene('❌ No voxel grid to export'); return; }
 
-  // No duplicate toggle handler — visibility logic handled by the single toggle above
+      try {
+        const mod = await import('./assignToBlocksForGLB.js');
+        await ensureMinecraftReady();          // map.js helper (already in your file)
+        await mod.initBlockData?.();           // extra guard; no-op if already ready
+        const dense = mod.buildBlockGrid(vgrid); // palette + dense indices
+        const fmt = exportFmt.value;
+        if (fmt === 'mcfunction') {
+          const txt = mod.generateMcfunction(dense, { x: 0, y: 0, z: 0 });
+          downloadText('structure.mcfunction', txt);
+          this._logSingleScene('✅ Exported mcfunction');
+        } else if (fmt === 'nbt') {
+          const bytes = await mod.writeStructureNBT(dense, { dataVersion: 3955 });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+          a.download = 'structure.nbt'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 250);
+          this._logSingleScene('✅ Exported Structure .nbt');
+        } else if (fmt === 'schem') {
+          const bytes = await mod.writeSpongeSchem(dense, { mcVersion: '1.20' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+          a.download = 'structure.schem'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 250);
+          this._logSingleScene('✅ Exported .schem');
+        } else if (fmt === 'schematic') {
+          const bytes = await mod.writeMCEditSchematic(dense);
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+          a.download = 'structure.schematic'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 250);
+          this._logSingleScene('✅ Exported legacy .schematic');
+        }
+      } catch (e) {
+        console.error(e);
+        this._logSingleScene('❌ Export failed');
+      }
+    });
+
+    // No duplicate toggle handler — visibility logic handled by the single toggle above
   }
 
   _initializeSingleSceneMap() {
@@ -793,7 +798,7 @@ class HUD {
       }).addTo(map);
 
       let marker = L.marker([lat || 40.6891, lon || -74.0446]).addTo(map);
-  map.whenReady(() => this._scheduleMiniMapInvalidate());
+      map.whenReady(() => this._scheduleMiniMapInvalidate());
 
       map.on('click', (e) => {
         const { lat, lng } = e.latlng;
@@ -811,9 +816,9 @@ class HUD {
         if (coordsInput) coordsInput.value = `${c.lat.toFixed(6)},${c.lng.toFixed(6)}`;
       });
 
-  // Save handles for later sync
-  this._singleMap = map;
-  this._singleMapMarker = marker;
+      // Save handles for later sync
+      this._singleMap = map;
+      this._singleMapMarker = marker;
       // Observers for size/visibility changes
       this._installMiniMapObservers(map, document.querySelector('#single-scene-panel'), mapContainer);
     } catch (error) {
@@ -826,7 +831,7 @@ class HUD {
     if (!this._singleMap) return;
     cancelAnimationFrame(this._miniMapInvalidateRAF);
     this._miniMapInvalidateRAF = requestAnimationFrame(() => {
-      try { this._singleMap.invalidateSize(true); } catch {}
+      try { this._singleMap.invalidateSize(true); } catch { }
     });
   }
 
@@ -838,7 +843,7 @@ class HUD {
       this._miniMapResizeObs = new ResizeObserver(() => this._scheduleMiniMapInvalidate());
       if (panelEl) this._miniMapResizeObs.observe(panelEl);
       if (containerEl) this._miniMapResizeObs.observe(containerEl);
-    } catch {}
+    } catch { }
 
     // MutationObserver for class changes (.hidden toggle)
     if (panelEl) {
@@ -906,6 +911,18 @@ class HUD {
     this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
     const myVersion = this._ssVoxVersion;
 
+    // UI Elements for Progress
+    const progressContainer = document.querySelector('#single-scene-progress-container');
+    const progressBar = document.querySelector('#single-scene-progress-bar');
+    const progressText = document.querySelector('#single-scene-progress-text');
+
+    // Reset & Show Progress
+    if (progressContainer) {
+      progressContainer.classList.remove('hidden');
+      if (progressBar) progressBar.style.width = '0%';
+      if (progressText) progressText.textContent = '0%';
+    }
+
     // Remove old voxels
     const old = container.getObjectByName('singleSceneVoxels');
     if (old) {
@@ -936,14 +953,34 @@ class HUD {
       const diag = box.getSize(new THREE.Vector3()).length();
       if (Number.isFinite(diag) && diag > 0) childDiags.push(diag);
     }
-    childDiags.sort((a,b)=>a-b);
-    const medianDiag = childDiags.length ? childDiags[Math.floor(childDiags.length/2)] : maxDim;
+    childDiags.sort((a, b) => a - b);
+    const medianDiag = childDiags.length ? childDiags[Math.floor(childDiags.length / 2)] : maxDim;
     const tileDiag = Math.max(medianDiag, 1e-3);
     const densitySetting = Math.max(1, Number(resolution) || 64);
     const tilesAcross = Math.max(1, maxDim / tileDiag);
     const computedResolution = Math.max(8, Math.round(densitySetting * tilesAcross));
     const approxVoxelMeters = tileDiag / densitySetting;
     this._logSingleScene(`?? (Re)voxelizing @ ${computedResolution} (~${approxVoxelMeters.toFixed(2)} m voxels per tile).`);
+
+    // Prepare counter-rotation so only sampling orientation changes
+    const pivot = containerBox.getCenter(new THREE.Vector3());
+    const Tneg = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
+    const RyInv = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(-rotDeg));
+    const Tpos = new THREE.Matrix4().makeTranslation(pivot.x, pivot.y, pivot.z);
+    const counterM = new THREE.Matrix4().multiplyMatrices(Tpos, new THREE.Matrix4().multiplyMatrices(RyInv, Tneg));
+
+    // world -> container-local + attach (after counter-rotation)
+    const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
+    // Combined matrix that we apply to geometry; use same to rebase voxelGrid
+    const Mreb = new THREE.Matrix4().multiplyMatrices(inv, counterM);
+
+    // Create group for new voxels immediately
+    const voxelGroup = new THREE.Group();
+    voxelGroup.name = 'singleSceneVoxels';
+    voxelGroup.matrixAutoUpdate = false;
+    voxelGroup.userData.resolution = resolution;
+    container.add(voxelGroup);
+    viewer.voxelMeshes = [voxelGroup];
 
     let vox;
     try {
@@ -953,105 +990,90 @@ class HUD {
         scene: viewer.scene,
         resolution: computedResolution,
         needGrid: true,
-        preRotateYDeg: rotDeg
+        preRotateYDeg: rotDeg,
+        onProgress: (processed, total) => {
+          if (myVersion !== this._ssVoxVersion) return;
+          const pct = Math.round((processed / total) * 100);
+
+          // Update Visual Progress Bar
+          if (progressBar) progressBar.style.width = `${pct}%`;
+          if (progressText) progressText.textContent = `${pct}%`;
+
+          this._logSingleScene(`?? Voxelizing... ${pct}% (${processed}/${total} chunks)`);
+        },
+        onChunk: (chunkMesh) => {
+          if (myVersion !== this._ssVoxVersion) return;
+
+          // Apply transforms to chunk immediately
+          if (chunkMesh.geometry) {
+            if (rotDeg !== 0) chunkMesh.geometry.applyMatrix4(counterM);
+            chunkMesh.geometry.applyMatrix4(inv);
+            chunkMesh.geometry.computeBoundingBox?.();
+            chunkMesh.geometry.computeBoundingSphere?.();
+          }
+          chunkMesh.position.set(0, 0, 0);
+          chunkMesh.rotation.set(0, 0, 0);
+          chunkMesh.scale.set(1, 1, 1);
+          chunkMesh.updateMatrix();
+          chunkMesh.frustumCulled = false; // or true if bounds are good
+          try { chunkMesh.layers.set(1); } catch { }
+
+          // Preserve original material
+          chunkMesh.userData.origMat = chunkMesh.material;
+
+          voxelGroup.add(chunkMesh);
+          // Force update to show progress
+          try { voxelGroup.updateMatrixWorld(true); } catch { }
+        }
       });
     } catch (e) {
       this._logSingleScene(`? Voxelization error: ${e?.message || e}`);
+      if (progressContainer) progressContainer.classList.add('hidden');
       return;
     }
 
     if (myVersion !== this._ssVoxVersion) {
       // stale
-      vox?.voxelMesh?.traverse(n => {
-        if (n.isMesh) { n.geometry?.dispose(); (Array.isArray(n.material)?n.material:[n.material]).forEach(m=>m?.dispose?.()); }
+      voxelGroup.traverse(n => {
+        if (n.isMesh) { n.geometry?.dispose(); (Array.isArray(n.material) ? n.material : [n.material]).forEach(m => m?.dispose?.()); }
       });
+      container.remove(voxelGroup);
       return;
     }
 
-    if (!vox || !vox.voxelMesh) {
-      this._logSingleScene('? Voxelizer returned no geometry');
-      return;
-    }
-    const voxelMesh = vox.voxelMesh;
-    const rawGrid   = vox._voxelGrid; // original grid in the mesh’s creation frame
+    // Finalize
+    const rawGrid = vox._voxelGrid; // might be null in streaming mode for now
 
-    // Preserve original vertex-color material BEFORE any MC swap
-    voxelMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
-
-    // If MC is on, bake atlas NOW while the mesh & grid still share a frame
+    // If MC is on, bake atlas (Note: MC baking might need updates for streaming if we want it to work incrementally, 
+    // but for now we do it at the end if we have a grid, or skip it if grid is missing)
     const wantMC = !!(typeof state === 'object' ? state.mc : (window.state && window.state.mc));
     if (wantMC && rawGrid) {
       try {
         await ensureMinecraftReady();
-        voxelMesh.userData.__mcAllowApply = true;
-        await applyAtlasToExistingVoxelMesh(voxelMesh, rawGrid);
-        voxelMesh.userData.__mcApplied = true;
+        voxelGroup.userData.__mcAllowApply = true;
+        await applyAtlasToExistingVoxelMesh(voxelGroup, rawGrid);
+        voxelGroup.userData.__mcApplied = true;
       } catch (e) {
         console.warn('MC apply (pre-transform) failed:', e);
       }
-    } else {
-      // keep vertex-color material
-      voxelMesh.traverse(n => { if (n.isMesh) n.material = n.userData.origMat; });
     }
 
-    // Prepare counter-rotation so only sampling orientation changes
-    const pivot = containerBox.getCenter(new THREE.Vector3());
-    const Tneg  = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
-    const RyInv = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(-rotDeg));
-    const Tpos  = new THREE.Matrix4().makeTranslation( pivot.x,  pivot.y,  pivot.z);
-    const counterM = new THREE.Matrix4().multiplyMatrices(Tpos, new THREE.Matrix4().multiplyMatrices(RyInv, Tneg));
+    // Respect global voxel visibility
+    this._setSingleSceneVisibility(!!state.vox);
 
-  // world -> container-local + attach (after counter-rotation)
-  const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
-  // Combined matrix that we apply to geometry; use same to rebase voxelGrid
-  const Mreb = new THREE.Matrix4().multiplyMatrices(inv, counterM);
-    voxelMesh.traverse(node => {
-      if (node.isMesh && node.geometry) {
-        if (rotDeg !== 0) node.geometry.applyMatrix4(counterM); // undo visual rotation
-        node.geometry.applyMatrix4(inv);
-        node.position.set(0,0,0);
-        node.rotation.set(0,0,0);
-        node.scale.set(1,1,1);
-        node.updateMatrix();
-        node.frustumCulled = false;
-        try {
-          node.geometry.computeBoundingBox?.();
-          node.geometry.computeBoundingSphere?.();
-        } catch {}
-        try { node.layers.set(1); } catch {}
+    this._logSingleScene(`✅ Voxels ready @ ${resolution}`);
+
+    // Hide progress bar after short delay
+    setTimeout(() => {
+      if (myVersion === this._ssVoxVersion && progressContainer) {
+        progressContainer.classList.add('hidden');
       }
-    });
-
-    voxelMesh.matrixAutoUpdate = false;
-    voxelMesh.name = 'singleSceneVoxels';
-    voxelMesh.userData.resolution = resolution;
-    container.add(voxelMesh);
-  // Ensure transforms are up-to-date before any material/shader compilation
-  try { container.updateMatrixWorld(true); } catch {}
-  try { voxelMesh.updateMatrixWorld(true); } catch {}
-    viewer.voxelMeshes = [voxelMesh];
-    viewer.voxelizer = vox;
-
-    // Save a voxelGrid that matches the transformed geometry
-    try {
-      const rebasedGrid = rawGrid ? rebaseVoxelGrid(rawGrid, Mreb) : null;
-      viewer.voxelizer._voxelGridRebased = rebasedGrid;
-    } catch (e) {
-      console.warn('Failed to compute rebased voxelGrid:', e);
-      viewer.voxelizer._voxelGridRebased = rawGrid || null;
-    }
-
-    // Materials already set earlier; no additional MC swap here
-
-  // Respect global voxel visibility
-  this._setSingleSceneVisibility(!!state.vox);
-
-    this._logSingleScene(`✅ Voxels ready (${vox.voxelCount ?? '—'}) @ ${resolution}`);
+    }, 1500);
   }
 
   _initializeBasicElements() {
     // Elements
-    this.keyInput   = document.querySelector('#google-api-key');
+    this.keyInput = document.querySelector('#google-api-key');
     if (this.keyInput) {
       const saved = (localStorage.getItem('token') || '').trim();
       if (saved) this.keyInput.value = saved; // keep HTML default otherwise
@@ -1068,14 +1090,14 @@ class HUD {
       };
     }
 
-    this.coordsEl   = document.querySelector('#lat-lng');
-    this.sseEl      = document.querySelector('#sse');
-    this.status     = document.querySelector('#status-chip');
+    this.coordsEl = document.querySelector('#lat-lng');
+    this.sseEl = document.querySelector('#sse');
+    this.status = document.querySelector('#status-chip');
     this.footerHint = document.querySelector('#composer-hint');
 
     // Composer
-    this.search     = document.querySelector('#place-search');
-    this.sendBtn    = document.querySelector('#composer-send');
+    this.search = document.querySelector('#place-search');
+    this.sendBtn = document.querySelector('#composer-send');
 
     // Suggestions + search results  
     this.suggestions = document.querySelector('#suggestions .composer');
@@ -1084,11 +1106,11 @@ class HUD {
 
     // Vox controls (in drawer)
     this.toggleVox = document.querySelector('#toggle-vox');
-    this.toggleMC  = document.querySelector('#toggle-mc');
+    this.toggleMC = document.querySelector('#toggle-mc');
     this.debugImageryRow = document.querySelector('#debug-imagery-row');
     this.toggleDebugImagery = document.querySelector('#toggle-debug-imagery');
-    this.resPills  = [...document.querySelectorAll('.res-pill')];
-    this.resFine   = document.querySelector('#res-fine');
+    this.resPills = [...document.querySelectorAll('.res-pill')];
+    this.resFine = document.querySelector('#res-fine');
 
     // Voxelization method controls
     this.voxelMethodRadios = [...document.querySelectorAll('input[name="voxel-method"]')];
@@ -1114,29 +1136,29 @@ class HUD {
     this.setStatus('Ready');
   }
 
-  getKey()    { 
+  getKey() {
     if (this.keyInput && this.keyInput.value.trim()) {
       return this.keyInput.value.trim();
     }
     // Fallback to localStorage if input field is empty
     return localStorage.getItem('token') || '';
   }
-  getSSE()    { return this.sseEl ? +this.sseEl.value : 20; }
-  getLatLon() { 
-    return this.coordsEl ? this.coordsEl.value.split(',').map(Number) : [37.7749, -122.4194]; 
+  getSSE() { return this.sseEl ? +this.sseEl.value : 20; }
+  getLatLon() {
+    return this.coordsEl ? this.coordsEl.value.split(',').map(Number) : [37.7749, -122.4194];
   }
-  log()       {}
+  log() { }
   setLatLon([lat, lon]) {
     if (this.coordsEl) {
       this.coordsEl.value = `${lat.toFixed(4)},${lon.toFixed(4)}`;
       localStorage.setItem('coords', this.coordsEl.value);
     }
-  // Reflect into Single Scene mini-map & input
-  try { this._syncSingleSceneMiniMap(lat, lon); } catch {}
+    // Reflect into Single Scene mini-map & input
+    try { this._syncSingleSceneMiniMap(lat, lon); } catch { }
   }
-  setStatus(t) { 
-    if (this.status) this.status.textContent = t; 
-    
+  setStatus(t) {
+    if (this.status) this.status.textContent = t;
+
     // Update footer citation based on status
     if (this.footerHint) {
       if (t.includes('Loading') || t.includes('Streaming')) {
@@ -1154,13 +1176,13 @@ class HUD {
   _wireVoxUI() {
     const highlightResPill = (val) => {
       document.querySelectorAll('.res-pill').forEach(b => {
-        b.classList.remove('bg-white','text-neutral-900');
+        b.classList.remove('bg-white', 'text-neutral-900');
         b.classList.add('opacity-80');
       });
       const active = document.querySelector(`.res-pill[data-res="${val}"]`);
       if (active) {
         active.classList.remove('opacity-80');
-        active.classList.add('bg-white','text-neutral-900');
+        active.classList.add('bg-white', 'text-neutral-900');
       }
     };
 
@@ -1264,14 +1286,14 @@ class HUD {
   /* ─── Suggestions (chips above composer) ─────────────────────── */
   _renderSuggestions() {
     const PICKS = [
-      { label:'Paris',         lat:48.85837, lon:2.29448, view:{height:360, tilt:45, heading:220} },
-      { label:'New York',      lat:40.75800, lon:-73.98550, view:{height:360, tilt:48, heading: 30} },
-      { label:'Tokyo',         lat:35.65858, lon:139.74543, view:{height:340, tilt:47, heading:-20} },
-      { label:'Sydney',        lat:-33.85678, lon:151.21530, view:{height:360, tilt:43, heading:120} },
-      { label:'Cairo',         lat:29.97923, lon:31.13420,  view:{height:420, tilt:38, heading:-140} },
-      { label:'Rio de Janeiro',lat:-22.95192, lon:-43.21049,view:{height:2840, tilt:43, heading:-20} },
-      { label:'San Francisco', lat:37.81993, lon:-122.47825,view:{height:420, tilt:41, heading:  0} },
-      { label:'London',        lat:51.50073, lon:-0.12463,  view:{height:340, tilt:46, heading:90} },
+      { label: 'Paris', lat: 48.85837, lon: 2.29448, view: { height: 360, tilt: 45, heading: 220 } },
+      { label: 'New York', lat: 40.75800, lon: -73.98550, view: { height: 360, tilt: 48, heading: 30 } },
+      { label: 'Tokyo', lat: 35.65858, lon: 139.74543, view: { height: 340, tilt: 47, heading: -20 } },
+      { label: 'Sydney', lat: -33.85678, lon: 151.21530, view: { height: 360, tilt: 43, heading: 120 } },
+      { label: 'Cairo', lat: 29.97923, lon: 31.13420, view: { height: 420, tilt: 38, heading: -140 } },
+      { label: 'Rio de Janeiro', lat: -22.95192, lon: -43.21049, view: { height: 2840, tilt: 43, heading: -20 } },
+      { label: 'San Francisco', lat: 37.81993, lon: -122.47825, view: { height: 420, tilt: 41, heading: 0 } },
+      { label: 'London', lat: 51.50073, lon: -0.12463, view: { height: 340, tilt: 46, heading: 90 } },
     ];
     this.suggestions.innerHTML = '';
     for (const p of PICKS) {
@@ -1351,7 +1373,7 @@ class HUD {
     };
     document.addEventListener('click', outsideClick);
 
-    const deb = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
+    const deb = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
     this.search.addEventListener('input', deb(() => {
       const q = this.search.value.trim();
       if (q.length < 3) return this._showResults(false);
@@ -1369,13 +1391,13 @@ class HUD {
         el.className = 'w-full text-left px-3 py-2 hover:bg-white/5 text-sm break-words';
         el.innerHTML = `<div class="font-medium truncate pr-2">${it.name}</div>
                         <div class="text-xs opacity-70 truncate pr-2">${it.addr}</div>`;
-        el.onclick = () => { 
+        el.onclick = () => {
           // Update the search input field with the selected location name
           if (this.search) {
             this.search.value = it.name;
           }
-          this._goTo(it.lat, it.lon); 
-          this._showResults(false); 
+          this._goTo(it.lat, it.lon);
+          this._showResults(false);
         };
         list.appendChild(el);
       }
@@ -1390,12 +1412,12 @@ class HUD {
         const j = await r.json();
         if (j?.results?.length) {
           return render(j.results.map(f => ({
-            name:f.name, addr:[f.admin1,f.country].filter(Boolean).join(', '),
-            lat:f.latitude, lon:f.longitude
+            name: f.name, addr: [f.admin1, f.country].filter(Boolean).join(', '),
+            lat: f.latitude, lon: f.longitude
           })));
         }
       }
-    } catch {}
+    } catch { }
 
     // 2) OSM Nominatim (fallback)
     try {
@@ -1403,13 +1425,13 @@ class HUD {
       if (r2.ok) {
         const j2 = await r2.json();
         return render(j2.map(f => ({
-          name:f.display_name.split(',')[0],
-          addr:f.display_name,
+          name: f.display_name.split(',')[0],
+          addr: f.display_name,
           lat: parseFloat(f.lat),
           lon: parseFloat(f.lon)
         })));
       }
-    } catch {}
+    } catch { }
 
     render([]);
   }
@@ -1430,14 +1452,14 @@ class HUD {
     let freecamKeys = { w: false, a: false, s: false, d: false, shift: false, space: false };
     let freecamSpeed = 100; // units per second
     let lastFrameTime = performance.now();
-    
+
     // Mouse look variables for freecam
     let isMouseLocked = false;
     let mouseSensitivity = 0.002; // radians per pixel
     let yaw = 0; // horizontal rotation
     let pitch = 0; // vertical rotation
     let maxPitch = Math.PI / 2 - 0.1; // prevent gimbal lock
-    
+
     // Get control elements
     const cameraModeBtn = document.querySelector('#camera-mode-btn');
     const compassBtn = document.querySelector('#compass-btn');
@@ -1449,7 +1471,7 @@ class HUD {
 
     // Pointer lock for freecam mouse look
     const canvas = renderer.domElement;
-    
+
     const requestPointerLock = () => {
       if (cameraMode === 'freecam' && !isMouseLocked) {
         canvas.requestPointerLock();
@@ -1471,7 +1493,7 @@ class HUD {
       // Apply rotation to camera immediately
       if (camera) {
         camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
-        
+
         // Update controls target to maintain orbit mode compatibility
         if (controls) {
           const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
@@ -1530,10 +1552,10 @@ class HUD {
 
       // Check if any movement keys are pressed
       const hasMovement = freecamKeys.w || freecamKeys.a || freecamKeys.s || freecamKeys.d || freecamKeys.shift || freecamKeys.space;
-      
+
       if (hasMovement) {
         const speed = freecamSpeed * deltaTime * (freecamKeys.shift ? 3 : 1);
-        
+
         // Get camera direction vectors
         const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
         const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
@@ -1546,11 +1568,11 @@ class HUD {
         if (freecamKeys.d) movement.add(right.clone().multiplyScalar(speed));
         if (freecamKeys.a) movement.add(right.clone().multiplyScalar(-speed));
         if (freecamKeys.space) movement.add(up.clone().multiplyScalar(speed));
-        if (freecamKeys.shift && !freecamKeys.space) movement.add(up.clone().multiplyScalar(-speed/3));
+        if (freecamKeys.shift && !freecamKeys.space) movement.add(up.clone().multiplyScalar(-speed / 3));
 
         // Apply movement
         camera.position.add(movement);
-        
+
         // Update controls target to maintain orbit mode compatibility
         if (controls) {
           const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
@@ -1587,19 +1609,19 @@ class HUD {
           if (controls) {
             controls.enabled = false; // Disable orbit controls
           }
-          
+
           // Initialize freecam rotation from current camera orientation
           const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
           yaw = euler.y;
           pitch = euler.x;
-          
+
           cameraModeBtn.querySelector('span').textContent = 'videocam';
           cameraModeBtn.title = 'Switch to Orbit Mode (Click canvas for mouse look)';
         } else {
           // Switch to orbit mode
           cameraMode = 'orbit';
           exitPointerLock(); // Exit pointer lock when switching to orbit
-          
+
           if (controls) {
             controls.enabled = true;
             controls.enablePan = true;
@@ -1623,7 +1645,7 @@ class HUD {
     if (compassBtn) {
       compassBtn.addEventListener('click', () => {
         if (!camera) return;
-        
+
         if (cameraMode === 'freecam') {
           // In freecam, just reset camera rotation to face north
           const currentPos = camera.position.clone();
@@ -1634,25 +1656,25 @@ class HUD {
           const currentPosition = camera.position.clone();
           const target = controls.target.clone();
           const distance = currentPosition.distanceTo(target);
-          
+
           const newPosition = target.clone();
           newPosition.add(new THREE.Vector3(0, currentPosition.y - target.y, distance));
-          
+
           // Smooth animation
           const startPos = currentPosition.clone();
           const startTime = performance.now();
           const duration = 500;
-          
+
           const animate = (time) => {
             const elapsed = time - startTime;
             const progress = Math.min(elapsed / duration, 1);
             const eased = 1 - Math.pow(1 - progress, 3);
-            
+
             camera.position.lerpVectors(startPos, newPosition, eased);
             camera.lookAt(target);
             controls.update();
             updateCompass();
-            
+
             if (progress < 1) {
               requestAnimationFrame(animate);
             }
@@ -1671,7 +1693,7 @@ class HUD {
           const factor = 0.8;
           const distance = camera.position.distanceTo(controls.target);
           const newDistance = Math.max(distance * factor, controls.minDistance);
-          
+
           const direction = camera.position.clone().sub(controls.target).normalize();
           camera.position.copy(controls.target).add(direction.multiplyScalar(newDistance));
           controls.update();
@@ -1687,7 +1709,7 @@ class HUD {
           const factor = 1.25;
           const distance = camera.position.distanceTo(controls.target);
           const newDistance = Math.min(distance * factor, controls.maxDistance);
-          
+
           const direction = camera.position.clone().sub(controls.target).normalize();
           camera.position.copy(controls.target).add(direction.multiplyScalar(newDistance));
           controls.update();
@@ -1704,11 +1726,11 @@ class HUD {
           const target = controls.target;
           const position = camera.position.clone();
           const direction = position.sub(target);
-          
+
           const axis = new THREE.Vector3().crossVectors(direction, camera.up).normalize();
           const angle = -0.2;
           direction.applyAxisAngle(axis, angle);
-          
+
           camera.position.copy(target).add(direction);
           camera.lookAt(target);
           controls.update();
@@ -1724,11 +1746,11 @@ class HUD {
           const target = controls.target;
           const position = camera.position.clone();
           const direction = position.sub(target);
-          
+
           const axis = new THREE.Vector3().crossVectors(direction, camera.up).normalize();
           const angle = 0.2;
           direction.applyAxisAngle(axis, angle);
-          
+
           camera.position.copy(target).add(direction);
           camera.lookAt(target);
           controls.update();
@@ -1766,7 +1788,7 @@ function initializeApp() {
   // Add a small delay to ensure all DOM elements are fully rendered
   setTimeout(() => {
     ui = new HUD();
-    
+
     // Set up UI callbacks after UI is ready
     if (ui && ui.getKey()) {
       console.log('got key from localStorage; starting tiles');
@@ -1774,7 +1796,7 @@ function initializeApp() {
       const key = ui.getKey();
       const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
       ui.setStatus('Loading tiles...');
-  updateAttributionFromTileset();
+      updateAttributionFromTileset();
       ensureTiles(root, key);
       retargetTiles(lat, lon);
     }
@@ -1786,10 +1808,10 @@ function initializeApp() {
         const [lat, lon] = ui.getLatLon();
         const root = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${key}`;
 
-  ui.setStatus(`Streaming ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
-  updateAttributionFromTileset();        // no network call
-  ensureTiles(root, key);
-  retargetTiles(lat, lon);
+        ui.setStatus(`Streaming ${lat.toFixed(4)}, ${lon.toFixed(4)}`);
+        updateAttributionFromTileset();        // no network call
+        ensureTiles(root, key);
+        retargetTiles(lat, lon);
       };
     }
   }, 100);
@@ -1802,7 +1824,7 @@ if (document.readyState === 'loading') {
 }
 
 /* ───────────────────────────────  Three.js set-up ─────────────────── */
-let scene,camera,controls,renderer,tiles=null;
+let scene, camera, controls, renderer, tiles = null;
 let isInteracting = false;
 let __desiredView = null; // populated by HUD._goTo
 let freecamUpdateFn = null; // Will be set by camera controls
@@ -1810,7 +1832,7 @@ let hasFramedOnce = false; // gate initial auto-framing
 
 /* ─────────────────────────────────── GUI & state ──────────────────── */
 const LAYER_IMAGERY = 0;   // Google 3D Tiles
-const LAYER_VOXELS  = 1;   // Our voxel meshes / MC
+const LAYER_VOXELS = 1;   // Our voxel meshes / MC
 
 const state = { resolution: 64, vox: true, mc: false, debugImagery: false };
 let lastVoxelUpdateTime = 0;
@@ -1823,52 +1845,52 @@ let lastVoxelUpdateTime = 0;
   });
   document.body.appendChild(renderer.domElement);
 
-  scene=new THREE.Scene();
-  scene.background=new THREE.Color(0x151c1f);
-  const hemi = new THREE.HemisphereLight(0xffffff,0x202020,1);
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x151c1f);
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x202020, 1);
   scene.add(hemi);
   // Lights affect both layers
   hemi.layers.enable(LAYER_IMAGERY);
   hemi.layers.enable(LAYER_VOXELS);
 
-  camera=new THREE.PerspectiveCamera(60,1,0.1,1_600_000);
+  camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1_600_000);
   // Camera can render both layers; we'll toggle them later
   camera.layers.enable(LAYER_IMAGERY);
   camera.layers.enable(LAYER_VOXELS);
-  controls=new OrbitControls(camera,renderer.domElement);
-  controls.enableDamping=true; controls.maxDistance=3e4;
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true; controls.maxDistance = 3e4;
 
   controls.addEventListener('start', () => {
     isInteracting = true;
     // Keep consistent LOD while moving - voxel caching handles performance now
   });
-  
+
   controls.addEventListener('end', () => {
     isInteracting = false;
     // No need to restore errorTarget since we don't change it
   });
 
-  window.addEventListener('resize',resize); resize();
-  
+  window.addEventListener('resize', resize); resize();
+
   requestAnimationFrame(loop);
 })();
 
-function resize(){
-  const w=innerWidth,h=innerHeight;
-  camera.aspect=w/h; camera.updateProjectionMatrix();
-  renderer.setSize(w,h);
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
   renderer.setPixelRatio(Math.min(1.25, window.devicePixelRatio));
 }
 
 /* ───────────────────────────── TilesRenderer factory ──────────────── */
 function frameToView(view = { height: 360, tilt: 60, heading: 0 }) {
-  const tilt    = THREE.MathUtils.degToRad(view.tilt    ?? 60);
+  const tilt = THREE.MathUtils.degToRad(view.tilt ?? 60);
   const heading = THREE.MathUtils.degToRad(view.heading ?? 0);
-  const r       = view.height ?? 360;
+  const r = view.height ?? 360;
   const horiz = Math.cos(tilt) * r;
-  const up    = Math.sin(tilt) * r;
-  const x     = Math.cos(heading) * horiz;
-  const z     = Math.sin(heading) * horiz;
+  const up = Math.sin(tilt) * r;
+  const x = Math.cos(heading) * horiz;
+  const z = Math.sin(heading) * horiz;
 
   controls.target.set(0, 0, 0);
   camera.position.set(x, up, z);
@@ -1877,13 +1899,13 @@ function frameToView(view = { height: 360, tilt: 60, heading: 0 }) {
   controls.update();
 }
 
-function ensureTiles(root,key){
+function ensureTiles(root, key) {
   if (tiles) return;
-  tiles=new TilesRenderer(root);
+  tiles = new TilesRenderer(root);
   tiles.registerPlugin(new TileCompressionPlugin());
   // tiles.registerPlugin(new TilesFadePlugin());
   tiles.registerPlugin(new GLTFExtensionsPlugin({
-    dracoLoader:new DRACOLoader()
+    dracoLoader: new DRACOLoader()
       .setDecoderPath('https://unpkg.com/three@0.160/examples/jsm/libs/draco/gltf/')
   }));
 
@@ -1931,7 +1953,7 @@ function ensureTiles(root,key){
 
   tiles.errorTarget = ui ? ui.getSSE() : 20;
   tiles.setCamera(camera);
-  tiles.setResolutionFromRenderer(camera,renderer);
+  tiles.setResolutionFromRenderer(camera, renderer);
 
   // Events (no auto-framing here; 'load-tile-set' fires multiple times for nested sets)
   tiles.addEventListener('load-model', onTileLoad);
@@ -1946,7 +1968,7 @@ function ensureTiles(root,key){
         buildVoxelFor(tileGroup);
       }
     } else {
-      try { tileGroup._voxWorker?.terminate?.(); } catch {}
+      try { tileGroup._voxWorker?.terminate?.(); } catch { }
       voxelizingTiles.delete(tileGroup);
       if (tileGroup._voxMesh) tileGroup._voxMesh.visible = false;
       if (tileGroup._mcMesh) tileGroup._mcMesh.visible = false;
@@ -1957,8 +1979,8 @@ function ensureTiles(root,key){
   scene.add(tiles.group);
 }
 
-function retargetTiles(latDeg,lonDeg){
-  if(!tiles) return;
+function retargetTiles(latDeg, lonDeg) {
+  if (!tiles) return;
   tiles.setLatLonToYUp(
     latDeg * THREE.MathUtils.DEG2RAD,
     lonDeg * THREE.MathUtils.DEG2RAD
@@ -1974,45 +1996,45 @@ function retargetTiles(latDeg,lonDeg){
     hasFramedOnce = true;
   }
   // Keep Single Scene mini-map centered with main map moves
-  try { ui?._syncSingleSceneMiniMap?.(latDeg, lonDeg); } catch {}
+  try { ui?._syncSingleSceneMiniMap?.(latDeg, lonDeg); } catch { }
 }
 
 // Back-compat wrapper for any remaining call sites
-function spawnTiles(root,key,latDeg,lonDeg){
-  ensureTiles(root,key);
-  retargetTiles(latDeg,lonDeg);
+function spawnTiles(root, key, latDeg, lonDeg) {
+  ensureTiles(root, key);
+  retargetTiles(latDeg, lonDeg);
 }
 
 // (tile-visibility-change listener now registered inside ensureTiles())
 
 /* ───────────────────── helper to dispose THREE objects ───────────── */
-function dispose(o){
-  if(!o) return;
-  if(o.userData && o.userData.sourceTile) {
+function dispose(o) {
+  if (!o) return;
+  if (o.userData && o.userData.sourceTile) {
     const tile = o.userData.sourceTile;
-    if(tile._voxMesh === o) delete tile._voxMesh;
-    if(tile._mcMesh === o) delete tile._mcMesh;
+    if (tile._voxMesh === o) delete tile._voxMesh;
+    if (tile._mcMesh === o) delete tile._mcMesh;
     delete o.userData.sourceTile;
   }
-  
-  if(o.traverse && typeof o.traverse === 'function') {
-    o.traverse(n=>{
-      if(n.isMesh){
+
+  if (o.traverse && typeof o.traverse === 'function') {
+    o.traverse(n => {
+      if (n.isMesh) {
         n.geometry?.dispose();
-        (Array.isArray(n.material)?n.material:[n.material])
-          .forEach(m=>{
-            if(m) {
+        (Array.isArray(n.material) ? n.material : [n.material])
+          .forEach(m => {
+            if (m) {
               m.map?.dispose();
               m.dispose();
             }
           });
       }
     });
-  } else if(o.isMesh) {
+  } else if (o.isMesh) {
     o.geometry?.dispose();
-    (Array.isArray(o.material)?o.material:[o.material])
-      .forEach(m=>{
-        if(m) {
+    (Array.isArray(o.material) ? o.material : [o.material])
+      .forEach(m => {
+        if (m) {
           m.map?.dispose();
           m.dispose();
         }
@@ -2030,7 +2052,7 @@ const disposingTiles = new Set();
 const CPU = (navigator.hardwareConcurrency || 4);
 const MAX_CONCURRENT_VOXELIZERS = Math.max(1, Math.min(4, Math.floor(CPU / 2)));
 const MOVING_BUDGET = 1; // keep UI smooth while the camera is in motion
-const TARGET_PX_PER_VOXEL       = 3;     // tweak to taste (2..4 is a good band)
+const TARGET_PX_PER_VOXEL = 3;     // tweak to taste (2..4 is a good band)
 
 function screenRadiusForObject(obj) {
   // estimate object radius in world units
@@ -2065,16 +2087,16 @@ const scheduleVoxel = (cb) => ('requestIdleCallback' in window)
   ? requestIdleCallback(cb, { timeout: 120 })
   : setTimeout(cb, 0);
 
-async function buildVoxelFor(tile){
+async function buildVoxelFor(tile) {
   const rendererVisible = tile?.userData?.rendererVisible;
-  if(!tile || tile._voxMesh || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile)) return;
+  if (!tile || tile._voxMesh || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile)) return;
   if (rendererVisible === false) return; // only skip when we know it's hidden
-  if(!tile.parent || tile.parent !== tiles.group) return;
-  
+  if (!tile.parent || tile.parent !== tiles.group) return;
+
   let hasMeshes = false;
-  tile.traverse(n => { if(n.isMesh && n.geometry) hasMeshes = true; });
-  if(!hasMeshes) return;
-  
+  tile.traverse(n => { if (n.isMesh && n.geometry) hasMeshes = true; });
+  if (!hasMeshes) return;
+
   // Skip giant parent tiles when we're close (they'll refine into children)
   const s = new THREE.Sphere();
   tile.getWorldPosition(s.center);
@@ -2082,9 +2104,9 @@ async function buildVoxelFor(tile){
   const approxRadius = tile.boundingSphere?.radius || Math.max(s.x, s.y, s.z) * 50;
   const dist2 = camera.position.distanceToSquared(s.center);
   if (approxRadius * approxRadius > dist2 * 0.3) return;
-  
+
   voxelizingTiles.add(tile);
-  try{
+  try {
     const perTileResolution = resolutionForTile(tile);
     let workerRef = null;
     const vox = await voxelizeModel({
@@ -2094,19 +2116,19 @@ async function buildVoxelFor(tile){
       method: ui.getVoxelizationMethod(),
       onStart: w => { workerRef = w; tile._voxWorker = w; }
     });
-    
-    if(!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
-      try { workerRef?.terminate?.(); } catch{} 
-      dispose(vox.voxelMesh); 
+
+    if (!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
+      try { workerRef?.terminate?.(); } catch { }
+      dispose(vox.voxelMesh);
       return;
     }
 
-  const vMesh = vox.voxelMesh;
+    const vMesh = vox.voxelMesh;
     vMesh.matrixAutoUpdate = false;
     vMesh.userData.sourceTile = tile;
-    
+
     // assign smaller renderOrder for nearer chunks (better early-Z)
-    vMesh.traverse(m=>{
+    vMesh.traverse(m => {
       if (!m.isMesh) return;
       const bb = m.geometry.boundingBox;
       if (bb) {
@@ -2114,7 +2136,7 @@ async function buildVoxelFor(tile){
         m.renderOrder = -camera.position.distanceToSquared(c);
       }
     });
-    
+
     // Put voxels on the voxel layer
     vMesh.traverse(n => n.layers.set(LAYER_VOXELS));
     scene.add(vMesh);
@@ -2122,37 +2144,37 @@ async function buildVoxelFor(tile){
     tile._voxMesh = vMesh;
     tile._voxelizer = vox;
     // Remember original materials for MC toggle
-    vMesh.traverse(n => { if(n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
+    vMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
 
-    if(state.mc && vox._voxelGrid) {
+    if (state.mc && vox._voxelGrid) {
       vMesh.userData.__mcAllowApply = true; // allow MC material application
       await applyAtlasToExistingVoxelMesh(vMesh, vox._voxelGrid);
       tile._mcApplied = true;
     }
     applyVis(tile);
-  }catch(e){ 
-    console.warn('voxelise failed',e);
+  } catch (e) {
+    console.warn('voxelise failed', e);
     tile._voxError = true; // prevent infinite retry spam this session
   } finally {
     voxelizingTiles.delete(tile);
   }
 }
 
-async function buildMinecraftFor(tile){
+async function buildMinecraftFor(tile) {
   // Backwards-compat helper: apply atlas material if not already applied
-  if(!tile || !tile._voxMesh || !tile._voxelizer || disposingTiles.has(tile)) return;
-  if(tile._mcApplied) return;
+  if (!tile || !tile._voxMesh || !tile._voxelizer || disposingTiles.has(tile)) return;
+  if (tile._mcApplied) return;
   try {
     if (!tile._voxelizer._voxelGrid) return; // needGrid must be true during voxelization when MC enabled
     await applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid);
     tile._mcApplied = true;
     applyVis(tile);
-  } catch(e) { console.warn('Minecraft material swap failed', e); }
+  } catch (e) { console.warn('Minecraft material swap failed', e); }
 }
 
 // The 'scene' from the event is the THREE.Group for the tile.
-function onTileLoad({scene:tile}){
-  if(!tile || !tile.parent || tile.parent !== tiles.group || tile.type !== 'Group') return;
+function onTileLoad({ scene: tile }) {
+  if (!tile || !tile.parent || tile.parent !== tiles.group || tile.type !== 'Group') return;
   tile.updateMatrixWorld(true);
 
   // All original meshes live on the imagery layer
@@ -2164,13 +2186,13 @@ function onTileLoad({scene:tile}){
   applyVis(tile);
   // If we don't yet know visibility, assume visible so idle sweep can pick it up.
   if (tile.userData.rendererVisible === undefined) tile.userData.rendererVisible = true;
-  
+
   // Automatically voxelize if vox mode is on.
   const rendererVisible = tile?.userData?.rendererVisible;
-  if(state.vox && !isInteracting && rendererVisible !== false && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
+  if (state.vox && !isInteracting && rendererVisible !== false && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
     scheduleVoxel(() => {
       const stillVisible = tile?.userData?.rendererVisible;
-      if(!isInteracting && tile.parent && stillVisible !== false && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile) && isWorthVoxelizing(tile)) {
+      if (!isInteracting && tile.parent && stillVisible !== false && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile) && isWorthVoxelizing(tile)) {
         buildVoxelFor(tile);
       }
     });
@@ -2178,31 +2200,31 @@ function onTileLoad({scene:tile}){
 }
 
 // The 'scene' from the event is the THREE.Group for the tile.
-function onTileDispose({scene:tile}){
-  if(tile) {
+function onTileDispose({ scene: tile }) {
+  if (tile) {
     disposingTiles.add(tile);
     cleanupTileVoxels(tile);
     disposingTiles.delete(tile);
   }
 }
 
-function cleanupTileVoxels(tile){
-  if(!tile) return;
-  
+function cleanupTileVoxels(tile) {
+  if (!tile) return;
+
   disposingTiles.add(tile);
   try {
-    try { tile._voxWorker?.terminate?.(); } catch {}
-  dispose(tile._voxMesh); 
-  dispose(tile._tempContainer);
-    
+    try { tile._voxWorker?.terminate?.(); } catch { }
+    dispose(tile._voxMesh);
+    dispose(tile._tempContainer);
+
     voxelizingTiles.delete(tile);
-    
-  delete tile._voxMesh;
-  delete tile._voxelizer;
-  delete tile._tempContainer;
-  delete tile._voxError;  // allow retry after cleanup
-  delete tile._voxWorker;
-  delete tile._mcApplied;
+
+    delete tile._voxMesh;
+    delete tile._voxelizer;
+    delete tile._tempContainer;
+    delete tile._voxError;  // allow retry after cleanup
+    delete tile._voxWorker;
+    delete tile._mcApplied;
   } finally {
     disposingTiles.delete(tile);
   }
@@ -2210,12 +2232,12 @@ function cleanupTileVoxels(tile){
 
 
 
-function applyVis(tile){
-  if(!tile || !tile.parent || tile.parent !== tiles.group || typeof tile.type !== 'string') return;
+function applyVis(tile) {
+  if (!tile || !tile.parent || tile.parent !== tiles.group || typeof tile.type !== 'string') return;
 
-  const showVoxels   = state.vox;
+  const showVoxels = state.vox;
   const useMinecraft = state.vox && state.mc;
-  const hideImagery  = state.vox && (state.debugImagery === false);
+  const hideImagery = state.vox && (state.debugImagery === false);
 
   if (hideImagery) {
     camera.layers.disable(LAYER_IMAGERY);
@@ -2236,98 +2258,98 @@ function applyVis(tile){
         if (typeof wantBias === 'number' && tile._voxMesh.userData.__mcBiasUsed !== wantBias && !tile._rebaking) {
           tile._rebaking = true;
           applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid)
-            .then(()=>{ tile._mcApplied = true; })
-            .finally(()=>{ tile._rebaking = false; });
+            .then(() => { tile._mcApplied = true; })
+            .finally(() => { tile._rebaking = false; });
         }
       }
       if (!tile._mcApplied && tile._voxelizer?._voxelGrid) {
         buildMinecraftFor(tile);
       } else {
-        tile._voxMesh.traverse(n=>{ if(n.isMesh && n.userData?.mcMat) n.material = n.userData.mcMat; });
+        tile._voxMesh.traverse(n => { if (n.isMesh && n.userData?.mcMat) n.material = n.userData.mcMat; });
       }
     } else {
-      tile._voxMesh.traverse(n=>{ if(n.isMesh && n.userData?.origMat) n.material = n.userData.origMat; });
+      tile._voxMesh.traverse(n => { if (n.isMesh && n.userData?.origMat) n.material = n.userData.origMat; });
     }
   }
 }
 
 // Re-bake Minecraft atlas UVs on currently visible voxel tiles with a new brightness bias.
 // Pure CPU; no re-voxelization or new geometry. Exposed via window.MC_setBrightness.
-async function rebakeMinecraftUVsForVisibleTiles(bias = 0){
+async function rebakeMinecraftUVsForVisibleTiles(bias = 0) {
   setMinecraftBrightnessBias(bias);
-  if(!tiles || !tiles.group) return;
-  if(!state.mc){ updateVis(); return; } // don't rebake when MC off; lazy on toggle
+  if (!tiles || !tiles.group) return;
+  if (!state.mc) { updateVis(); return; } // don't rebake when MC off; lazy on toggle
   const kids = tiles.group.children || [];
-  for(const tile of kids){
-    if(!tile || tile.type !== 'Group') continue;
-    if(!tile._voxMesh || !tile._voxelizer?._voxelGrid) continue;
+  for (const tile of kids) {
+    if (!tile || tile.type !== 'Group') continue;
+    if (!tile._voxMesh || !tile._voxelizer?._voxelGrid) continue;
     tile._voxMesh.userData.__mcAllowApply = true;
-    try { await applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid); tile._mcApplied = true; } catch(e){ console.warn('Rebake failed', e); }
+    try { await applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid); tile._mcApplied = true; } catch (e) { console.warn('Rebake failed', e); }
   }
   updateVis();
 }
-window.MC_setBrightness = (b)=>rebakeMinecraftUVsForVisibleTiles(b);
+window.MC_setBrightness = (b) => rebakeMinecraftUVsForVisibleTiles(b);
 
 // Recompute per-tile visibility & (re)voxelization needs after UI state changes.
 // Called by UI event handlers when toggling vox / mc / debug imagery.
-function updateVis(){
-  if(!tiles || !tiles.group) return;
-  tiles.group.children.forEach(tile => { if(tile && tile.type==='Group') applyVis(tile); });
+function updateVis() {
+  if (!tiles || !tiles.group) return;
+  tiles.group.children.forEach(tile => { if (tile && tile.type === 'Group') applyVis(tile); });
 }
 
 
-function rebuildAll(){
-  if(!tiles || !tiles.group) return;
-  
+function rebuildAll() {
+  if (!tiles || !tiles.group) return;
+
   if (tiles.group.children) {
     const tilesToClean = tiles.group.children.filter(child =>
       child && (child._voxMesh || child._mcMesh)
     );
     tilesToClean.forEach(cleanupTileVoxels);
   }
-  
+
   voxelizingTiles.clear();
   disposingTiles.clear();
-  
+
   updateVis();
 }
 
 /* ───────────────────────── render loop ───────────────────────────── */
 const VOXEL_UPDATE_INTERVAL = 300;
 
-function loop(){
+function loop() {
   requestAnimationFrame(loop);
-  
+
   // Update freecam if enabled
   if (window.freecamUpdateFn) {
     window.freecamUpdateFn();
   }
-  
+
   controls.update();
-  
-  if(tiles){ 
-    camera.updateMatrixWorld(); 
+
+  if (tiles) {
+    camera.updateMatrixWorld();
     tiles.update();
-    
+
     // This periodic check is a good fallback to catch any visible tiles
     // that slipped through the event-based voxelization.
     const now = performance.now();
-    if(state.vox && !isInteracting && now - lastVoxelUpdateTime > VOXEL_UPDATE_INTERVAL) {
+    if (state.vox && !isInteracting && now - lastVoxelUpdateTime > VOXEL_UPDATE_INTERVAL) {
       lastVoxelUpdateTime = now;
-      
-      if(tiles.group && tiles.group.children) {
+
+      if (tiles.group && tiles.group.children) {
         const tilesToVoxelize = [];
         tiles.group.children.forEach(tile => {
           const rendererVisible = tile?.userData?.rendererVisible;
           if (tile && tile.type === 'Group'
-              && rendererVisible !== false
-              && isWorthVoxelizing(tile)
-              && !tile._voxMesh && !tile._voxError
-              && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
+            && rendererVisible !== false
+            && isWorthVoxelizing(tile)
+            && !tile._voxMesh && !tile._voxError
+            && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
             tilesToVoxelize.push(tile);
           }
         });
-        
+
         if (tilesToVoxelize.length > 0) {
           const camPos = camera.position;
           tilesToVoxelize.sort((a, b) => {
@@ -2337,7 +2359,7 @@ function loop(){
             b.getWorldPosition(bPos);
             return aPos.distanceToSquared(camPos) - bPos.distanceToSquared(camPos);
           });
-          
+
           const budget = Math.max(
             0, (isInteracting ? MOVING_BUDGET : MAX_CONCURRENT_VOXELIZERS) - voxelizingTiles.size
           );
@@ -2346,8 +2368,8 @@ function loop(){
       }
     }
   }
-  
-  renderer.render(scene,camera);
+
+  renderer.render(scene, camera);
 }
 
 // Rebase a voxelGrid's bbox+unit by a 4x4 transform M (the SAME matrices applied to the voxel geometry).
@@ -2369,10 +2391,10 @@ function rebaseVoxelGrid(voxelGrid, M) {
   for (const c of corners) outBox.expandByPoint(c.clone().applyMatrix4(M));
 
   // derive per-axis scale from M (assume mostly orthonormal after our counter-rotation)
-  const origin = new THREE.Vector3(0,0,0).applyMatrix4(M);
-  const ex = new THREE.Vector3(1,0,0).applyMatrix4(M).sub(origin).length();
-  const ey = new THREE.Vector3(0,1,0).applyMatrix4(M).sub(origin).length();
-  const ez = new THREE.Vector3(0,0,1).applyMatrix4(M).sub(origin).length();
+  const origin = new THREE.Vector3(0, 0, 0).applyMatrix4(M);
+  const ex = new THREE.Vector3(1, 0, 0).applyMatrix4(M).sub(origin).length();
+  const ey = new THREE.Vector3(0, 1, 0).applyMatrix4(M).sub(origin).length();
+  const ez = new THREE.Vector3(0, 0, 1).applyMatrix4(M).sub(origin).length();
 
   // shallow clone (keep big arrays by reference)
   return {

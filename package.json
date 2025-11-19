@@ -6,6 +6,7 @@
     "build": "vite build",
     "preview": "vite preview"
   },
+  "type": "module",
   "devDependencies": {
     "path-browserify": "^1.0.1",
     "rollup-plugin-polyfill-node": "^0.13.0",
