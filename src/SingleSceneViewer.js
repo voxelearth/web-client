@@ -9,6 +9,7 @@ import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 export class SingleSceneViewer {
 	constructor() {
 		const scene = new THREE.Scene();
+		scene.background = new THREE.Color(0x202020); // Dark grey background to see black voxels
 		const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 100);
 		camera.position.z = -0.25; 
 		camera.position.y = 0.2;
@@ -51,30 +52,48 @@ export class SingleSceneViewer {
 	this.voxelMeshes = []; // Initialize voxel meshes array
 	this._debugTilesOn = false;
 	this._debugHelpers = [];
-	this.gltfLoader = this._makeGLTFLoader(renderer);
+		this.gltfLoader = this._makeGLTFLoader(renderer);
 
-		this.render();
+        // Debug: Add a red cube to verify scene rendering
+        const debugCube = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 0.1), new THREE.MeshBasicMaterial({ color: 0xff0000 }));
+        debugCube.position.set(0, 0, 0);
+        scene.add(debugCube);
+
 		this.resizeCanvas();
 	}
 
+    update() {
+        if (this.controls) this.controls.update();
+    }
+
 	_makeGLTFLoader(renderer) {
 		const THREE_PATH = `https://unpkg.com/three@0.160`;
-		const draco = new DRACOLoader().setDecoderPath(`${THREE_PATH}/examples/jsm/libs/draco/gltf/`);
-		const ktx2  = new KTX2Loader().setTranscoderPath(`${THREE_PATH}/examples/jsm/libs/basis/`);
-		ktx2.detectSupport(renderer);
+
+		const draco = new DRACOLoader()
+			.setDecoderPath(`${THREE_PATH}/examples/jsm/libs/draco/gltf/`);
+
+		const ktx2  = new KTX2Loader()
+			.setTranscoderPath(`${THREE_PATH}/examples/jsm/libs/basis/`)
+			.detectSupport(renderer);
+
 		const loader = new GLTFLoader();
 		loader.setDRACOLoader(draco);
 		loader.setKTX2Loader(ktx2);
 		loader.setMeshoptDecoder(MeshoptDecoder);
-		// Enable three.js in-memory cache to short-circuit duplicate GLB / texture fetches this session
+
 		THREE.Cache.enabled = true;
 		return loader;
 	}
 
 	render() {
 		const { renderer, camera, scene } = this;
-	  	requestAnimationFrame(this.render.bind(this));
 	  	renderer.render(scene, camera);
+        
+        // Debug: Log camera pos occasionally
+        if (!this._lastLog || Date.now() - this._lastLog > 2000) {
+            this._lastLog = Date.now();
+            console.log(`[SingleSceneViewer] Cam: ${camera.position.x.toFixed(3)}, ${camera.position.y.toFixed(3)}, ${camera.position.z.toFixed(3)} | Target: ${this.controls.target.x.toFixed(3)}, ${this.controls.target.y.toFixed(3)}, ${this.controls.target.z.toFixed(3)}`);
+        }
 	}
 
 	resizeCanvas() {
@@ -84,7 +103,7 @@ export class SingleSceneViewer {
 		renderer.setSize(window.innerWidth, window.innerHeight);
 	}
 
-	async loadGLTFTiles(urlArray, logFn) {
+	async loadGLTFTiles(urlArray, logFn, onProgress) {
 		// Resizing/recentering code inspired by by gltf-viewer
 		// https://github.com/donmccurdy/three-gltf-viewer/blob/de78a07180e4141b0b87a0ff4572bc4f7aafec56/src/viewer.js#L246
 		const { scene, controls, camera } = this;
@@ -94,19 +113,39 @@ export class SingleSceneViewer {
 			this.tilesContainer = null;
 		}
 		const tilesContainer = new THREE.Object3D();
-		// Fetch individual glTF's (with DRACO/KTX2/Meshopt support) and add them to the scene
+		
+        // Fetch individual glTF's in parallel
 		const gltfArray = [];
-		for (let i = 0; i < urlArray.length; i++) {
-			const url = urlArray[i];
-			if (logFn) logFn(`Fetching glTF ${i + 1}/${urlArray.length}`);
-			try {
-				const gltf = await new Promise((res, rej) => this.gltfLoader.load(url, res, undefined, rej));
-				gltfArray.push(gltf);
-				tilesContainer.add(gltf.scene);
-			} catch (e) {
-				logFn?.(`Skipped one tile (${e?.message ?? 'load error'})`);
-			}
-		}
+        let loadedCount = 0;
+        const total = urlArray.length;
+
+        if (logFn) logFn(`Fetching ${total} tiles in parallel...`);
+
+        const promises = urlArray.map((url, i) => {
+            return new Promise((resolve) => {
+                this.gltfLoader.load(url, 
+                    (gltf) => {
+                        loadedCount++;
+                        if (onProgress) onProgress(loadedCount, total);
+                        resolve(gltf);
+                    }, 
+                    undefined, 
+                    (err) => {
+                        logFn?.(`Failed to load tile ${i+1}: ${err.message}`);
+                        resolve(null); // Resolve with null so Promise.all doesn't fail
+                    }
+                );
+            });
+        });
+
+        const results = await Promise.all(promises);
+        
+        for (const gltf of results) {
+            if (gltf) {
+                gltfArray.push(gltf);
+                tilesContainer.add(gltf.scene);
+            }
+        }
 
 		if (logFn) logFn(`Normalizing & stitching together ${gltfArray.length} glTFs`);
 

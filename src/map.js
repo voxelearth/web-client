@@ -329,6 +329,9 @@ class HUD {
       singleScenePanel.classList.remove('hidden');
       this._scheduleMiniMapInvalidate?.();
 
+      // Hide main canvas
+      if (renderer && renderer.domElement) renderer.domElement.style.display = 'none';
+
       // Update model picker button text
       if (modelPickerBtn) {
         const titleEl = modelPickerBtn.querySelector('.text-sm.font-medium');
@@ -353,6 +356,9 @@ class HUD {
       // Switch back to voxel earth mode
       singleScenePanel.classList.add('hidden');
       this.setStatus('Voxel Earth Mode');
+
+      // Show main canvas
+      if (renderer && renderer.domElement) renderer.domElement.style.display = '';
 
       // Update model picker button text
       if (modelPickerBtn) {
@@ -602,6 +608,16 @@ class HUD {
           this._showSingleSceneLog();
           this._logSingleScene('Fetching tiles...');
 
+          // Progress UI setup
+          const progressContainer = document.querySelector('#single-scene-progress-container');
+          const progressBar = document.querySelector('#single-scene-progress-bar');
+          const progressText = document.querySelector('#single-scene-progress-text');
+          if (progressContainer) {
+            progressContainer.classList.remove('hidden');
+            if (progressBar) progressBar.style.width = '0%';
+            if (progressText) progressText.textContent = '0%';
+          }
+
           if (!this._singleSceneFetcher) this._singleSceneFetcher = new SingleSceneFetcher();
           const fetcher = this._singleSceneFetcher;
           // zoom auto-computed from radius; pass null for zoom and provide radiusM
@@ -609,12 +625,19 @@ class HUD {
 
           if (urls.length === 0) {
             this._logSingleScene('No tiles found for this location');
+            if (progressContainer) progressContainer.classList.add('hidden');
             return;
           }
 
           // Load the tiles into the existing viewer
           if (window.singleSceneViewer) {
-            await window.singleSceneViewer.loadGLTFTiles(urls, this._logSingleScene.bind(this));
+            await window.singleSceneViewer.loadGLTFTiles(urls, this._logSingleScene.bind(this), (done, total) => {
+                if (progressBar && progressText) {
+                    const pct = Math.round((done / total) * 100);
+                    progressBar.style.width = `${pct}%`;
+                    progressText.textContent = `${pct}%`;
+                }
+            });
           }
 
           // Mirror global Vox/MC state into Single Scene and pre-bake if needed
@@ -895,6 +918,7 @@ class HUD {
     const container = viewer?.tilesContainer;
     if (!viewer || !container) return;
 
+    console.log(`[Single Scene] Visibility update: Voxels=${showVoxels}`);
     const vox = container.getObjectByName('singleSceneVoxels');
     container.children.forEach(ch => {
       if (vox && ch === vox) ch.visible = !!showVoxels;
@@ -902,174 +926,219 @@ class HUD {
     });
   }
 
-  async _rebuildSingleSceneVoxels(resolution) {
-    const viewer = window.singleSceneViewer;
-    const container = viewer?.tilesContainer;
-    if (!viewer || !container) { this._logSingleScene('? No tiles loaded'); return; }
-    const rotDeg = parseInt(document.querySelector('#single-scene-rot')?.value || '0', 10) || 0; // degrees to sample at
-
-    this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
-    const myVersion = this._ssVoxVersion;
-
-    // UI Elements for Progress
-    const progressContainer = document.querySelector('#single-scene-progress-container');
-    const progressBar = document.querySelector('#single-scene-progress-bar');
-    const progressText = document.querySelector('#single-scene-progress-text');
-
-    // Reset & Show Progress
-    if (progressContainer) {
-      progressContainer.classList.remove('hidden');
-      if (progressBar) progressBar.style.width = '0%';
-      if (progressText) progressText.textContent = '0%';
-    }
-
-    // Remove old voxels
-    const old = container.getObjectByName('singleSceneVoxels');
-    if (old) {
-      old.traverse(n => {
-        if (n.isMesh) {
-          n.geometry?.dispose();
-          (Array.isArray(n.material) ? n.material : [n.material]).forEach(m => m?.dispose?.());
-        }
-      });
-      container.remove(old);
-      const i = viewer.voxelMeshes.indexOf(old);
-      if (i >= 0) viewer.voxelMeshes.splice(i, 1);
-    }
-
-    // Show originals while rebuilding
-    container.children.forEach(ch => { if (ch.name !== 'singleSceneVoxels') ch.visible = true; });
-
-    container.updateMatrixWorld(true);
-    const containerBox = new THREE.Box3().setFromObject(container);
-    const containerSize = containerBox.getSize(new THREE.Vector3());
-    const maxDim = Math.max(containerSize.x, containerSize.y, containerSize.z, 1);
-
-    const childDiags = [];
-    for (const child of container.children) {
-      if (!child || child.name === 'singleSceneVoxels') continue;
-      const box = new THREE.Box3().setFromObject(child);
-      if (box.isEmpty()) continue;
-      const diag = box.getSize(new THREE.Vector3()).length();
-      if (Number.isFinite(diag) && diag > 0) childDiags.push(diag);
-    }
-    childDiags.sort((a, b) => a - b);
-    const medianDiag = childDiags.length ? childDiags[Math.floor(childDiags.length / 2)] : maxDim;
-    const tileDiag = Math.max(medianDiag, 1e-3);
-    const densitySetting = Math.max(1, Number(resolution) || 64);
-    const tilesAcross = Math.max(1, maxDim / tileDiag);
-    const computedResolution = Math.max(8, Math.round(densitySetting * tilesAcross));
-    const approxVoxelMeters = tileDiag / densitySetting;
-    this._logSingleScene(`?? (Re)voxelizing @ ${computedResolution} (~${approxVoxelMeters.toFixed(2)} m voxels per tile).`);
-
-    // Prepare counter-rotation so only sampling orientation changes
-    const pivot = containerBox.getCenter(new THREE.Vector3());
-    const Tneg = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
-    const RyInv = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(-rotDeg));
-    const Tpos = new THREE.Matrix4().makeTranslation(pivot.x, pivot.y, pivot.z);
-    const counterM = new THREE.Matrix4().multiplyMatrices(Tpos, new THREE.Matrix4().multiplyMatrices(RyInv, Tneg));
-
-    // world -> container-local + attach (after counter-rotation)
-    const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
-    // Combined matrix that we apply to geometry; use same to rebase voxelGrid
-    const Mreb = new THREE.Matrix4().multiplyMatrices(inv, counterM);
-
-    // Create group for new voxels immediately
-    const voxelGroup = new THREE.Group();
-    voxelGroup.name = 'singleSceneVoxels';
-    voxelGroup.matrixAutoUpdate = false;
-    voxelGroup.userData.resolution = resolution;
-    container.add(voxelGroup);
-    viewer.voxelMeshes = [voxelGroup];
-
-    let vox;
-    try {
-      vox = await voxelizeModel({
-        model: container,
-        renderer: viewer.renderer,
-        scene: viewer.scene,
-        resolution: computedResolution,
-        needGrid: true,
-        preRotateYDeg: rotDeg,
-        onProgress: (processed, total) => {
-          if (myVersion !== this._ssVoxVersion) return;
-          const pct = Math.round((processed / total) * 100);
-
-          // Update Visual Progress Bar
-          if (progressBar) progressBar.style.width = `${pct}%`;
-          if (progressText) progressText.textContent = `${pct}%`;
-
-          this._logSingleScene(`?? Voxelizing... ${pct}% (${processed}/${total} chunks)`);
-        },
-        onChunk: (chunkMesh) => {
-          if (myVersion !== this._ssVoxVersion) return;
-
-          // Apply transforms to chunk immediately
-          if (chunkMesh.geometry) {
-            if (rotDeg !== 0) chunkMesh.geometry.applyMatrix4(counterM);
-            chunkMesh.geometry.applyMatrix4(inv);
-            chunkMesh.geometry.computeBoundingBox?.();
-            chunkMesh.geometry.computeBoundingSphere?.();
-          }
-          chunkMesh.position.set(0, 0, 0);
-          chunkMesh.rotation.set(0, 0, 0);
-          chunkMesh.scale.set(1, 1, 1);
-          chunkMesh.updateMatrix();
-          chunkMesh.frustumCulled = false; // or true if bounds are good
-          try { chunkMesh.layers.set(1); } catch { }
-
-          // Preserve original material
-          chunkMesh.userData.origMat = chunkMesh.material;
-
-          voxelGroup.add(chunkMesh);
-          // Force update to show progress
-          try { voxelGroup.updateMatrixWorld(true); } catch { }
-        }
-      });
-    } catch (e) {
-      this._logSingleScene(`? Voxelization error: ${e?.message || e}`);
-      if (progressContainer) progressContainer.classList.add('hidden');
-      return;
-    }
-
-    if (myVersion !== this._ssVoxVersion) {
-      // stale
-      voxelGroup.traverse(n => {
-        if (n.isMesh) { n.geometry?.dispose(); (Array.isArray(n.material) ? n.material : [n.material]).forEach(m => m?.dispose?.()); }
-      });
-      container.remove(voxelGroup);
-      return;
-    }
-
-    // Finalize
-    const rawGrid = vox._voxelGrid; // might be null in streaming mode for now
-
-    // If MC is on, bake atlas (Note: MC baking might need updates for streaming if we want it to work incrementally, 
-    // but for now we do it at the end if we have a grid, or skip it if grid is missing)
-    const wantMC = !!(typeof state === 'object' ? state.mc : (window.state && window.state.mc));
-    if (wantMC && rawGrid) {
-      try {
-        await ensureMinecraftReady();
-        voxelGroup.userData.__mcAllowApply = true;
-        await applyAtlasToExistingVoxelMesh(voxelGroup, rawGrid);
-        voxelGroup.userData.__mcApplied = true;
-      } catch (e) {
-        console.warn('MC apply (pre-transform) failed:', e);
-      }
-    }
-
-    // Respect global voxel visibility
-    this._setSingleSceneVisibility(!!state.vox);
-
-    this._logSingleScene(`✅ Voxels ready @ ${resolution}`);
-
-    // Hide progress bar after short delay
-    setTimeout(() => {
-      if (myVersion === this._ssVoxVersion && progressContainer) {
-        progressContainer.classList.add('hidden');
-      }
-    }, 1500);
+ async _rebuildSingleSceneVoxels(resolution) {
+  const viewer    = window.singleSceneViewer;
+  const container = viewer?.tilesContainer;
+  if (!viewer || !container) {
+    this._logSingleScene('? No tiles loaded');
+    return;
   }
+
+  const rotDeg = parseInt(document.querySelector('#single-scene-rot')?.value || '0', 10) || 0;
+
+  // version guard for concurrent rebuilds
+  this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
+  const myVersion = this._ssVoxVersion;
+
+  // Progress UI
+  const progressContainer = document.querySelector('#single-scene-progress-container');
+  const progressBar       = document.querySelector('#single-scene-progress-bar');
+  const progressText      = document.querySelector('#single-scene-progress-text');
+
+  if (progressContainer) {
+    progressContainer.classList.remove('hidden');
+    // Don't reset to 0% if we just finished downloading (which leaves it at 50%)
+    // But if this is a standalone rebuild (e.g. slider change), we might want to start at 0.
+    // For now, let's assume voxelization is the second half of the process if download happened,
+    // or the full process if just changing resolution.
+    // We'll map voxelization progress 0-100 to the remaining space or full space.
+    // Simpler: Just show voxelization progress 0-100% for now, or 50-100% if we want to chain.
+    // Let's stick to 0-100% for the voxelization phase itself to be clear.
+    if (progressBar)  progressBar.style.width = '0%';
+    if (progressText) progressText.textContent = '0%';
+  }
+
+  // Remove old voxels
+  const old = container.getObjectByName('singleSceneVoxels');
+  if (old) {
+    old.traverse(n => {
+      if (n.isMesh) {
+        n.geometry?.dispose();
+        (Array.isArray(n.material) ? n.material : [n.material])
+          .forEach(m => m?.dispose?.());
+      }
+    });
+    container.remove(old);
+    const idx = viewer.voxelMeshes.indexOf(old);
+    if (idx >= 0) viewer.voxelMeshes.splice(idx, 1);
+  }
+
+  // Show original GLTF while rebuilding
+  container.children.forEach(ch => { if (ch.name !== 'singleSceneVoxels') ch.visible = true; });
+
+  container.updateMatrixWorld(true);
+  const containerBox  = new THREE.Box3().setFromObject(container);
+  const containerSize = containerBox.getSize(new THREE.Vector3());
+  const maxDim        = Math.max(containerSize.x, containerSize.y, containerSize.z, 1);
+
+  // Use median tile size like before
+  const childDiags = [];
+  for (const child of container.children) {
+    if (!child || child.name === 'singleSceneVoxels') continue;
+    const box = new THREE.Box3().setFromObject(child);
+    if (box.isEmpty()) continue;
+    const diag = box.getSize(new THREE.Vector3()).length();
+    if (Number.isFinite(diag) && diag > 0) childDiags.push(diag);
+  }
+  childDiags.sort((a, b) => a - b);
+  const medianDiag      = childDiags.length ? childDiags[Math.floor(childDiags.length / 2)] : maxDim;
+  const tileDiag        = Math.max(medianDiag, 1e-3);
+  const densitySetting  = Math.max(1, Number(resolution) || 64);
+  const tilesAcross     = Math.max(1, maxDim / tileDiag);
+  const computedRes      = Math.max(8, Math.round(densitySetting * tilesAcross));
+  const approxVoxelMeters = tileDiag / densitySetting;
+
+  this._logSingleScene(`?? (Re)voxelizing @ ${computedRes} (~${approxVoxelMeters.toFixed(2)} m/voxel)`);
+
+  let vox;
+  try {
+    vox = await voxelizeModel({
+      model: container,
+      renderer: viewer.renderer,
+      scene: viewer.scene,
+      resolution: computedRes,
+      needGrid: true,
+      preRotateYDeg: rotDeg,
+      onProgress: (done, total) => {
+        if (myVersion !== this._ssVoxVersion) return;
+        if (!progressBar && !progressText) return;
+        const pct = total ? Math.round((done / total) * 100) : 0;
+        if (progressBar)  progressBar.style.width = `${pct}%`;
+        if (progressText) progressText.textContent = `${pct}%`;
+      }
+    });
+  } catch (e) {
+    this._logSingleScene(`? Voxelization error: ${e?.message || e}`);
+    if (progressContainer) progressContainer.classList.add('hidden');
+    return;
+  }
+
+  // stale rebuild – throw result away
+  if (myVersion !== this._ssVoxVersion) {
+    vox?.voxelMesh?.traverse(n => {
+      if (n.isMesh) {
+        n.geometry?.dispose();
+        (Array.isArray(n.material) ? n.material : [n.material])
+          .forEach(m => m?.dispose?.());
+      }
+    });
+    if (progressContainer) progressContainer.classList.add('hidden');
+    return;
+  }
+
+  if (!vox || !vox.voxelMesh) {
+    this._logSingleScene('? Voxelizer returned no geometry');
+    if (progressContainer) progressContainer.classList.add('hidden');
+    return;
+  }
+
+  const voxelMesh = vox.voxelMesh;
+  const rawGrid   = vox._voxelGrid || null;
+
+  // Preserve original vertex-color materials BEFORE any MC swap
+  voxelMesh.traverse(n => {
+    if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material;
+  });
+
+  // Optional Minecraft atlas, same semantics as before
+  const wantMC = !!(typeof state === 'object' ? state.mc : (window.state && window.state.mc));
+  if (wantMC && rawGrid) {
+    try {
+      await ensureMinecraftReady();
+      voxelMesh.userData.__mcAllowApply = true;
+      await applyAtlasToExistingVoxelMesh(voxelMesh, rawGrid);
+      voxelMesh.userData.__mcApplied = true;
+    } catch (e) {
+      console.warn('MC apply (pre-transform) failed:', e);
+      // Fall back to original vertex-color material
+      voxelMesh.traverse(n => {
+        if (n.isMesh && n.userData.origMat) n.material = n.userData.origMat;
+      });
+    }
+  } else {
+    voxelMesh.traverse(n => {
+      if (n.isMesh && n.userData.origMat) n.material = n.userData.origMat;
+    });
+  }
+
+  // Same transform logic as original
+  const pivot  = containerBox.getCenter(new THREE.Vector3());
+  const Tneg   = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
+  const RyInv  = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(-rotDeg));
+  const Tpos   = new THREE.Matrix4().makeTranslation(pivot.x, pivot.y, pivot.z);
+  const counterM = new THREE.Matrix4().multiplyMatrices(
+    Tpos,
+    new THREE.Matrix4().multiplyMatrices(RyInv, Tneg)
+  );
+
+  const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
+  const Mreb = new THREE.Matrix4().multiplyMatrices(inv, counterM);
+
+  voxelMesh.traverse(node => {
+    if (node.isMesh && node.geometry) {
+      // undo preRotateYDeg
+      if (rotDeg !== 0) node.geometry.applyMatrix4(counterM);
+      // world → container-local
+      node.geometry.applyMatrix4(inv);
+
+      node.position.set(0, 0, 0);
+      node.rotation.set(0, 0, 0);
+      node.scale.set(1, 1, 1);
+      node.updateMatrix();
+      node.frustumCulled = false;
+
+      try {
+        node.geometry.computeBoundingBox?.();
+        node.geometry.computeBoundingSphere?.();
+      } catch {}
+
+      // keep voxels on layer 1 (camera already enables it)
+      try { node.layers.set(1); } catch {}
+    }
+  });
+
+  voxelMesh.matrixAutoUpdate = false;
+  voxelMesh.name = 'singleSceneVoxels';
+  voxelMesh.userData.resolution = resolution;
+
+  container.add(voxelMesh);
+  try { container.updateMatrixWorld(true); voxelMesh.updateMatrixWorld(true); } catch {}
+
+  viewer.voxelMeshes = [voxelMesh];
+  viewer.voxelizer  = vox;
+
+  // Rebased voxelGrid for exports
+  try {
+    const rebasedGrid = rawGrid ? rebaseVoxelGrid(rawGrid, Mreb) : null;
+    viewer.voxelizer._voxelGridRebased = rebasedGrid;
+  } catch (e) {
+    console.warn('Failed to compute rebased voxelGrid:', e);
+    viewer.voxelizer._voxelGridRebased = rawGrid || null;
+  }
+
+  // Respect global voxel visibility
+  this._setSingleSceneVisibility(!!state.vox);
+
+  this._logSingleScene(`✅ Voxels ready (${vox.voxelCount ?? '—'}) @ ${resolution}`);
+
+  // Hide progress UI after a short delay
+  setTimeout(() => {
+    if (myVersion === this._ssVoxVersion && progressContainer) {
+      progressContainer.classList.add('hidden');
+    }
+  }, 1500);
+}
+
 
   _initializeBasicElements() {
     // Elements
@@ -2320,9 +2389,14 @@ const VOXEL_UPDATE_INTERVAL = 300;
 function loop() {
   requestAnimationFrame(loop);
 
-  // Update freecam if enabled
-  if (window.freecamUpdateFn) {
-    window.freecamUpdateFn();
+  /* ----- freecam ---- */
+  if (window.freecamUpdateFn) window.freecamUpdateFn();
+
+  /* ----- SINGLE‑SCENE MODE: use its own renderer ----- */
+  if (window.singleSceneViewer) {
+      window.singleSceneViewer.update();   // run internal updates (voxel batching, visibility etc.)
+      window.singleSceneViewer.render();   // render to the viewer’s own canvas
+      return; // skip the main renderer
   }
 
   controls.update();

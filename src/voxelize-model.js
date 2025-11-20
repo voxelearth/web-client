@@ -24,9 +24,23 @@ function textureToPixels(tex) {
   try {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     ctx.drawImage(img, 0, 0);
-    return ctx.getImageData(0, 0, img.width, img.height);   // Uint8ClampedArray
-  } catch {
-    return null; // fall back to material color
+    const idata = ctx.getImageData(0, 0, img.width, img.height);
+    
+    // Debug: Log center pixel of first texture
+    if (!window._loggedTexture) {
+        window._loggedTexture = true;
+        const cx = Math.floor(img.width/2);
+        const cy = Math.floor(img.height/2);
+        const idx = (cy * img.width + cx) * 4;
+        const d = idata.data;
+        console.log(`[voxelize-model] Texture sample (${img.width}x${img.height}) type=${img.constructor.name} @ center: R=${d[idx]} G=${d[idx+1]} B=${d[idx+2]} A=${d[idx+3]}`);
+    }
+    
+    return idata;   // Uint8ClampedArray
+  } catch (e) {
+    console.warn('[voxelize-model] textureToPixels failed (likely CORS):', e);
+    // Return a 1x1 Magenta pixel to indicate error visibly
+    return new ImageData(new Uint8ClampedArray([255, 0, 255, 255]), 1, 1);
   }
 }
 
@@ -66,6 +80,7 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
           m[key] = {
             imageUuid: t.source.uuid,
             encoding: t.encoding,
+            isSRGB: (t.colorSpace === 'srgb' || t.encoding === 3001 || t.encoding === 3000), // Handle Three.js r152+ colorSpace and sRGBEncoding (3001)
             flipY: t.flipY,
             wrapS: t.wrapS,
             wrapT: t.wrapT,
@@ -157,7 +172,12 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
     let totalVoxels = 0;
 
     worker.onmessage = e => {
-      const { status, result, geometry, processed, total, message, stack } = e.data;
+      const { status, result, message, stack, current, total } = e.data;
+
+      if (status === 'progress') {
+        if (onProgress) onProgress(current, total);
+        return;
+      }
 
       if (status === 'error') {
         worker.terminate();
@@ -165,53 +185,65 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
         return reject(new Error(message));
       }
 
-      if (status === 'progress') {
-        if (onProgress) onProgress(processed, total);
-        return;
-      }
-
-      if (status === 'chunk') {
-        // Rehydrate geometry
-        const geom = new THREE.BufferGeometry();
-        geom.setAttribute('position', new THREE.BufferAttribute(geometry.positions, 3));
-        geom.setAttribute('color', new THREE.BufferAttribute(geometry.colors8, 4, true));
-        geom.setIndex(new THREE.BufferAttribute(geometry.indices, 1));
-
-        // Bounds
-        const min = new THREE.Vector3().fromArray(geometry.bounds.min);
-        const max = new THREE.Vector3().fromArray(geometry.bounds.max);
-        geom.boundingBox = new THREE.Box3(min, max);
-        geom.boundingSphere = new THREE.Sphere(
-          min.clone().add(max).multiplyScalar(0.5),
-          min.distanceTo(max) * 0.5
-        );
-
-        const mesh = new THREE.Mesh(
-          geom,
-          new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false })
-        );
-        mesh.userData.chunkBounds = geometry.bounds;
-
-        if (onChunk) {
-          onChunk(mesh);
-        } else {
-          chunks.push(mesh);
-        }
-        return;
-      }
-
-      if (status === 'done') {
+      if (status === 'success') {
         worker.terminate();
-
-        // If streaming (onChunk provided), we resolve with null/empty group as chunks are already handled
-        // If not streaming, we return the group of all chunks
+        
         const group = new THREE.Group();
-        chunks.forEach(c => group.add(c));
+        const geometries = result.geometries || [];
+        
+        console.log('[voxelizeModel] Worker success. Geometries:', geometries.length, 'VoxelGrid:', result.voxelGrid ? 'yes' : 'no');
+
+        // Debug: Check first geometry colors
+        if (geometries.length > 0 && geometries[0].colors8) {
+            const c = geometries[0].colors8;
+            if (c.length >= 4) {
+                console.log(`[voxelizeModel] First voxel color: R=${c[0]} G=${c[1]} B=${c[2]} A=${c[3]}`);
+                if (c[0]===0 && c[1]===0 && c[2]===0) {
+                    console.warn('[voxelizeModel] ⚠️ First voxel is BLACK. This might indicate texture/material issues.');
+                }
+            }
+        }
+
+        for (const geometry of geometries) {
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.BufferAttribute(geometry.positions, 3));
+            geom.setAttribute('color', new THREE.BufferAttribute(geometry.colors8, 4, true));
+            geom.setIndex(new THREE.BufferAttribute(geometry.indices, 1));
+
+            // Bounds
+            if (geometry.bounds) {
+                const min = new THREE.Vector3().fromArray(geometry.bounds.min);
+                const max = new THREE.Vector3().fromArray(geometry.bounds.max);
+                geom.boundingBox = new THREE.Box3(min, max);
+                geom.boundingSphere = new THREE.Sphere(
+                    min.clone().add(max).multiplyScalar(0.5),
+                    min.distanceTo(max) * 0.5
+                );
+            } else {
+                geom.computeBoundingBox();
+                geom.computeBoundingSphere();
+            }
+
+            const mesh = new THREE.Mesh(
+                geom,
+                new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false })
+            );
+            mesh.frustumCulled = false;
+            
+            if (geometry.bounds) {
+                mesh.userData.chunkBounds = geometry.bounds;
+            }
+
+            if (onChunk) {
+                onChunk(mesh);
+            }
+            group.add(mesh);
+        }
 
         resolve({
           voxelMesh: group,
-          voxelCount: 0, // TODO: track count if needed
-          _voxelGrid: null // Grid export not fully supported in streaming mode yet
+          voxelCount: result.voxelCount || 0,
+          _voxelGrid: result.voxelGrid // Pass back the grid data if available
         });
       }
     };
