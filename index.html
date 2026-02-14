@@ -1,10 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
   <title>Voxel Earth Web</title>
-  <meta name="description" content="Voxel Earth Web is an educational photogrammetry explorer that streams Google Photorealistic 3D Tiles, visualizes voxel workflows, and exports scenes directly from the browser.">
+  <meta name="description"
+    content="Voxel Earth Web is an educational photogrammetry explorer that streams Google Photorealistic 3D Tiles, visualizes voxel workflows, and exports scenes directly from the browser.">
   <meta name="theme-color" content="#0b0e11">
   <meta name="color-scheme" content="dark">
   <meta name="application-name" content="Voxel Earth Web">
@@ -23,59 +25,131 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Voxel Earth Web">
   <meta property="og:title" content="Voxel Earth Web">
-  <meta property="og:description" content="Voxel Earth Web is an educational photogrammetry explorer that streams Google Photorealistic 3D Tiles, visualizes voxel workflows, and exports scenes directly from the browser.">
+  <meta property="og:description"
+    content="Voxel Earth Web is an educational photogrammetry explorer that streams Google Photorealistic 3D Tiles, visualizes voxel workflows, and exports scenes directly from the browser.">
   <meta property="og:image" content="/icons/coverwithattribution.jpg">
-  <meta property="og:image:alt" content="Voxel Earth preview banner showcasing photorealistic tiles and voxel overlays.">
+  <meta property="og:image:alt"
+    content="Voxel Earth preview banner showcasing photorealistic tiles and voxel overlays.">
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Voxel Earth Web">
-  <meta name="twitter:description" content="Voxel Earth Web is an educational photogrammetry explorer that streams Google Photorealistic 3D Tiles, visualizes voxel workflows, and exports scenes directly from the browser.">
+  <meta name="twitter:description"
+    content="Voxel Earth Web is an educational photogrammetry explorer that streams Google Photorealistic 3D Tiles, visualizes voxel workflows, and exports scenes directly from the browser.">
   <meta name="twitter:image" content="/icons/coverwithattribution.jpg">
-  <meta name="twitter:image:alt" content="Voxel Earth preview banner showcasing photorealistic tiles and voxel overlays.">
+  <meta name="twitter:image:alt"
+    content="Voxel Earth preview banner showcasing photorealistic tiles and voxel overlays.">
 
   <!-- Tailwind + Inter + Material Symbols + Leaflet -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Material+Symbols+Rounded:wght@300&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
-  
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Material+Symbols+Rounded:wght@300&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script>
     tailwind.config = {
-      theme: { extend: { fontFamily: { sans: ['Inter','system-ui','sans-serif'] } } }
+      theme: { extend: { fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] } } }
     }
   </script>
 
   <style>
-    html,body { margin:0; height:100%; overflow:hidden; background:#0b0e11; touch-action: none; }
-    body.policy-locked { overflow:hidden; }
-    canvas { position:fixed; inset:0 }
-    .glass { backdrop-filter: blur(14px); background: rgba(21,24,28,.55) }
-    .elev { box-shadow: 0 10px 30px rgba(0,0,0,.28), 0 1px 0 rgba(255,255,255,.04) }
-    .material-symbols-rounded { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24 }
-    .material-bold { font-variation-settings: 'FILL' 0, 'wght' 600, 'GRAD' 0, 'opsz' 24 }
-    .scrollbar-hide { scrollbar-width: none; -ms-overflow-style: none; }
-    .scrollbar-hide::-webkit-scrollbar { display: none; }
-    .composer { max-width:min(820px, 96vw) }
-    
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #0b0e11;
+      touch-action: none;
+    }
+
+    body.policy-locked {
+      overflow: hidden;
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0
+    }
+
+    .glass {
+      backdrop-filter: blur(14px);
+      background: rgba(21, 24, 28, .55)
+    }
+
+    .elev {
+      box-shadow: 0 10px 30px rgba(0, 0, 0, .28), 0 1px 0 rgba(255, 255, 255, .04)
+    }
+
+    .material-symbols-rounded {
+      font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24
+    }
+
+    .material-bold {
+      font-variation-settings: 'FILL' 0, 'wght' 600, 'GRAD' 0, 'opsz' 24
+    }
+
+    .scrollbar-hide {
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+
+    .scrollbar-hide::-webkit-scrollbar {
+      display: none;
+    }
+
+    .composer {
+      max-width: min(820px, 96vw)
+    }
+
     /* Mobile optimizations */
     @media (max-width: 768px) {
-      .composer { max-width: 96vw; }
-      .mobile-bottom { bottom: 80px; }
-      .mobile-safe { padding-bottom: env(safe-area-inset-bottom, 20px); }
-      .mobile-compact { padding: 0.75rem; }
-      .mobile-text { font-size: 0.875rem; }
-      .mobile-button { min-height: 44px; min-width: 44px; }
+      .composer {
+        max-width: 96vw;
+      }
+
+      .mobile-bottom {
+        bottom: 80px;
+      }
+
+      .mobile-safe {
+        padding-bottom: env(safe-area-inset-bottom, 20px);
+      }
+
+      .mobile-compact {
+        padding: 0.75rem;
+      }
+
+      .mobile-text {
+        font-size: 0.875rem;
+      }
+
+      .mobile-button {
+        min-height: 44px;
+        min-width: 44px;
+      }
     }
-    
+
     /* Touch targets */
-    button, input[type="range"], label { touch-action: manipulation; }
-    
+    button,
+    input[type="range"],
+    label {
+      touch-action: manipulation;
+    }
+
     /* Model picker styles */
-    .model-option .material-symbols-rounded:last-child { display: none; }
-    .model-option.selected .material-symbols-rounded:last-child { display: block; }
-    
+    .model-option .material-symbols-rounded:last-child {
+      display: none;
+    }
+
+    .model-option.selected .material-symbols-rounded:last-child {
+      display: block;
+    }
+
     /* Single scene resolution pill styles */
     .single-scene-res-pill.active {
       background: white;
@@ -85,37 +159,43 @@
     /* Single Scene panel scrollbar */
     #single-scene-panel .single-scene-scroll {
       scrollbar-width: thin;
-      scrollbar-color: rgba(255,255,255,.4) rgba(255,255,255,.08);
+      scrollbar-color: rgba(255, 255, 255, .4) rgba(255, 255, 255, .08);
     }
+
     #single-scene-panel .single-scene-scroll::-webkit-scrollbar {
       width: 8px;
     }
+
     #single-scene-panel .single-scene-scroll::-webkit-scrollbar-track {
-      background: rgba(255,255,255,.08);
+      background: rgba(255, 255, 255, .08);
       border-radius: 999px;
     }
+
     #single-scene-panel .single-scene-scroll::-webkit-scrollbar-thumb {
-      background: linear-gradient(180deg, rgba(255,255,255,.65), rgba(255,255,255,.35));
+      background: linear-gradient(180deg, rgba(255, 255, 255, .65), rgba(255, 255, 255, .35));
       border-radius: 999px;
-      border: 1px solid rgba(11,14,17,.65);
+      border: 1px solid rgba(11, 14, 17, .65);
     }
 
     /* Policy modal scroll region */
     #policy-banner .policy-scroll {
       scrollbar-width: thin;
-      scrollbar-color: rgba(255,255,255,.45) transparent;
+      scrollbar-color: rgba(255, 255, 255, .45) transparent;
     }
+
     #policy-banner .policy-scroll::-webkit-scrollbar {
       width: 6px;
     }
+
     #policy-banner .policy-scroll::-webkit-scrollbar-track {
       background: transparent;
     }
+
     #policy-banner .policy-scroll::-webkit-scrollbar-thumb {
-      background: rgba(255,255,255,.45);
+      background: rgba(255, 255, 255, .45);
       border-radius: 999px;
     }
-    
+
     /* Line clamp utility */
     .line-clamp-2 {
       display: -webkit-box;
@@ -124,52 +204,81 @@
       line-clamp: 2;
       overflow: hidden;
     }
-    
+
     /* Slider: thick track + visible filled portion */
     input[type="range"].slider {
-      --track: rgba(255,255,255,.14);
-      --fill:  #60a5fa; /* blue-400 */
+      --track: rgba(255, 255, 255, .14);
+      --fill: #60a5fa;
+      /* blue-400 */
       --thumb: #ffffff;
       -webkit-appearance: none;
       appearance: none;
       width: 100%;
       background: transparent;
       cursor: pointer;
-      height: 28px; /* bigger target */
+      height: 28px;
+      /* bigger target */
     }
-    input[type="range"].slider.slider-lg { height: 34px; }
+
+    input[type="range"].slider.slider-lg {
+      height: 34px;
+    }
+
     /* WebKit */
-    input[type="range"].slider::-webkit-slider-runnable-track{
+    input[type="range"].slider::-webkit-slider-runnable-track {
       height: 12px;
       background:
-        linear-gradient(var(--fill) 0 0) 0/var(--p,0%) 100% no-repeat,
+        linear-gradient(var(--fill) 0 0) 0/var(--p, 0%) 100% no-repeat,
         var(--track);
       border-radius: 6px;
     }
-    input[type="range"].slider.slider-lg::-webkit-slider-runnable-track{ height: 14px; }
-    input[type="range"].slider::-webkit-slider-thumb{
+
+    input[type="range"].slider.slider-lg::-webkit-slider-runnable-track {
+      height: 14px;
+    }
+
+    input[type="range"].slider::-webkit-slider-thumb {
       -webkit-appearance: none;
-      height: 20px; width: 20px; border-radius: 9999px;
+      height: 20px;
+      width: 20px;
+      border-radius: 9999px;
       background: var(--thumb);
-      border: 2px solid rgba(0,0,0,.35);
+      border: 2px solid rgba(0, 0, 0, .35);
       margin-top: -4px;
-      box-shadow: 0 0 0 1px rgba(255,255,255,.18);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, .18);
     }
+
     /* Firefox */
-    input[type="range"].slider::-moz-range-track{
-      height: 12px; background: var(--track); border: none; border-radius: 6px;
+    input[type="range"].slider::-moz-range-track {
+      height: 12px;
+      background: var(--track);
+      border: none;
+      border-radius: 6px;
     }
-    input[type="range"].slider.slider-lg::-moz-range-track{ height: 14px; }
-    input[type="range"].slider::-moz-range-progress{
-      height: 12px; background: var(--fill); border-radius: 6px;
+
+    input[type="range"].slider.slider-lg::-moz-range-track {
+      height: 14px;
     }
-    input[type="range"].slider.slider-lg::-moz-range-progress{ height: 14px; }
-    input[type="range"].slider::-moz-range-thumb{
-      height: 20px; width: 20px; border-radius: 9999px;
+
+    input[type="range"].slider::-moz-range-progress {
+      height: 12px;
+      background: var(--fill);
+      border-radius: 6px;
+    }
+
+    input[type="range"].slider.slider-lg::-moz-range-progress {
+      height: 14px;
+    }
+
+    input[type="range"].slider::-moz-range-thumb {
+      height: 20px;
+      width: 20px;
+      border-radius: 9999px;
       background: var(--thumb);
-      border: 2px solid rgba(0,0,0,.35);
-      box-shadow: 0 0 0 1px rgba(255,255,255,.18);
+      border: 2px solid rgba(0, 0, 0, .35);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, .18);
     }
+
     /* Options in dropdown */
     option {
       background: #15181c;
@@ -182,9 +291,9 @@
       appearance: none;
       -webkit-appearance: none;
       -moz-appearance: none;
-      box-shadow: 0 0 0 1px rgba(255,255,255,.18);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, .18);
     }
-    
+
     /* Leaflet map in glass panels */
     #single-scene-panel .leaflet-container {
       border-radius: 12px;
@@ -194,6 +303,7 @@
       will-change: transform;
       isolation: isolate;
     }
+
     #single-scene-panel .leaflet-map-pane,
     #single-scene-panel .leaflet-tile-pane,
     #single-scene-panel .leaflet-overlay-pane,
@@ -205,187 +315,218 @@
       will-change: transform;
       backface-visibility: hidden;
     }
-    #single-scene-panel .leaflet-tile { filter: none !important; -webkit-filter: none !important; }
-    
+
+    #single-scene-panel .leaflet-tile {
+      filter: none !important;
+      -webkit-filter: none !important;
+    }
+
     #single-scene-panel .leaflet-control-container {
       filter: invert(1) hue-rotate(180deg);
     }
   </style>
 </head>
+
 <body class="text-white font-sans selection:bg-white/20">
 
   <!-- Settings menu popup -->
-  <div id="settings-menu" class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-start z-50 px-2">
+  <div id="settings-menu"
+    class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-start z-50 px-2">
     <div class="w-full max-w-[min(820px,96vw)] mx-auto flex">
       <div class="glass elev rounded-2xl p-4 mobile-compact w-full md:w-[320px] max-w-[90vw] space-y-4">
         <div class="flex items-center justify-between">
           <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
-          <span class="material-symbols-rounded">tune</span> Options
+            <span class="material-symbols-rounded">tune</span> Options
+          </div>
+          <button id="menu-close"
+            class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
+            <span class="material-symbols-rounded text-lg">close</span>
+          </button>
         </div>
-        <button id="menu-close" class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
-          <span class="material-symbols-rounded text-lg">close</span>
-        </button>
-      </div>
 
-      <div class="space-y-4">
-        <div>
-          <div class="text-sm font-medium opacity-80 mb-2">Voxels</div>
-          <label class="inline-flex items-center cursor-pointer mobile-button">
+        <div class="space-y-4">
+          <div>
+            <div class="text-sm font-medium opacity-80 mb-2">Voxels</div>
+            <label class="inline-flex items-center cursor-pointer mobile-button">
+              <div class="relative">
+                <input id="toggle-vox" type="checkbox" class="sr-only peer" checked>
+                <div class="w-11 h-6 bg-white/10 peer-checked:bg-blue-500/80 rounded-full relative transition"></div>
+                <div
+                  class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5">
+                </div>
+              </div>
+              <span class="ml-3 text-sm opacity-85">Show voxels (default on)</span>
+            </label>
+          </div>
+
+          <div>
+            <div class="flex items-center justify-between">
+              <div class="text-sm font-medium opacity-80">Minecraft textures</div>
+              <label class="inline-flex items-center cursor-pointer mobile-button">
+                <div class="relative">
+                  <input id="toggle-mc" type="checkbox" class="sr-only peer" disabled>
+                  <div
+                    class="w-11 h-6 bg-white/10 peer-checked:bg-green-500/80 peer-disabled:opacity-50 rounded-full relative transition">
+                  </div>
+                  <div
+                    class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5">
+                  </div>
+                </div>
+              </label>
+            </div>
+            <div class="text-xs opacity-60 mt-1">Enable after voxels are on.</div>
+          </div>
+
+          <div class="cursor-pointer hover:bg-white/5 -mx-2 px-2 py-1 rounded" id="voxel-methods-btn">
+            <div class="flex items-stretch">
+              <div class="flex-1">
+                <div class="text-sm font-medium opacity-80">Voxelization Methods</div>
+                <div class="text-xs opacity-60 mt-1">Choose algorithm speed vs accuracy.</div>
+              </div>
+              <div class="flex items-center justify-center px-2">
+                <span class="material-symbols-rounded text-2xl opacity-70">edit</span>
+              </div>
+            </div>
+          </div>
+
+          <div id="debug-imagery-row" style="display: none;">
+            <div class="flex items-center justify-between">
+              <div class="text-sm font-medium opacity-80">Debug imagery</div>
+              <label class="inline-flex items-center cursor-pointer mobile-button">
+                <div class="relative">
+                  <input id="toggle-debug-imagery" type="checkbox" class="sr-only peer">
+                  <div class="w-11 h-6 bg-white/10 peer-checked:bg-orange-500/80 rounded-full relative transition">
+                  </div>
+                  <div
+                    class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5">
+                  </div>
+                </div>
+              </label>
+            </div>
+            <div class="text-xs opacity-60 mt-1">Hide original imagery to see voxel coverage.</div>
+          </div>
+
+          <div>
+            <div class="text-sm font-medium opacity-80 mb-2">Voxel resolution</div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-1 bg-white/5 rounded-xl p-1">
+              <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button"
+                data-res="32">Low</button>
+              <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button"
+                data-res="64">Med</button>
+              <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button"
+                data-res="128">High</button>
+              <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button"
+                data-res="256">Ultra</button>
+            </div>
+            <input id="res-fine" type="range" min="8" max="512" value="64" class="w-full accent-white/80 mt-2 h-8">
+            <div class="text-xs opacity-60 -mt-1">Drag to fine-tune</div>
+          </div>
+
+          <div>
+            <div class="flex items-center gap-2 text-sm font-semibold opacity-90 mb-2">
+              <span class="material-symbols-rounded">key</span> API Key
+            </div>
             <div class="relative">
-              <input id="toggle-vox" type="checkbox" class="sr-only peer" checked>
-              <div class="w-11 h-6 bg-white/10 peer-checked:bg-blue-500/80 rounded-full relative transition"></div>
-              <div class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5"></div>
+              <input id="google-api-key"
+                class="w-full rounded-xl bg-white/10 px-3 py-3 md:py-2 pr-16 outline-none mobile-text"
+                placeholder="Google Photoreal Tiles API key" />
+              <button id="save-settings"
+                class="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg bg-white/10 hover:bg-white/20 px-3 py-2 text-xs mobile-button">Save</button>
             </div>
-            <span class="ml-3 text-sm opacity-85">Show voxels (default on)</span>
-          </label>
-        </div>
-
-        <div>
-          <div class="flex items-center justify-between">
-            <div class="text-sm font-medium opacity-80">Minecraft textures</div>
-            <label class="inline-flex items-center cursor-pointer mobile-button">
-              <div class="relative">
-                <input id="toggle-mc" type="checkbox" class="sr-only peer" disabled>
-                <div class="w-11 h-6 bg-white/10 peer-checked:bg-green-500/80 peer-disabled:opacity-50 rounded-full relative transition"></div>
-                <div class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5"></div>
-              </div>
-            </label>
+            <div class="text-[11px] opacity-60 leading-4 mt-1">Stored locally in this browser.</div>
           </div>
-          <div class="text-xs opacity-60 mt-1">Enable after voxels are on.</div>
-        </div>
-
-        <div class="cursor-pointer hover:bg-white/5 -mx-2 px-2 py-1 rounded" id="voxel-methods-btn">
-          <div class="flex items-stretch">
-            <div class="flex-1">
-              <div class="text-sm font-medium opacity-80">Voxelization Methods</div>
-              <div class="text-xs opacity-60 mt-1">Choose algorithm speed vs accuracy.</div>
-            </div>
-            <div class="flex items-center justify-center px-2">
-              <span class="material-symbols-rounded text-2xl opacity-70">edit</span>
-            </div>
-          </div>
-        </div>
-
-        <div id="debug-imagery-row" style="display: none;">
-          <div class="flex items-center justify-between">
-            <div class="text-sm font-medium opacity-80">Debug imagery</div>
-            <label class="inline-flex items-center cursor-pointer mobile-button">
-              <div class="relative">
-                <input id="toggle-debug-imagery" type="checkbox" class="sr-only peer">
-                <div class="w-11 h-6 bg-white/10 peer-checked:bg-orange-500/80 rounded-full relative transition"></div>
-                <div class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5"></div>
-              </div>
-            </label>
-          </div>
-          <div class="text-xs opacity-60 mt-1">Hide original imagery to see voxel coverage.</div>
-        </div>
-
-        <div>
-          <div class="text-sm font-medium opacity-80 mb-2">Voxel resolution</div>
-          <div class="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-1 bg-white/5 rounded-xl p-1">
-            <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button" data-res="32">Low</button>
-            <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button" data-res="64">Med</button>
-            <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button" data-res="128">High</button>
-            <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button" data-res="256">Ultra</button>
-          </div>
-          <input id="res-fine" type="range" min="8" max="512" value="64" class="w-full accent-white/80 mt-2 h-8">
-          <div class="text-xs opacity-60 -mt-1">Drag to fine-tune</div>
-        </div>
-
-        <div>
-          <div class="flex items-center gap-2 text-sm font-semibold opacity-90 mb-2">
-            <span class="material-symbols-rounded">key</span> API Key
-          </div>
-          <div class="relative">
-            <input id="google-api-key" class="w-full rounded-xl bg-white/10 px-3 py-3 md:py-2 pr-16 outline-none mobile-text"
-                   placeholder="Google Photoreal Tiles API key"
-                  value=""/>
-            <button id="save-settings" class="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg bg-white/10 hover:bg-white/20 px-3 py-2 text-xs mobile-button">Save</button>
-          </div>
-          <div class="text-[11px] opacity-60 leading-4 mt-1">Stored locally in this browser.</div>
-        </div>
         </div>
       </div>
     </div>
   </div>
 
   <!-- Voxelization Methods menu popup -->
-  <div id="voxel-methods-menu" class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-start z-50 px-2">
+  <div id="voxel-methods-menu"
+    class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-start z-50 px-2">
     <div class="w-full max-w-[min(820px,96vw)] mx-auto flex">
       <div class="glass elev rounded-2xl p-4 mobile-compact w-full md:w-[320px] max-w-[90vw] space-y-4">
         <div class="flex items-center justify-between">
-          <button id="voxel-methods-back" class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
-          <span class="material-symbols-rounded text-lg">arrow_back</span>
-        </button>
-        <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
-          Voxelization Methods
-        </div>
-        <button id="voxel-methods-close" class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
-          <span class="material-symbols-rounded text-lg">close</span>
-        </button>
-      </div>
-
-      <div class="space-y-3">
-        <!-- 3D SAT (Original) Method -->
-        <label class="flex items-center p-3 rounded-xl hover:bg-white/5 cursor-pointer transition-colors">
-          <input name="voxel-method" type="radio" class="sr-only peer" value="3d-sat">
-          <div class="w-5 h-5 rounded-full border-2 border-white/30 peer-checked:border-blue-500 peer-checked:bg-blue-500 flex items-center justify-center mr-3 transition-colors">
-            <span class="material-symbols-rounded text-white text-xs opacity-0 peer-checked:opacity-100">check</span>
+          <button id="voxel-methods-back"
+            class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
+            <span class="material-symbols-rounded text-lg">arrow_back</span>
+          </button>
+          <div class="flex items-center gap-2 text-sm font-semibold opacity-90">
+            Voxelization Methods
           </div>
-          <div class="flex-1">
-            <div class="flex items-center gap-2 mb-1">
-              <div class="text-sm font-medium">3D SAT</div>
-              <div class="px-2 py-0.5 rounded-full bg-yellow-500/20 text-yellow-400 text-xs font-medium">~1x</div>
-            </div>
-            <div class="text-xs opacity-60 leading-relaxed">Full 3D separating axis tests. Most accurate but slower.</div>
-          </div>
-        </label>
-
-        <!-- 2.5D Scan Converter (Current Default) -->
-        <label class="flex items-center p-3 rounded-xl hover:bg-white/5 cursor-pointer transition-colors">
-          <input name="voxel-method" type="radio" class="sr-only peer" value="2.5d-scan" checked>
-          <div class="w-5 h-5 rounded-full border-2 border-white/30 peer-checked:border-blue-500 peer-checked:bg-blue-500 flex items-center justify-center mr-3 transition-colors">
-            <span class="material-symbols-rounded text-white text-xs opacity-0 peer-checked:opacity-100">check</span>
-          </div>
-          <div class="flex-1">
-            <div class="flex items-center gap-2 mb-1">
-              <div class="text-sm font-medium">2.5D Scan Converter</div>
-              <div class="px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 text-xs font-medium">~10x</div>
-              <div class="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 text-xs font-medium">DEFAULT</div>
-            </div>
-            <div class="text-xs opacity-60 leading-relaxed">Dominant-plane projection with incremental barycentric stepping.</div>
-          </div>
-        </label>
-
-        <!-- Rust WASM (Future) -->
-        <div class="flex items-center p-3 rounded-xl bg-white/2 opacity-70 cursor-not-allowed">
-          <div class="w-5 h-5 rounded-full border-2 border-white/30 flex items-center justify-center mr-3">
-            <span class="material-symbols-rounded text-white/30 text-xs">lock</span>
-          </div>
-          <div class="flex-1">
-            <div class="flex items-center gap-2 mb-1">
-              <div class="text-sm font-medium text-white/80">Rust WASM</div>
-              <div class="px-2 py-0.5 rounded-full bg-orange-500/10 text-orange-400/80 text-xs font-medium">~50x</div>
-              <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium">FUTURE</div>
-            </div>
-            <div class="text-xs opacity-60 leading-relaxed">Native-speed voxelization compiled to WebAssembly with SIMD optimizations.</div>
-          </div>
+          <button id="voxel-methods-close"
+            class="mobile-button w-8 h-8 rounded-full flex items-center justify-center hover:bg-white/10">
+            <span class="material-symbols-rounded text-lg">close</span>
+          </button>
         </div>
 
-        <!-- WebGPU (Coming Soon) -->
-        <div class="flex items-center p-3 rounded-xl bg-white/2 opacity-70 cursor-not-allowed">
-          <div class="w-5 h-5 rounded-full border-2 border-white/30 flex items-center justify-center mr-3">
-            <span class="material-symbols-rounded text-white/30 text-xs">lock</span>
-          </div>
-          <div class="flex-1">
-            <div class="flex items-center gap-2 mb-1">
-              <div class="text-sm font-medium text-white/80">WebGPU Compute</div>
-              <div class="px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400/80 text-xs font-medium">~100x</div>
-              <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium">COMING SOON</div>
+        <div class="space-y-3">
+          <!-- 3D SAT (Original) Method -->
+          <label class="flex items-center p-3 rounded-xl hover:bg-white/5 cursor-pointer transition-colors">
+            <input name="voxel-method" type="radio" class="sr-only peer" value="3d-sat">
+            <div
+              class="w-5 h-5 rounded-full border-2 border-white/30 peer-checked:border-blue-500 peer-checked:bg-blue-500 flex items-center justify-center mr-3 transition-colors">
+              <span class="material-symbols-rounded text-white text-xs opacity-0 peer-checked:opacity-100">check</span>
             </div>
-            <div class="text-xs opacity-60 leading-relaxed">GPU-accelerated parallel voxelization with compute shaders.</div>
+            <div class="flex-1">
+              <div class="flex items-center gap-2 mb-1">
+                <div class="text-sm font-medium">3D SAT</div>
+                <div class="px-2 py-0.5 rounded-full bg-yellow-500/20 text-yellow-400 text-xs font-medium">~1x</div>
+              </div>
+              <div class="text-xs opacity-60 leading-relaxed">Full 3D separating axis tests. Most accurate but slower.
+              </div>
+            </div>
+          </label>
+
+          <!-- 2.5D Scan Converter (Current Default) -->
+          <label class="flex items-center p-3 rounded-xl hover:bg-white/5 cursor-pointer transition-colors">
+            <input name="voxel-method" type="radio" class="sr-only peer" value="2.5d-scan" checked>
+            <div
+              class="w-5 h-5 rounded-full border-2 border-white/30 peer-checked:border-blue-500 peer-checked:bg-blue-500 flex items-center justify-center mr-3 transition-colors">
+              <span class="material-symbols-rounded text-white text-xs opacity-0 peer-checked:opacity-100">check</span>
+            </div>
+            <div class="flex-1">
+              <div class="flex items-center gap-2 mb-1">
+                <div class="text-sm font-medium">2.5D Scan Converter</div>
+                <div class="px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 text-xs font-medium">~10x</div>
+                <div class="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 text-xs font-medium">DEFAULT</div>
+              </div>
+              <div class="text-xs opacity-60 leading-relaxed">Dominant-plane projection with incremental barycentric
+                stepping.</div>
+            </div>
+          </label>
+
+          <!-- Rust WASM (Future) -->
+          <div class="flex items-center p-3 rounded-xl bg-white/2 opacity-70 cursor-not-allowed">
+            <div class="w-5 h-5 rounded-full border-2 border-white/30 flex items-center justify-center mr-3">
+              <span class="material-symbols-rounded text-white/30 text-xs">lock</span>
+            </div>
+            <div class="flex-1">
+              <div class="flex items-center gap-2 mb-1">
+                <div class="text-sm font-medium text-white/80">Rust WASM</div>
+                <div class="px-2 py-0.5 rounded-full bg-orange-500/10 text-orange-400/80 text-xs font-medium">~50x</div>
+                <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium">FUTURE</div>
+              </div>
+              <div class="text-xs opacity-60 leading-relaxed">Native-speed voxelization compiled to WebAssembly with
+                SIMD optimizations.</div>
+            </div>
           </div>
-        </div>
+
+          <!-- WebGPU (Coming Soon) -->
+          <div class="flex items-center p-3 rounded-xl bg-white/2 opacity-70 cursor-not-allowed">
+            <div class="w-5 h-5 rounded-full border-2 border-white/30 flex items-center justify-center mr-3">
+              <span class="material-symbols-rounded text-white/30 text-xs">lock</span>
+            </div>
+            <div class="flex-1">
+              <div class="flex items-center gap-2 mb-1">
+                <div class="text-sm font-medium text-white/80">WebGPU Compute</div>
+                <div class="px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400/80 text-xs font-medium">~100x
+                </div>
+                <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium">COMING SOON</div>
+              </div>
+              <div class="text-xs opacity-60 leading-relaxed">GPU-accelerated parallel voxelization with compute
+                shaders.</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -393,29 +534,37 @@
 
   <!-- Suggestions (like ChatGPT prompt suggestions) -->
   <div id="suggestions"
-       class="pointer-events-none fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-center z-30 px-2">
-    <div class="pointer-events-auto composer glass elev rounded-2xl px-3 py-2 flex flex-nowrap gap-2 md:gap-1 overflow-x-auto scrollbar-hide">
+    class="pointer-events-none fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-center z-30 px-2">
+    <div
+      class="pointer-events-auto composer glass elev rounded-2xl px-3 py-2 flex flex-nowrap gap-2 md:gap-1 overflow-x-auto scrollbar-hide">
       <!-- Filled by JS -->
     </div>
   </div>
 
   <!-- Search results popup -->
-  <div id="search-results" class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-center z-50 px-2">
-    <div class="composer glass elev rounded-2xl overflow-hidden divide-y divide-white/5 max-h-[60vh] overflow-y-auto"></div>
+  <div id="search-results"
+    class="hidden fixed inset-x-0 mobile-bottom bottom-[110px] md:bottom-[100px] flex justify-center z-50 px-2">
+    <div class="composer glass elev rounded-2xl overflow-hidden divide-y divide-white/5 max-h-[60vh] overflow-y-auto">
+    </div>
   </div>
 
   <!-- Bottom composer bar -->
   <footer class="pointer-events-none fixed left-0 right-0 bottom-0 z-40 mobile-safe">
     <div class="pointer-events-auto composer mx-auto px-2 md:px-3 pb-4">
       <div class="glass elev rounded-2xl px-2 md:px-3 py-3 md:py-2.5 flex items-center gap-2">
-        <button id="composer-plus" class="flex-shrink-0 mobile-button w-9 h-9 md:w-9 md:h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors" title="Options">
+        <button id="composer-plus"
+          class="flex-shrink-0 mobile-button w-9 h-9 md:w-9 md:h-9 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
+          title="Options">
           <span class="material-symbols-rounded material-bold text-lg">add</span>
         </button>
         <div class="flex-1 min-w-0 relative">
-          <input id="place-search" class="w-full bg-transparent outline-none text-base md:text-[15px] placeholder-white/60 py-1 pr-2"
-                 placeholder="Search places or paste 'lat,lon'"/>
+          <input id="place-search"
+            class="w-full bg-transparent outline-none text-base md:text-[15px] placeholder-white/60 py-1 pr-2"
+            placeholder="Search places or paste 'lat,lon'" />
         </div>
-        <button id="composer-send" class="flex-shrink-0 mobile-button w-9 h-9 md:w-9 md:h-9 rounded-full flex items-center justify-center bg-white/5 text-white/40 cursor-not-allowed transition-all" title="Go" disabled>
+        <button id="composer-send"
+          class="flex-shrink-0 mobile-button w-9 h-9 md:w-9 md:h-9 rounded-full flex items-center justify-center bg-white/5 text-white/40 cursor-not-allowed transition-all"
+          title="Go" disabled>
           <span class="material-symbols-rounded material-bold text-lg">arrow_upward</span>
         </button>
       </div>
@@ -427,7 +576,7 @@
 
   <!-- Status chip (very bottom right) -->
   <div id="status-chip"
-       class="fixed right-2 md:right-4 bottom-1 md:bottom-2 glass elev rounded-full px-2 md:px-3 py-1 md:py-1.5 text-[10px] md:text-xs opacity-80 z-30 pointer-events-none mobile-safe">
+    class="fixed right-2 md:right-4 bottom-1 md:bottom-2 glass elev rounded-full px-2 md:px-3 py-1 md:py-1.5 text-[10px] md:text-xs opacity-80 z-30 pointer-events-none mobile-safe">
     Ready
   </div>
 
@@ -435,41 +584,50 @@
   <div id="model-picker" class="fixed top-4 left-2 md:left-4 z-50">
     <div class="relative">
       <!-- Main Model Button -->
-      <button id="model-picker-btn" class="glass elev rounded-xl px-3 py-2 flex items-center gap-2 hover:bg-white/5 transition-colors">
+      <button id="model-picker-btn"
+        class="glass elev rounded-xl px-3 py-2 flex items-center gap-2 hover:bg-white/5 transition-colors">
         <span class="material-symbols-rounded text-blue-400">public</span>
         <div class="flex flex-col items-start">
           <div class="text-sm font-medium text-white">Voxel Earth 1.0</div>
           <div class="text-xs opacity-60 text-white/70">with Google Earth tiles</div>
         </div>
-        <span id="model-picker-arrow" class="material-symbols-rounded text-sm opacity-60 transition-transform duration-200">expand_more</span>
+        <span id="model-picker-arrow"
+          class="material-symbols-rounded text-sm opacity-60 transition-transform duration-200">expand_more</span>
       </button>
-      
+
       <!-- Dropdown Menu -->
-      <div id="model-picker-menu" class="hidden absolute top-full left-0 mt-1 w-80 glass elev rounded-xl overflow-hidden border border-white/10">
+      <div id="model-picker-menu"
+        class="hidden absolute top-full left-0 mt-1 w-80 glass elev rounded-xl overflow-hidden border border-white/10">
         <!-- Voxel Earth 1.0 (Current) -->
-        <div class="model-option selected flex items-center p-3 hover:bg-white/5 cursor-pointer transition-colors" data-model="voxel-earth">
+        <div class="model-option selected flex items-center p-3 hover:bg-white/5 cursor-pointer transition-colors"
+          data-model="voxel-earth">
           <span class="material-symbols-rounded text-blue-400 mr-3 flex-shrink-0">public</span>
           <div class="flex-1 min-w-0 mr-3">
             <div class="flex items-center gap-2 mb-1">
               <div class="text-sm font-medium text-white truncate">Voxel Earth 1.0</div>
-              <div class="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 text-xs font-medium flex-shrink-0">CURRENT</div>
+              <div class="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 text-xs font-medium flex-shrink-0">
+                CURRENT</div>
             </div>
-            <div class="text-xs opacity-60 text-white/70 line-clamp-2 pr-2">Stream and voxelize Google Earth imagery in real-time</div>
+            <div class="text-xs opacity-60 text-white/70 line-clamp-2 pr-2">Stream and voxelize Google Earth imagery in
+              real-time</div>
           </div>
           <div class="flex-shrink-0 w-8 flex justify-center">
             <span class="material-symbols-rounded text-blue-400 text-lg">check</span>
           </div>
         </div>
-        
+
         <!-- Single Scene -->
-        <div class="model-option flex items-center p-3 hover:bg-white/5 cursor-pointer transition-colors" data-model="single-scene">
+        <div class="model-option flex items-center p-3 hover:bg-white/5 cursor-pointer transition-colors"
+          data-model="single-scene">
           <span class="material-symbols-rounded text-green-400 mr-3 flex-shrink-0">landscape</span>
           <div class="flex-1 min-w-0 mr-3">
             <div class="flex items-center gap-2 mb-1">
               <div class="text-sm font-medium text-white truncate">Single Scene</div>
-              <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium flex-shrink-0">EXPORT</div>
+              <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium flex-shrink-0">
+                EXPORT</div>
             </div>
-            <div class="text-xs opacity-60 text-white/70 line-clamp-2 pr-2">Load a specific area and export as GLTF/Schematic</div>
+            <div class="text-xs opacity-60 text-white/70 line-clamp-2 pr-2">Load a specific area and export as
+              GLTF/Schematic</div>
           </div>
           <div class="flex-shrink-0 w-8 flex justify-center">
             <span class="material-symbols-rounded text-blue-400 text-lg">check</span>
@@ -483,36 +641,50 @@
   <div id="camera-controls" class="fixed top-4 right-2 md:right-4 z-40 space-y-1">
     <!-- Camera Mode Toggle -->
     <div class="glass elev rounded-lg p-1">
-      <button id="camera-mode-btn" class="mobile-button w-10 h-10 md:w-8 md:h-8 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Switch Camera Mode">
+      <button id="camera-mode-btn"
+        class="mobile-button w-10 h-10 md:w-8 md:h-8 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
+        title="Switch Camera Mode">
         <span class="material-symbols-rounded text-base md:text-sm">360</span>
       </button>
     </div>
 
     <!-- Compass -->
     <div class="glass elev rounded-lg p-1">
-      <button id="compass-btn" class="mobile-button w-10 h-10 md:w-8 md:h-8 rounded flex items-center justify-center hover:bg-white/10 transition-colors relative" title="Reset to North">
-        <span id="compass-needle" class="material-symbols-rounded text-base md:text-sm transition-transform duration-300" style="transform: rotate(0deg)">north</span>
+      <button id="compass-btn"
+        class="mobile-button w-10 h-10 md:w-8 md:h-8 rounded flex items-center justify-center hover:bg-white/10 transition-colors relative"
+        title="Reset to North">
+        <span id="compass-needle"
+          class="material-symbols-rounded text-base md:text-sm transition-transform duration-300"
+          style="transform: rotate(0deg)">north</span>
       </button>
     </div>
 
     <!-- Zoom Controls -->
     <div class="glass elev rounded-lg p-1 space-y-px">
-      <button id="zoom-in-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Zoom In">
+      <button id="zoom-in-btn"
+        class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
+        title="Zoom In">
         <span class="material-symbols-rounded text-sm md:text-xs">add</span>
       </button>
       <div class="h-px bg-white/10"></div>
-      <button id="zoom-out-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Zoom Out">
+      <button id="zoom-out-btn"
+        class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
+        title="Zoom Out">
         <span class="material-symbols-rounded text-sm md:text-xs">remove</span>
       </button>
     </div>
 
     <!-- Tilt Controls -->
     <div class="glass elev rounded-lg p-1 space-y-px">
-      <button id="tilt-up-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Tilt Up">
+      <button id="tilt-up-btn"
+        class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
+        title="Tilt Up">
         <span class="material-symbols-rounded text-sm md:text-xs">keyboard_arrow_up</span>
       </button>
       <div class="h-px bg-white/10"></div>
-      <button id="tilt-down-btn" class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors" title="Tilt Down">
+      <button id="tilt-down-btn"
+        class="mobile-button w-10 h-8 md:w-8 md:h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
+        title="Tilt Down">
         <span class="material-symbols-rounded text-sm md:text-xs">keyboard_arrow_down</span>
       </button>
     </div>
@@ -525,30 +697,30 @@
         <h2 class="text-sm font-semibold text-white mb-1">Single Scene Export</h2>
         <p class="text-xs text-white/60">Load and voxelize a specific area</p>
       </div>
-      
+
       <!-- Controls -->
       <div class="space-y-3">
         <div class="flex gap-2">
-          <button id="single-scene-fetch" 
-                  class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm">
+          <button id="single-scene-fetch"
+            class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm">
             Fetch Tiles
           </button>
         </div>
-        
+
         <!-- Map -->
         <div>
           <label class="block text-sm font-medium text-white/80 mb-2">Select Location</label>
           <div id="single-scene-map" class="w-full h-32 rounded-lg overflow-hidden"></div>
-          <input id="single-scene-coords" class="mt-2 w-full rounded-lg bg-white/10 px-2 py-1 text-xs outline-none" placeholder="lat,lon (click map to set)"/>
+          <input id="single-scene-coords" class="mt-2 w-full rounded-lg bg-white/10 px-2 py-1 text-xs outline-none"
+            placeholder="lat,lon (click map to set)" />
         </div>
-        
+
         <!-- Tile Controls -->
         <div id="single-scene-tile-controls" class="hidden" style="display:none;">
           <label class="block text-sm font-medium text-white/80 mb-2">
             Tiles: <span id="single-scene-tile-count">0</span>
           </label>
-          <input id="single-scene-tile-slider" type="range" min="-1" max="100" value="100"
-                 class="w-full slider"/>
+          <input id="single-scene-tile-slider" type="range" min="-1" max="100" value="100" class="w-full slider" />
         </div>
 
         <!-- Voxelization Controls (Single Scene) -->
@@ -564,13 +736,14 @@
             <!-- Radius (meters) -->
             <div class="mb-1">
               <label for="single-scene-radius" class="block text-sm font-medium text-white/80 mb-1">Radius</label>
-              <input id="single-scene-radius" type="range" min="20" max="3000" step="50" value="500" class="w-full slider slider-lg">
+              <input id="single-scene-radius" type="range" min="20" max="3000" step="50" value="500"
+                class="w-full slider slider-lg">
               <div class="flex justify-between items-center text-xs opacity-60 mt-1 gap-2">
                 <span>20 m</span>
                 <label class="flex items-center gap-1 text-white/90">
                   <input id="single-scene-radius-value" type="number" min="0" max="3000" value="500"
-                         class="w-20 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
-                         inputmode="numeric" />
+                    class="w-20 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
+                    inputmode="numeric" />
                   <span>m</span>
                 </label>
                 <span>3 km</span>
@@ -579,13 +752,14 @@
 
             <!-- SSE -->
             <div id="single-scene-sse-row" class="mb-1">
-              <label for="single-scene-sse" class="block text-sm font-medium text-white/80 mb-1">Screen Space Error (SSE)</label>
+              <label for="single-scene-sse" class="block text-sm font-medium text-white/80 mb-1">Screen Space Error
+                (SSE)</label>
               <input id="single-scene-sse" type="range" min="2" max="64" value="20" class="w-full slider slider-lg">
               <div class="flex justify-between items-center text-xs opacity-60 mt-1 gap-2">
                 <span>High detail</span>
                 <input id="single-scene-sse-value" type="number" min="2" max="64" value="20"
-                       class="w-16 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
-                       inputmode="numeric" />
+                  class="w-16 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
+                  inputmode="numeric" />
                 <span>Low detail</span>
               </div>
             </div>
@@ -593,13 +767,14 @@
             <!-- Rotation (Y) -->
             <div class="mb-1">
               <label for="single-scene-rot" class="block text-sm font-medium text-white/80 mb-1">Rotation (Y)</label>
-              <input id="single-scene-rot" type="range" min="0" max="360" step="1" value="0" class="w-full slider slider-lg">
+              <input id="single-scene-rot" type="range" min="0" max="360" step="1" value="0"
+                class="w-full slider slider-lg">
               <div class="flex justify-between items-center text-xs opacity-60 mt-1 gap-2">
                 <span>0°</span>
                 <label class="flex items-center gap-1 text-white/90">
                   <input id="single-scene-rot-value" type="number" min="0" max="360" value="0"
-                         class="w-16 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
-                         inputmode="numeric" />
+                    class="w-16 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
+                    inputmode="numeric" />
                   <span>°</span>
                 </label>
                 <span>360°</span>
@@ -613,8 +788,11 @@
                 <label class="inline-flex items-center cursor-pointer">
                   <div class="relative">
                     <input id="single-scene-debug-tiles" type="checkbox" class="sr-only peer">
-                    <div class="w-9 h-5 bg-white/10 peer-checked:bg-amber-500/80 rounded-full relative transition"></div>
-                    <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-4"></div>
+                    <div class="w-9 h-5 bg-white/10 peer-checked:bg-amber-500/80 rounded-full relative transition">
+                    </div>
+                    <div
+                      class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-4">
+                    </div>
                   </div>
                 </label>
               </div>
@@ -625,35 +803,42 @@
             <div class="mt-2">
               <label class="block text-sm font-medium text-white/80 mb-2">Voxel Density</label>
               <div class="grid grid-cols-2 gap-1 bg-white/5 rounded-lg p-1 mb-2">
-                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="32">Low</button>
-                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="64">Med</button>
-                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="128">High</button>
-                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10" data-res="256">Ultra</button>
+                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10"
+                  data-res="32">Low</button>
+                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10"
+                  data-res="64">Med</button>
+                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10"
+                  data-res="128">High</button>
+                <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10"
+                  data-res="256">Ultra</button>
               </div>
-              <input id="single-scene-res-fine" type="range" min="8" max="1024" value="64" class="w-full slider slider-lg">
+              <input id="single-scene-res-fine" type="range" min="8" max="1024" value="64"
+                class="w-full slider slider-lg">
               <div class="flex items-center gap-2 mt-2">
                 <input id="single-scene-res-input" type="number" min="8" max="2048" step="1"
-                       class="flex-1 rounded-lg bg-white/10 px-2 py-1 text-xs outline-none"
-                       placeholder="Enter custom resolution" value="64" />
+                  class="flex-1 rounded-lg bg-white/10 px-2 py-1 text-xs outline-none"
+                  placeholder="Enter custom resolution" value="64" />
                 <span class="text-xs opacity-60 whitespace-nowrap">voxels</span>
               </div>
-              <div class="text-xs opacity-60 mt-1">Fine-tune per-tile density. Larger capture areas automatically add more voxels.</div>
+              <div class="text-xs opacity-60 mt-1">Fine-tune per-tile density. Larger capture areas automatically add
+                more voxels.</div>
             </div>
           </div>
         </div>
 
 
         <!-- Single Scene export compliance -->
-        <div id="single-scene-compliance" class="mt-4 bg-white/5 border border-white/10 rounded-2xl p-3 space-y-2 text-xs text-white/70">
+        <div id="single-scene-compliance"
+          class="mt-4 bg-white/5 border border-white/10 rounded-2xl p-3 space-y-2 text-xs text-white/70">
           <p class="text-[11px] uppercase tracking-wide text-white/60">Before exporting</p>
           <label class="flex items-start gap-3">
             <input id="single-scene-confirm-no-photoreal" data-single-scene-compliance type="checkbox"
-                   class="mt-0.5 h-4 w-4 rounded border border-white/30 bg-transparent accent-white/80">
+              class="mt-0.5 h-4 w-4 rounded border border-white/30 bg-transparent accent-white/80">
             <span>I confirm the current scene contains no Google Photorealistic 3D Tiles or derivatives.</span>
           </label>
           <label class="flex items-start gap-3">
             <input id="single-scene-confirm-rights" data-single-scene-compliance type="checkbox"
-                   class="mt-0.5 h-4 w-4 rounded border border-white/30 bg-transparent accent-white/80">
+              class="mt-0.5 h-4 w-4 rounded border border-white/30 bg-transparent accent-white/80">
             <span>I have the necessary rights to export, process, or redistribute every asset in this scene.</span>
           </label>
           <p class="text-[11px] text-amber-200/80 flex items-center gap-2">
@@ -666,45 +851,53 @@
         <div id="single-scene-export-row" class="mt-2">
           <label class="block text-sm font-medium text-white/80 mb-1">Minecraft export</label>
           <div class="flex items-center gap-2">
-            <select id="single-scene-export-format" class="flex-1 min-w-0 bg-white/10 rounded-lg px-2 py-1 text-xs outline-none">
+            <select id="single-scene-export-format"
+              class="flex-1 min-w-0 bg-white/10 rounded-lg px-2 py-1 text-xs outline-none">
               <option value="nbt">Structure (.nbt)</option>
               <option value="schem">WorldEdit v2 (.schem)</option>
               <option value="schematic">MCEdit legacy (.schematic)</option>
               <option value="mcfunction">mcfunction (vanilla)</option>
             </select>
             <button id="single-scene-export-btn"
-                    class="flex-none bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-1.5 px-3 rounded-lg transition-colors text-xs disabled:opacity-40 disabled:cursor-not-allowed"
-                    disabled
-            >
+              class="flex-none bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-1.5 px-3 rounded-lg transition-colors text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+              disabled>
               Export
             </button>
           </div>
           <div class="text-[11px] opacity-60 mt-1">
-            <b>.nbt</b> = structure block format (Java). <b>.schem</b> = WorldEdit v2. <b>.schematic</b> = legacy MCEdit. <b>.mcfunction</b> places blocks at ~x ~y ~z.
+            <b>.nbt</b> = structure block format (Java). <b>.schem</b> = WorldEdit v2. <b>.schematic</b> = legacy
+            MCEdit. <b>.mcfunction</b> places blocks at ~x ~y ~z.
           </div>
         </div>
 
         <!-- Global Export GLB Button -->
         <div id="global-export-controls" class="mt-4">
-          <button id="export-glb-btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm disabled:opacity-40 disabled:cursor-not-allowed" disabled>
+          <button id="export-glb-btn"
+            class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-3 rounded-lg transition-colors text-sm disabled:opacity-40 disabled:cursor-not-allowed"
+            disabled>
             Export Current Scene as GLB
           </button>
         </div>
-        
+
         <!-- Log -->
-        <div id="single-scene-log" class="bg-black/20 rounded-lg p-2 text-xs text-white/80 font-mono max-h-20 overflow-y-auto hidden"></div>
+        <div id="single-scene-log"
+          class="bg-black/20 rounded-lg p-2 text-xs text-white/80 font-mono max-h-20 overflow-y-auto hidden"></div>
       </div>
     </div>
   </div>
 
   <!-- Google Maps / Photorealistic Tiles usage notice -->
-  <div id="policy-banner" class="hidden fixed inset-0 z-[60] flex items-start md:items-center justify-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-10 bg-black/80">
-    <div class="glass elev w-full max-w-[min(560px,96vw)] rounded-2xl p-5 sm:p-6 md:p-8 text-white flex flex-col gap-4 max-h-[calc(100vh-3rem)] overflow-hidden">
+  <div id="policy-banner"
+    class="hidden fixed inset-0 z-[60] flex items-start md:items-center justify-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-10 bg-black/80">
+    <div
+      class="glass elev w-full max-w-[min(560px,96vw)] rounded-2xl p-5 sm:p-6 md:p-8 text-white flex flex-col gap-4 max-h-[calc(100vh-3rem)] overflow-hidden">
       <div class="shrink-0">
         <p class="text-xs uppercase tracking-widest text-white/60 mb-2">Voxel Earth Educational Preview</p>
-        <h2 class="text-lg sm:text-xl font-semibold leading-snug">Read & accept the Google Maps Platform usage notice</h2>
+        <h2 class="text-lg sm:text-xl font-semibold leading-snug">Read & accept the Google Maps Platform usage notice
+        </h2>
       </div>
-      <div class="policy-scroll flex-1 min-h-0 space-y-3 text-sm text-white/80 leading-relaxed overflow-y-auto pr-1 sm:pr-2">
+      <div
+        class="policy-scroll flex-1 min-h-0 space-y-3 text-sm text-white/80 leading-relaxed overflow-y-auto pr-1 sm:pr-2">
         <p>
           This demo loads Google Photorealistic 3D Tiles through the Google Maps Platform Tiles API. It is provided for
           educational and experimental use only ("Voxel Earth") to illustrate how to request tiles, apply a screen-space
@@ -713,29 +906,33 @@
         <ul class="list-disc pl-5 space-y-2">
           <li>
             By continuing you confirm you have reviewed and will comply with the
-            <a href="https://cloud.google.com/maps-platform/terms" target="_blank" rel="noreferrer noopener" class="text-blue-300 underline">
+            <a href="https://cloud.google.com/maps-platform/terms" target="_blank" rel="noreferrer noopener"
+              class="text-blue-300 underline">
               Google Maps Platform Terms of Service
             </a>
             and the
-            <a href="https://developers.google.com/maps/documentation/tile/policies" target="_blank" rel="noreferrer noopener" class="text-blue-300 underline">
+            <a href="https://developers.google.com/maps/documentation/tile/policies" target="_blank"
+              rel="noreferrer noopener" class="text-blue-300 underline">
               Map Tiles & Photorealistic 3D Tiles policies
             </a>.
           </li>
-          <li>You are fully responsible for how you access, render, process, or share Google data, and offline caching, redistribution, or creating derivative content outside Google&rsquo;s allowed use cases is strictly prohibited.</li>
+          <li>You are fully responsible for how you access, render, process, or share Google data, and offline caching,
+            redistribution, or creating derivative content outside Google&rsquo;s allowed use cases is strictly
+            prohibited.</li>
         </ul>
         <p class="text-xs text-white/70">
-          If you cannot accept these requirements you may close this tab or review the official policies linked above for more details.
+          If you cannot accept these requirements you may close this tab or review the official policies linked above
+          for more details.
         </p>
       </div>
       <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between text-sm shrink-0">
-        <button id="policy-accept" class="flex-1 bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2.5 rounded-lg transition-colors">
+        <button id="policy-accept"
+          class="flex-1 bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2.5 rounded-lg transition-colors">
           I understand & agree
         </button>
-        <a id="policy-review"
-           href="https://developers.google.com/maps/documentation/tile/policies"
-           target="_blank"
-           rel="noreferrer noopener"
-           class="flex items-center justify-center gap-2 text-white/70 hover:text-white transition-colors">
+        <a id="policy-review" href="https://developers.google.com/maps/documentation/tile/policies" target="_blank"
+          rel="noreferrer noopener"
+          class="flex items-center justify-center gap-2 text-white/70 hover:text-white transition-colors">
           <span class="material-symbols-rounded text-base">gavel</span>
           <span>Review Google policies</span>
         </a>
@@ -751,44 +948,45 @@
   <button id="download" class="hidden"></button>
 
   <script>
-    (function () {
-      const overlay = document.getElementById('policy-banner');
-      if (!overlay) return;
+      (function () {
+        const overlay = document.getElementById('policy-banner');
+        if (!overlay) return;
 
-      const STORAGE_KEY = 'voxel-earth-policy-accepted';
-      const body = document.body;
-      const acceptBtn = document.getElementById('policy-accept');
+        const STORAGE_KEY = 'voxel-earth-policy-accepted';
+        const body = document.body;
+        const acceptBtn = document.getElementById('policy-accept');
 
-      const hideOverlay = () => {
-        overlay.classList.add('hidden');
-        body.classList.remove('policy-locked');
-      };
-      const showOverlay = () => {
-        overlay.classList.remove('hidden');
-        body.classList.add('policy-locked');
-      };
+        const hideOverlay = () => {
+          overlay.classList.add('hidden');
+          body.classList.remove('policy-locked');
+        };
+        const showOverlay = () => {
+          overlay.classList.remove('hidden');
+          body.classList.add('policy-locked');
+        };
 
-      if (localStorage.getItem(STORAGE_KEY) === 'yes') {
-        hideOverlay();
-      } else {
-        showOverlay();
-      }
+        if (localStorage.getItem(STORAGE_KEY) === 'yes') {
+          hideOverlay();
+        } else {
+          showOverlay();
+        }
 
-      acceptBtn?.addEventListener('click', () => {
-        localStorage.setItem(STORAGE_KEY, 'yes');
-        hideOverlay();
-      });
+        acceptBtn?.addEventListener('click', () => {
+          localStorage.setItem(STORAGE_KEY, 'yes');
+          hideOverlay();
+        });
 
-    })();
+      })();
   </script>
   <script type="module" src="/src/map.js"></script>
   <script>
     // Lightweight SW registrar; ignores errors (e.g., unsupported contexts)
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js').catch(()=>{});
+        navigator.serviceWorker.register('/sw.js').catch(() => { });
       });
     }
   </script>
 </body>
+
 </html>

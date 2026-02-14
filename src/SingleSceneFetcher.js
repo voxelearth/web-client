@@ -130,7 +130,7 @@ export class SingleSceneFetcher {
     this._sessionTs = 0;
   }
 
-  async fetch3DTiles(lat, lng, zoom, targetScreenSpaceError, apiKey, logFn, radiusMeters) {
+  async fetch3DTiles(lat, lng, zoom, targetScreenSpaceError, apiKey, logFn, radiusMeters, rootUrlString) {
     const radius = Math.max(50, Number.isFinite(radiusMeters) ? radiusMeters : 500);
     const centerECEF = cartesianFromDegrees(lng, lat, 0);
     const regionSphere = new Sphere(centerECEF, radius);
@@ -142,8 +142,13 @@ export class SingleSceneFetcher {
     }
     this._visitedTilesets = new Set();
     const urls = [];
-    const rootUrl = new URL('https://tile.googleapis.com/v1/3dtiles/root.json');
-    rootUrl.searchParams.set('key', apiKey);
+    const rootUrl = rootUrlString ? new URL(rootUrlString) : new URL('https://tile.googleapis.com/v1/3dtiles/root.json');
+
+    // Only append key for Google host
+    if (rootUrl.hostname === 'tile.googleapis.com' && apiKey && !rootUrl.searchParams.has('key')) {
+      rootUrl.searchParams.set('key', apiKey);
+    }
+
     if (sessionRef.value && !rootUrl.searchParams.has('session')) {
       rootUrl.searchParams.set('session', sessionRef.value);
     }
@@ -187,7 +192,7 @@ export class SingleSceneFetcher {
       return;
     }
     if (!resp.ok) {
-      if (sessionRef.value && [400,401,403].includes(resp.status)) {
+      if (sessionRef.value && [400, 401, 403].includes(resp.status)) {
         logFn?.(`Session rejected (HTTP ${resp.status}); retrying without session.`);
         this._clearSession(sessionRef);
         if (attempt < 1) {
@@ -208,7 +213,7 @@ export class SingleSceneFetcher {
     try {
       const respSession = new URL(resp.url).searchParams.get('session');
       if (respSession) this._setSession(sessionRef, respSession);
-    } catch {}
+    } catch { }
     if (!json?.root) return;
     await this._walkNode(json.root, urlObj, regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth);
   }

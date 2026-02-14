@@ -23,6 +23,7 @@ self.addEventListener('message', (evt) => {
 function isRootJsonRequest(req) {
   try {
     const url = new URL(req.url);
+    if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return false;
     // Match .../v1/3dtiles/root.json (with or without query params)
     return /\/v1\/3dtiles\/root\.json$/i.test(url.pathname);
   } catch {
@@ -46,7 +47,7 @@ async function handleRootJson(request) {
 
   let ts = 0;
   if (tsRes) {
-    try { ts = parseInt(await tsRes.text(), 10) || 0; } catch {}
+    try { ts = parseInt(await tsRes.text(), 10) || 0; } catch { }
   }
   const age = Date.now() - ts;
 

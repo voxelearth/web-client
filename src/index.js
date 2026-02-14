@@ -1,16 +1,16 @@
 /* index.js – viewer / voxeliser / Minecraft‑toggle coordinator + schematic exporter */
 
-import { Viewer }               from './Viewer.js';
-import { UI }                   from './UI.js';
-import { voxelizeModel }        from './voxelize-model.js';
-import { GUI }                  from 'three/addons/libs/lil-gui.module.min.js';
-import { load }                 from '@loaders.gl/core';
-import { Tileset3D }            from '@loaders.gl/tiles';
-import { Tiles3DLoader }        from '@loaders.gl/3d-tiles';
-import { WebMercatorViewport }  from '@deck.gl/core';
+import { Viewer } from './Viewer.js';
+import { UI } from './UI.js';
+import { voxelizeModel } from './voxelize-model.js';
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+import { load } from '@loaders.gl/core';
+import { Tileset3D } from '@loaders.gl/tiles';
+import { Tiles3DLoader } from '@loaders.gl/3d-tiles';
+import { WebMercatorViewport } from '@deck.gl/core';
 import { initBlockData, assignVoxelsToBlocks } from './assignToBlocksForGLB.js';
-import * as BlockLib            from './assignToBlocksForGLB.js';
-import * as THREE               from 'three';
+import * as BlockLib from './assignToBlocksForGLB.js';
+import * as THREE from 'three';
 
 /* heavy schematic libs will be lazy‑loaded */
 let exportToSchematicFn = null;
@@ -18,13 +18,13 @@ let exportToSchematicFn = null;
 /* ------------------------------------------------------------------ */
 /* UI set‑up                                                          */
 /* ------------------------------------------------------------------ */
-const ui  = new UI();
+const ui = new UI();
 const gui = new GUI({ width: 260 });
 
 const voxCtrl = {
-  resolution : 64,
-  visible    : true,
-  minecraft  : false
+  resolution: 64,
+  visible: true,
+  minecraft: false
 };
 
 const voxFolder = gui.addFolder('Voxels');
@@ -37,9 +37,9 @@ voxFolder
   .add(voxCtrl, 'visible')
   .name('Show Voxels')
   .onChange(flag => {
-    if (viewer.colorMesh      ) viewer.colorMesh.visible      = flag && !voxCtrl.minecraft;
-    if (viewer.mcGroup        ) viewer.mcGroup.visible        = flag &&  voxCtrl.minecraft;
-    if (viewer.tilesContainer ) viewer.tilesContainer.visible = !flag;
+    if (viewer.colorMesh) viewer.colorMesh.visible = flag && !voxCtrl.minecraft;
+    if (viewer.mcGroup) viewer.mcGroup.visible = flag && voxCtrl.minecraft;
+    if (viewer.tilesContainer) viewer.tilesContainer.visible = !flag;
   });
 
 voxFolder
@@ -51,7 +51,7 @@ voxFolder.open();
 /* Extra UI – export schematic button -------------------------------- */
 const actionFolder = gui.addFolder('Export');
 actionFolder
-  .add({ exportSchematic : exportCurrentSchematic }, 'exportSchematic')
+  .add({ exportSchematic: exportCurrentSchematic }, 'exportSchematic')
   .name('Export .schem');
 actionFolder.open();
 
@@ -65,7 +65,7 @@ const viewer = new Viewer({
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
-function disposeMesh (obj) {
+function disposeMesh(obj) {
   if (!obj) return;
   obj.traverse(o => {
     if (o.isMesh) {
@@ -86,7 +86,7 @@ function disposeMesh (obj) {
 /* ------------------------------------------------------------------ */
 let voxelising = false;
 
-async function buildVoxels (res) {
+async function buildVoxels(res) {
   if (voxelising || !viewer.tilesContainer) return;
   voxelising = true;
 
@@ -98,22 +98,22 @@ async function buildVoxels (res) {
   viewer.colorMesh = viewer.mcGroup = null;
 
   try {
-    const t0  = performance.now();
+    const t0 = performance.now();
     const vox = await voxelizeModel({
-      model      : viewer.tilesContainer,
-      renderer   : viewer.renderer,
-      resolution : res,
-      scene      : viewer.scene
+      model: viewer.tilesContainer,
+      renderer: viewer.renderer,
+      resolution: res,
+      scene: viewer.scene
     });
 
     /* store references */
-    viewer.voxelizer  = vox;
-    viewer.colorMesh  = vox.voxelMesh;
+    viewer.voxelizer = vox;
+    viewer.colorMesh = vox.voxelMesh;
     viewer.colorMesh.visible = voxCtrl.visible && !voxCtrl.minecraft;
     viewer.scene.add(viewer.colorMesh);
     viewer.tilesContainer.visible = !voxCtrl.visible;
 
-    ui.log(`✅ Voxelised (${vox.voxelCount.toLocaleString()} voxels) in ${(performance.now()-t0).toFixed(1)} ms`);
+    ui.log(`✅ Voxelised (${vox.voxelCount.toLocaleString()} voxels) in ${(performance.now() - t0).toFixed(1)} ms`);
 
     /* if MC toggle already on – regenerate block mesh */
     if (voxCtrl.minecraft) await handleMinecraftToggle(true, /*clearOnly=*/false);
@@ -128,7 +128,7 @@ async function buildVoxels (res) {
 /* ------------------------------------------------------------------ */
 /* MC toggle                                                          */
 /* ------------------------------------------------------------------ */
-async function handleMinecraftToggle (enabled, clearOnly = false) {
+async function handleMinecraftToggle(enabled, clearOnly = false) {
   if (!viewer.voxelizer) {
     ui.log('Voxelise first!');
     voxCtrl.minecraft = false;
@@ -150,7 +150,7 @@ async function handleMinecraftToggle (enabled, clearOnly = false) {
   /* hand scene to helper */
   const sceneWrapper = viewer.scene;
   sceneWrapper._voxelGrid = viewer.voxelizer._voxelGrid;
-  if (!sceneWrapper.editor) sceneWrapper.editor = { update (){} };
+  if (!sceneWrapper.editor) sceneWrapper.editor = { update() { } };
 
   await assignVoxelsToBlocks(sceneWrapper);
 
@@ -162,7 +162,7 @@ async function handleMinecraftToggle (enabled, clearOnly = false) {
     return;
   }
 
-  viewer.mcGroup.visible   = voxCtrl.visible;
+  viewer.mcGroup.visible = voxCtrl.visible;
   if (viewer.colorMesh) viewer.colorMesh.visible = false;
   ui.log('✅ Minecraft conversion done');
 }
@@ -170,7 +170,7 @@ async function handleMinecraftToggle (enabled, clearOnly = false) {
 /* ------------------------------------------------------------------ */
 /* Export current voxel grid → Sponge .schem                          */
 /* ------------------------------------------------------------------ */
-async function exportCurrentSchematic () {
+async function exportCurrentSchematic() {
   if (!viewer.voxelizer || !viewer.voxelizer._voxelGrid) {
     ui.log('Voxelise first!');
     return;
@@ -197,33 +197,33 @@ async function exportCurrentSchematic () {
 /* ------------------------------------------------------------------ */
 /* GOOGLE 3‑D‑TILES fetcher                                           */
 /* ------------------------------------------------------------------ */
-async function fetch3DTiles () {
+async function fetch3DTiles() {
   ui.setDebugSliderVisibility(false);
-  const { lat,lng,zoom } = ui.getLatLngZoom();
-  const GOOGLE_API_KEY   = ui.getGoogleAPIKey();
+  const { lat, lng, zoom } = ui.getLatLngZoom();
+  const GOOGLE_API_KEY = ui.getGoogleAPIKey();
 
-  const tilesetUrl = `https://tile.googleapis.com/v1/3dtiles/root.json?key=${GOOGLE_API_KEY}`;
-  const targetSSE  = ui.getScreenSpaceError();
+  const tilesetUrl = ui.getTilesetUrl();
+  const targetSSE = ui.getScreenSpaceError();
   ui.log(`Fetching tiles at (${lat},${lng},z${zoom},sse ${targetSSE})`);
 
-  const viewport = new WebMercatorViewport({ width:230,height:175, latitude:lat, longitude:lng, zoom });
-  const json     = await load(tilesetUrl, Tiles3DLoader, { '3d-tiles': { loadGLTF:false }});
-  const tiles3d  = new Tileset3D(json, { maximumScreenSpaceError: targetSSE, throttleRequests:false });
+  const viewport = new WebMercatorViewport({ width: 230, height: 175, latitude: lat, longitude: lng, zoom });
+  const json = await load(tilesetUrl, Tiles3DLoader, { '3d-tiles': { loadGLTF: false } });
+  const tiles3d = new Tileset3D(json, { maximumScreenSpaceError: targetSSE, throttleRequests: false });
   while (!tiles3d.isLoaded()) await tiles3d.selectTiles(viewport);
 
   const session = new URL(`https://x?${tiles3d.queryParams}`).searchParams.get('session');
-  const tiles   = [...tiles3d.tiles].sort((a,b)=>a.header.geometricError-b.header.geometricError);
-  const urls    = [];
+  const tiles = [...tiles3d.tiles].sort((a, b) => a.header.geometricError - b.header.geometricError);
+  const urls = [];
 
   for (const t of tiles) {
     if (Math.abs(targetSSE - t.header.geometricError) <= targetSSE) {
       urls.push(`${t.contentUrl}?key=${GOOGLE_API_KEY}&session=${session}`);
-      if (urls.length>=100) break;
+      if (urls.length >= 100) break;
     }
   }
   if (!urls.length) {
     ui.log('No tiles matched SSE – fetching a few anyway …');
-    tiles.slice(0,50).forEach(t=>urls.push(`${t.contentUrl}?key=${GOOGLE_API_KEY}&session=${session}`));
+    tiles.slice(0, 50).forEach(t => urls.push(`${t.contentUrl}?key=${GOOGLE_API_KEY}&session=${session}`));
   }
 
   viewer.loadGLTFTiles(urls, ui.log);
@@ -234,7 +234,7 @@ async function fetch3DTiles () {
 /* ------------------------------------------------------------------ */
 /* UI callbacks                                                      */
 /* ------------------------------------------------------------------ */
-ui.onFetch             = fetch3DTiles;
-ui.onDownload          = () => viewer.generateCombineGltf();
-ui.onTileSliderChange  = v => viewer.gltfArray.forEach((gltf,i)=>gltf.scene.visible = i<=v);
-ui.onExportSchematic   = exportCurrentSchematic;
+ui.onFetch = fetch3DTiles;
+ui.onDownload = () => viewer.generateCombineGltf();
+ui.onTileSliderChange = v => viewer.gltfArray.forEach((gltf, i) => gltf.scene.visible = i <= v);
+ui.onExportSchematic = exportCurrentSchematic;
