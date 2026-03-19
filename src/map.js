@@ -27,6 +27,7 @@ import { SingleSceneViewer } from './SingleSceneViewer.js';
 import { SingleSceneFetcher } from './SingleSceneFetcher.js';
 import { getActiveServerUrl, isLocalServer } from './config.js';
 
+const LEGACY_SRGB_ENCODING = 3001;
 const SESSION_MAX_AGE_MS = 2.5 * 60 * 60 * 1000;
 let __tilesSessionId = null;
 let __tilesSessionTs = 0;
@@ -1826,6 +1827,11 @@ let lastVoxelUpdateTime = 0;
     antialias: true,
     powerPreference: 'high-performance'
   });
+  if (THREE.SRGBColorSpace !== undefined) {
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+  } else if ('outputEncoding' in renderer) {
+    renderer.outputEncoding = LEGACY_SRGB_ENCODING;
+  }
   document.body.appendChild(renderer.domElement);
 
   scene = new THREE.Scene();

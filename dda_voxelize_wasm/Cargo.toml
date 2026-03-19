@@ -1,0 +1,17 @@
+[package]
+name = "dda_voxelize_wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+dda-voxelize = "0.2.0-alpha.1"
+
+# optional but nice for better Rust panics in the browser console
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+default = ["console_error_panic_hook"]

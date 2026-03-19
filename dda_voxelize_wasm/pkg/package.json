@@ -1,0 +1,15 @@
+{
+  "name": "dda_voxelize_wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "dda_voxelize_wasm_bg.wasm",
+    "dda_voxelize_wasm.js",
+    "dda_voxelize_wasm.d.ts"
+  ],
+  "main": "dda_voxelize_wasm.js",
+  "types": "dda_voxelize_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

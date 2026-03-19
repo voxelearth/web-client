@@ -1,5 +1,56 @@
 import * as THREE from 'three';
 
+function nowMs() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+const SERIALIZED_MODEL_CACHE = new WeakMap();
+
+function clonePlain(value) {
+  if (typeof structuredClone === 'function') return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+function cloneSerializedModel(template) {
+  return {
+    meshes: template.meshes.map(mesh => ({
+      geometry: {
+        attributes: Object.fromEntries(
+          Object.entries(mesh.geometry.attributes).map(([name, attr]) => [
+            name,
+            {
+              array: new attr.array.constructor(attr.array),
+              itemSize: attr.itemSize,
+            },
+          ])
+        ),
+        groups: clonePlain(mesh.geometry.groups),
+        index: mesh.geometry.index
+          ? { array: new mesh.geometry.index.array.constructor(mesh.geometry.index.array) }
+          : null,
+      },
+      materials: mesh.materials.slice(),
+      matrixWorld: mesh.matrixWorld.slice(),
+    })),
+    materials: clonePlain(template.materials),
+    imageDatas: template.imageDatas.map(([uuid, imageData]) => [
+      uuid,
+      {
+        data: new Uint8ClampedArray(imageData.data),
+        width: imageData.width,
+        height: imageData.height,
+      },
+    ]),
+    bbox: {
+      min: template.bbox.min.slice(),
+      max: template.bbox.max.slice(),
+    },
+  };
+}
+
 /* --------------------------------------------------------------- */
 /* helper – extract raw RGBA Uint8Array from any THREE texture     */
 /* --------------------------------------------------------------- */
@@ -33,7 +84,13 @@ function textureToPixels(tex) {
 /* --------------------------------------------------------------- */
 /* 1️⃣  serialise the model                                         */
 /* --------------------------------------------------------------- */
-function serializeModel(model, { preRotateYDeg = 0 } = {}) {
+export function serializeModel(model, { preRotateYDeg = 0, cache = true } = {}) {
+  const useCache = cache && Math.abs(preRotateYDeg) <= 0.0001;
+  if (useCache) {
+    const cached = SERIALIZED_MODEL_CACHE.get(model);
+    if (cached) return cloneSerializedModel(cached);
+  }
+
   const meshes        = [];
   const materialStore = new Map();   // uuid → serialised material
   const imageStore    = new Map();   // uuid → ImageData
@@ -66,6 +123,7 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
           m[key] = {
             imageUuid : t.source.uuid,
             encoding  : t.encoding,
+            colorSpace: t.colorSpace,
             flipY     : t.flipY,
             wrapS     : t.wrapS,
             wrapT     : t.wrapT,
@@ -130,12 +188,19 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
     bbox.min.copy(rbbox.min); bbox.max.copy(rbbox.max);
   }
 
-  return {
+  const serialized = {
     meshes,
     materials  : Array.from(materialStore.values()),
     imageDatas : Array.from(imageStore.entries()),     // [uuid, ImageData]
     bbox       : { min: bbox.min.toArray(), max: bbox.max.toArray() }
   };
+
+  if (useCache) {
+    SERIALIZED_MODEL_CACHE.set(model, serialized);
+    return cloneSerializedModel(serialized);
+  }
+
+  return serialized;
 }
 
 /* --------------------------------------------------------------- */
@@ -143,6 +208,8 @@ function serializeModel(model, { preRotateYDeg = 0 } = {}) {
 /* --------------------------------------------------------------- */
 export function voxelizeModel({ model, resolution = 200, needGrid = false, method = '2.5d-scan', onStart, preRotateYDeg = 0 }) {
   return new Promise((resolve, reject) => {
+    const serializeStartedAt = nowMs();
+    let workerPostedAt = 0;
 
     const worker = new Worker(
       new URL('./voxelizer.worker.js', import.meta.url),
@@ -152,6 +219,7 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
 
     worker.onmessage = e => {
       const { status, result, message, stack } = e.data;
+      const workerCompletedAt = nowMs();
       worker.terminate();
 
       if (status === 'error') {
@@ -160,6 +228,7 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
       }
 
       /* rebuild THREE geometries with chunk bounds for frustum culling */
+      const rebuildStartedAt = nowMs();
       const group = new THREE.Group();
       for (const g of result.geometries) {
         const geom = new THREE.BufferGeometry();
@@ -216,10 +285,18 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
         }
         group.add(mesh);
       }
+      const rebuildCompletedAt = nowMs();
 
       resolve({
         voxelMesh : group,
         voxelCount: result.voxelCount,
+        stats: {
+          serializeMs: workerPostedAt - serializeStartedAt,
+          workerMs: workerCompletedAt - workerPostedAt,
+          rebuildMs: rebuildCompletedAt - rebuildStartedAt,
+          totalMs: rebuildCompletedAt - serializeStartedAt,
+          ...(result.stats || {}),
+        },
         _voxelGrid: result.voxelGrid
           ? {
               ...result.voxelGrid,
@@ -237,6 +314,7 @@ export function voxelizeModel({ model, resolution = 200, needGrid = false, metho
     worker.onerror = err => { worker.terminate(); reject(err); };
 
   const payload = serializeModel(model, { preRotateYDeg });
+    workerPostedAt = nowMs();
 
     /* collect ArrayBuffers for zero-copy transfer */
     const transfers = [];

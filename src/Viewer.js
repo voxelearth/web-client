@@ -4,6 +4,9 @@ import { GLTFLoader }     from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader }    from 'three/addons/loaders/DRACOLoader.js';
 import { GLTFExporter }   from 'three/addons/exporters/GLTFExporter.js';
 import { WebGPURenderer } from 'three/webgpu';
+import { loadGltfBatch }  from './loadGltfBatch.js';
+
+const LEGACY_SRGB_ENCODING = 3001;
 
 /**
  * Minimal viewer for Google-3D-Tiles.
@@ -27,6 +30,11 @@ export class Viewer {
       renderer = new WebGPURenderer({ antialias: true, forceWebGL: false });
     } else {
       renderer = new THREE.WebGLRenderer({ antialias: true });
+    }
+    if (THREE.SRGBColorSpace !== undefined && 'outputColorSpace' in renderer) {
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+    } else if ('outputEncoding' in renderer) {
+      renderer.outputEncoding = LEGACY_SRGB_ENCODING;
     }
     document.body.appendChild(renderer.domElement);
 
@@ -81,17 +89,34 @@ export class Viewer {
     if (this.tilesContainer) scene.remove(this.tilesContainer);
 
     const tilesContainer = new THREE.Object3D();
-    const gltfArray      = [];
+    const { gltfs: gltfArray, stats } = await loadGltfBatch({
+      urls: urlArray,
+      concurrency: 8,
+      loadOne: fetchGltf,
+      onProgress: ({ index, total, loaded, failed, ok, error }) => {
+        if (ok) {
+          log(`Fetched glTF ${loaded}/${total} (parallel x${Math.min(8, total)})`);
+        } else {
+          log(`Skipped glTF ${index + 1}/${total}: ${error?.message ?? 'load error'}`);
+        }
+      },
+    });
 
-    for (let i = 0; i < urlArray.length; ++i) {
-      const url = urlArray[i];
-      log(`Fetching glTF ${i + 1}/${urlArray.length}`);
-      const gltf = await fetchGltf(url);
-      gltfArray.push(gltf);
+    for (const gltf of gltfArray) {
       tilesContainer.add(gltf.scene);
     }
 
-    log(`Normalising & stitching ${urlArray.length} glTFs`);
+    if (!gltfArray.length) {
+      log('No glTF tiles loaded successfully.');
+      this.tilesContainer = null;
+      this.gltfArray = [];
+      return;
+    }
+
+    log(
+      `Normalising & stitching ${gltfArray.length} glTFs `
+      + `(${stats.durationMs.toFixed(1)} ms load, ${stats.failed} failed)`
+    );
 
     /* centre at origin */
     const box    = new THREE.Box3().setFromObject(tilesContainer);

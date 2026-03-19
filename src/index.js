@@ -114,6 +114,24 @@ async function buildVoxels(res) {
     viewer.tilesContainer.visible = !voxCtrl.visible;
 
     ui.log(`✅ Voxelised (${vox.voxelCount.toLocaleString()} voxels) in ${(performance.now() - t0).toFixed(1)} ms`);
+    if (vox.stats) {
+      const parts = [
+        `serialize ${vox.stats.serializeMs?.toFixed?.(1) ?? '0.0'} ms`,
+        `worker ${vox.stats.workerMs?.toFixed?.(1) ?? '0.0'} ms`,
+        `rebuild ${vox.stats.rebuildMs?.toFixed?.(1) ?? '0.0'} ms`,
+      ];
+      if (vox.stats.rasterMs != null) parts.push(`raster ${vox.stats.rasterMs.toFixed(1)} ms`);
+      if (vox.stats.postprocessMs != null && vox.stats.postprocessMs > 0) parts.push(`post ${vox.stats.postprocessMs.toFixed(1)} ms`);
+      if (vox.stats.meshMs != null) parts.push(`mesh ${vox.stats.meshMs.toFixed(1)} ms`);
+      if (vox.stats.method) parts.push(`method ${vox.stats.method}`);
+      if (vox.stats.requestedMethod && vox.stats.requestedMethod !== vox.stats.method) {
+        parts.push(`requested ${vox.stats.requestedMethod}`);
+      }
+      if (vox.stats.hitStoreMode) parts.push(`store ${vox.stats.hitStoreMode}`);
+      if (vox.stats.wasmCalls) parts.push(`wasm calls ${vox.stats.wasmCalls}`);
+      ui.log(`↳ ${parts.join(' | ')}`);
+      if (vox.stats.fallbackReason) ui.log(`↳ ${vox.stats.fallbackReason}`);
+    }
 
     /* if MC toggle already on – regenerate block mesh */
     if (voxCtrl.minecraft) await handleMinecraftToggle(true, /*clearOnly=*/false);
@@ -198,6 +216,7 @@ async function exportCurrentSchematic() {
 /* GOOGLE 3‑D‑TILES fetcher                                           */
 /* ------------------------------------------------------------------ */
 async function fetch3DTiles() {
+  const fetchStartedAt = performance.now();
   ui.setDebugSliderVisibility(false);
   const { lat, lng, zoom } = ui.getLatLngZoom();
   const GOOGLE_API_KEY = ui.getGoogleAPIKey();
@@ -226,7 +245,8 @@ async function fetch3DTiles() {
     tiles.slice(0, 50).forEach(t => urls.push(`${t.contentUrl}?key=${GOOGLE_API_KEY}&session=${session}`));
   }
 
-  viewer.loadGLTFTiles(urls, ui.log);
+  await viewer.loadGLTFTiles(urls, ui.log);
+  ui.log(`Prepared ${urls.length} tile URLs in ${(performance.now() - fetchStartedAt).toFixed(1)} ms`);
   ui.setDebugSliderVisibility(true);
   ui.updateDebugSliderRange(urls.length);
 }

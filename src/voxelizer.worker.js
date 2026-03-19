@@ -2,11 +2,148 @@
 
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import initDdaVoxelizeWasm, {
+    rasterize_mesh_2d5_packed,
+    voxelize_mesh_with_uv_and_texture_params_packed,
+    voxelize_mesh_with_vertex_colors_packed,
+} from '../dda_voxelize_wasm/pkg/dda_voxelize_wasm.js';
 
 const ALPHA_CUTOFF = 0.08; // skip texels with alpha below this to avoid black bleed
 const MAX_GRID_VOXELS = 40_000_000; // ~80MB worst case for counts+colors; adjust to taste
 const ALPHA_EPS = 1e-3; // minimum alpha for palette inclusion
 const DEFAULT_CHUNK_SIZE = 32;
+const DENSE_HIT_STORE_MAX_VOXELS = 8_000_000;
+const LEGACY_SRGB_ENCODING = 3001;
+
+let ddaWasmInitPromise = null;
+
+function nowMs() {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+        return performance.now();
+    }
+    return Date.now();
+}
+
+class VoxelHitStore {
+    constructor(total, mode = 'auto') {
+        const useDense = mode === 'dense' || (mode !== 'sparse' && total <= DENSE_HIT_STORE_MAX_VOXELS);
+        this.mode = useDense ? 'dense' : 'sparse';
+        this.size = 0;
+
+        if (useDense) {
+            this.triangles = new Int32Array(total);
+            this.triangles.fill(-1);
+            this.distances = new Float32Array(total);
+            this.distances.fill(Infinity);
+        } else {
+            this.map = new Map();
+        }
+    }
+
+    setIfCloser(index, tri, dist2) {
+        if (this.mode === 'dense') {
+            if (this.triangles[index] === -1) {
+                this.triangles[index] = tri;
+                this.distances[index] = dist2;
+                this.size += 1;
+                return true;
+            }
+            if (dist2 < this.distances[index]) {
+                this.triangles[index] = tri;
+                this.distances[index] = dist2;
+                return true;
+            }
+            return false;
+        }
+
+        const prev = this.map.get(index);
+        if (!prev) {
+            this.map.set(index, { tri, dist2 });
+            this.size += 1;
+            return true;
+        }
+        if (dist2 < prev.dist2) {
+            prev.tri = tri;
+            prev.dist2 = dist2;
+            return true;
+        }
+        return false;
+    }
+
+    forEach(callback) {
+        if (this.mode === 'dense') {
+            const { triangles, distances } = this;
+            for (let i = 0; i < triangles.length; i++) {
+                const tri = triangles[i];
+                if (tri === -1) continue;
+                callback(i, tri, distances[i]);
+            }
+            return;
+        }
+
+        for (const [index, hit] of this.map.entries()) {
+            callback(index, hit.tri, hit.dist2);
+        }
+    }
+}
+
+function isSRGBTexture(tex) {
+    return !!tex && (
+        tex.colorSpace === THREE.SRGBColorSpace
+        || tex.encoding === LEGACY_SRGB_ENCODING
+    );
+}
+
+function isSRGBTextureData(texData) {
+    return !!texData && (
+        texData.colorSpace === THREE.SRGBColorSpace
+        || texData.encoding === LEGACY_SRGB_ENCODING
+    );
+}
+
+async function ensureDdaWasm() {
+    if (!ddaWasmInitPromise) ddaWasmInitPromise = initDdaVoxelizeWasm();
+    return ddaWasmInitPromise;
+}
+
+function srgbToLinear(x) {
+    return x <= 0.04045 ? (x / 12.92) : Math.pow((x + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(x) {
+    return x <= 0.0031308 ? (x * 12.92) : (1.055 * Math.pow(x, 1 / 2.4) - 0.055);
+}
+
+function transformPositionsToWorld(positionArray, matrixWorldArray) {
+    const out = new Float32Array(positionArray.length);
+    const e = matrixWorldArray;
+    for (let i = 0; i < positionArray.length; i += 3) {
+        const x = positionArray[i];
+        const y = positionArray[i + 1];
+        const z = positionArray[i + 2];
+        out[i + 0] = e[0] * x + e[4] * y + e[8] * z + e[12];
+        out[i + 1] = e[1] * x + e[5] * y + e[9] * z + e[13];
+        out[i + 2] = e[2] * x + e[6] * y + e[10] * z + e[14];
+    }
+    return out;
+}
+
+function toUint32Indices(indexArray, start = 0, count = indexArray?.length ?? 0) {
+    if (!indexArray) return new Uint32Array(0);
+    if (indexArray instanceof Uint32Array && start === 0 && count === indexArray.length) return indexArray;
+    const slice = indexArray.subarray(start, start + count);
+    return slice instanceof Uint32Array ? slice : new Uint32Array(slice);
+}
+
+function buildSequentialTriangleIndices(start, count) {
+    const out = new Uint32Array(count);
+    for (let i = 0; i < count; i++) out[i] = start + i;
+    return out;
+}
+
+function colorFromHex(hex, fallbackHex = 0xffffff) {
+    return new THREE.Color(hex ?? fallbackHex);
+}
 
 class ChunkIndexer {
     constructor(nx, ny, nz, chunkSize = DEFAULT_CHUNK_SIZE) {
@@ -71,6 +208,7 @@ class ColorChunkStore {
         this.ny = this.indexer.ny;
         this.nz = this.indexer.nz;
         this.chunks = new Map();
+        this.filledCount = 0;
     }
 
     accumulate(x, y, z, r, g, b, alpha = 1) {
@@ -84,9 +222,14 @@ class ColorChunkStore {
                 cz: loc.cz,
                 colors: new Float32Array(this.indexer.chunkVolume * 3),
                 alphas: new Float32Array(this.indexer.chunkVolume),
-                counts: new Uint32Array(this.indexer.chunkVolume)
+                counts: new Uint32Array(this.indexer.chunkVolume),
+                filledIndices: []
             };
             this.chunks.set(loc.key, chunk);
+        }
+        if (chunk.counts[loc.localIndex] === 0) {
+            this.filledCount += 1;
+            chunk.filledIndices.push(loc.localIndex);
         }
         const base = loc.localIndex * 3;
         chunk.colors[base + 0] += r;
@@ -94,6 +237,70 @@ class ColorChunkStore {
         chunk.colors[base + 2] += b;
         chunk.alphas[loc.localIndex] += alpha;
         chunk.counts[loc.localIndex] += 1;
+    }
+
+    set(x, y, z, r, g, b, alpha = 1) {
+        const loc = this.indexer.locate(x, y, z);
+        if (!loc) return;
+        let chunk = this.chunks.get(loc.key);
+        if (!chunk) {
+            chunk = {
+                cx: loc.cx,
+                cy: loc.cy,
+                cz: loc.cz,
+                colors: new Float32Array(this.indexer.chunkVolume * 3),
+                alphas: new Float32Array(this.indexer.chunkVolume),
+                counts: new Uint32Array(this.indexer.chunkVolume),
+                filledIndices: []
+            };
+            this.chunks.set(loc.key, chunk);
+        }
+        if (chunk.counts[loc.localIndex] === 0) {
+            this.filledCount += 1;
+            chunk.filledIndices.push(loc.localIndex);
+        }
+        const base = loc.localIndex * 3;
+        chunk.colors[base + 0] = r;
+        chunk.colors[base + 1] = g;
+        chunk.colors[base + 2] = b;
+        chunk.alphas[loc.localIndex] = alpha;
+        chunk.counts[loc.localIndex] = 1;
+    }
+
+    forEachVoxel(callback) {
+        const NX = this.nx;
+        const NY = this.ny;
+        const NZ = this.nz;
+        const CS = this.indexer.chunkSize;
+        const layer = this.indexer.layerSize;
+
+        for (const chunk of this.chunks.values()) {
+            const baseX = chunk.cx * CS;
+            const baseY = chunk.cy * CS;
+            const baseZ = chunk.cz * CS;
+            for (const i of chunk.filledIndices) {
+                const cnt = chunk.counts[i];
+                if (!cnt) continue;
+                const lx = i % CS;
+                const ly = ((i / CS) | 0) % CS;
+                const lz = (i / layer) | 0;
+                const x = baseX + lx;
+                const y = baseY + ly;
+                const z = baseZ + lz;
+                if (x < 0 || y < 0 || z < 0 || x >= NX || y >= NY || z >= NZ) continue;
+                const colorBase = i * 3;
+                callback(
+                    x,
+                    y,
+                    z,
+                    chunk.colors[colorBase + 0] / cnt,
+                    chunk.colors[colorBase + 1] / cnt,
+                    chunk.colors[colorBase + 2] / cnt,
+                    chunk.alphas[i] / cnt,
+                    cnt
+                );
+            }
+        }
     }
 
     toDense(total) {
@@ -213,7 +420,7 @@ function getSampler(tex, imageDatas) {
                 const i = (iy * width + ix) * 4;
                 let r = data[i] / 255, g = data[i+1] / 255, b = data[i+2] / 255, a = data[i+3] / 255;
                 // convert EACH texel to linear before mixing
-                if (tex.encoding === THREE.sRGBEncoding) {
+                if (isSRGBTexture(tex)) {
                     r = srgbToLin(r); g = srgbToLin(g); b = srgbToLin(b);
                 }
                 return [r, g, b, a];
@@ -338,42 +545,918 @@ function kMeansPalette(colors, k = 64, iters = 8) {
 }
 
 // --- The Main Voxelizer Class ---
-class WorkerVoxelizer {
-    async init({ modelData, voxelSize, maxGrid = Infinity, paletteSize = 256, needGrid = false, method = '2.5d-scan' }) {
+export class WorkerVoxelizer {
+    async init({
+        modelData,
+        voxelSize,
+        maxGrid = Infinity,
+        paletteSize = 256,
+        needGrid = false,
+        method = '2.5d-scan',
+        hitStoreMode = 'auto'
+    }) {
+        const startedAt = nowMs();
         this.voxelSize = voxelSize;
         this.paletteSize = paletteSize;
         this.needGrid = needGrid;
         this.method = method;
+        const requestedMethod = method;
+        this.hitStoreMode = hitStoreMode;
         this.imageDatas = new Map(modelData.imageDatas);
 
-        const model = this.#reconstructModel(modelData);
-        const baked = this.#bakeAndMerge(model);
-        this.positions = baked.positions; this.uvs = baked.uvs;
-        this.indices = baked.indices; this.triMats = baked.triMats;
-        this.palette = baked.palette; this.materials = baked.materials;
+        let reconstructMs = 0;
+        let bakeMs = 0;
+        let rasterMs = 0;
+        let meshMs = 0;
+        let gridExportMs = 0;
+        let postprocessMs = 0;
+        let accumulateMs = 0;
+        let paletteMs = 0;
+        let wasmInitMs = 0;
+        let wasmCalls = 0;
+        let batchCount = 0;
+        let triangleCount = 0;
+        let fallbackReason = null;
+        let result = { geometries: [] };
+        let voxelGridData = null;
+        let rustCompleted = false;
 
-        this.bbox = new THREE.Box3().setFromObject(model);
-        const size = new THREE.Vector3(); this.bbox.getSize(size);
-        let nx = Math.ceil(size.x/voxelSize), ny = Math.ceil(size.y/voxelSize), nz = Math.ceil(size.z/voxelSize);
-        const m = Math.max(nx,ny,nz), scale = Number.isFinite(maxGrid) && m>maxGrid ? maxGrid/m : 1;
-        this.grid = new THREE.Vector3(Math.ceil(nx*scale), Math.ceil(ny*scale), Math.ceil(nz*scale));
-        this.voxelSize /= scale;
+        if (requestedMethod === 'rust-wasm') {
+            try {
+                const wasmStartedAt = nowMs();
+                await ensureDdaWasm();
+                wasmInitMs = nowMs() - wasmStartedAt;
+                this.bbox = new THREE.Box3(
+                    new THREE.Vector3().fromArray(modelData.bbox.min),
+                    new THREE.Vector3().fromArray(modelData.bbox.max)
+                );
+                this.#configureGridFromBox(this.bbox, maxGrid, false);
 
-        // Choose rasterization method
-        if (this.method === '3d-sat') {
-            this.#cpuRasterize3DSAT();
-        } else {
-            this.#cpuRasterize2D5(); // Default: 2.5D scan converter
+                const bakeStartedAt = nowMs();
+                const baked = this.#bakeSerializedModel(modelData);
+                bakeMs = nowMs() - bakeStartedAt;
+                this.positions = baked.positions; this.uvs = baked.uvs;
+                this.indices = baked.indices; this.triMats = baked.triMats;
+                this.palette = baked.palette; this.materials = baked.materials;
+
+                const rasterResult = this.#rustWasmRasterize2D5();
+                rasterMs = rasterResult.rasterMs ?? 0;
+                wasmCalls = rasterResult.wasmCalls ?? 0;
+                batchCount = rasterResult.batchCount ?? 0;
+                this.filledVoxelCount = this._rasterResult?.filledCount ?? 0;
+                triangleCount = (this.indices.length / 3) | 0;
+                const meshStartedAt = nowMs();
+                result = this.#buildGreedyMeshChunks();
+                meshMs = nowMs() - meshStartedAt;
+                const gridStartedAt = nowMs();
+                voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
+                gridExportMs = nowMs() - gridStartedAt;
+                rustCompleted = true;
+            } catch (error) {
+                fallbackReason = error?.message
+                    ? `Rust WASM unavailable, fell back to 2.5d-scan: ${error.message}`
+                    : 'Rust WASM unavailable, fell back to 2.5d-scan';
+                this.method = '2.5d-scan';
+                console.warn(fallbackReason, error);
+            }
         }
-        
-        this.filledVoxelCount = this._rasterResult?.filledCount ?? 0;
-        const result = this.#buildGreedyMeshChunks();   // NEW
-        const voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
+
+        if (!rustCompleted) {
+            const reconstructStartedAt = nowMs();
+            const model = this.#reconstructModel(modelData);
+            reconstructMs = nowMs() - reconstructStartedAt;
+
+            const bakeStartedAt = nowMs();
+            const baked = this.#bakeAndMerge(model);
+            bakeMs = nowMs() - bakeStartedAt;
+            this.positions = baked.positions; this.uvs = baked.uvs;
+            this.indices = baked.indices; this.triMats = baked.triMats;
+            this.palette = baked.palette; this.materials = baked.materials;
+
+            this.bbox = new THREE.Box3().setFromObject(model);
+            this.#configureGridFromBox(this.bbox, maxGrid, false);
+
+            // Choose rasterization method
+            const rasterStartedAt = nowMs();
+            if (this.method === '3d-sat') {
+                this.#cpuRasterize3DSAT();
+            } else {
+                this.#cpuRasterize2D5(); // Default: 2.5D scan converter
+            }
+            rasterMs = nowMs() - rasterStartedAt;
+
+            this.filledVoxelCount = this._rasterResult?.filledCount ?? 0;
+            triangleCount = (this.indices.length / 3) | 0;
+            const meshStartedAt = nowMs();
+            result = this.#buildGreedyMeshChunks();
+            meshMs = nowMs() - meshStartedAt;
+            const gridStartedAt = nowMs();
+            voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
+            gridExportMs = nowMs() - gridStartedAt;
+        }
 
         return {
             geometries: result.geometries,
             voxelCount: this.filledVoxelCount,
             voxelGrid: voxelGridData,
+            stats: {
+                reconstructMs,
+                bakeMs,
+                rasterMs,
+                postprocessMs,
+                accumulateMs,
+                paletteMs,
+                meshMs: result.meshMs ?? meshMs,
+                gridExportMs,
+                totalMs: nowMs() - startedAt,
+                method: this.method,
+                requestedMethod,
+                fallbackReason,
+                hitStoreMode: this._rasterResult?.voxelHits?.mode ?? hitStoreMode,
+                wasmInitMs,
+                wasmCalls,
+                batchCount,
+                triangleCount,
+                gridSize: { x: this.grid.x | 0, y: this.grid.y | 0, z: this.grid.z | 0 }
+            }
+        };
+    }
+
+    #configureGridFromBox(rawBox, maxGrid, alignToVoxelGrid = false) {
+        const rawSize = rawBox.getSize(new THREE.Vector3());
+        let nx = Math.ceil(rawSize.x / this.voxelSize);
+        let ny = Math.ceil(rawSize.y / this.voxelSize);
+        let nz = Math.ceil(rawSize.z / this.voxelSize);
+        const m = Math.max(nx, ny, nz);
+        const scale = Number.isFinite(maxGrid) && m > maxGrid ? maxGrid / m : 1;
+        this.voxelSize /= scale;
+
+        if (alignToVoxelGrid) {
+            const alignedMin = new THREE.Vector3(
+                Math.floor(rawBox.min.x / this.voxelSize) * this.voxelSize,
+                Math.floor(rawBox.min.y / this.voxelSize) * this.voxelSize,
+                Math.floor(rawBox.min.z / this.voxelSize) * this.voxelSize
+            );
+            const alignedMax = new THREE.Vector3(
+                Math.ceil(rawBox.max.x / this.voxelSize) * this.voxelSize,
+                Math.ceil(rawBox.max.y / this.voxelSize) * this.voxelSize,
+                Math.ceil(rawBox.max.z / this.voxelSize) * this.voxelSize
+            );
+            this.bbox = new THREE.Box3(alignedMin, alignedMax);
+        } else {
+            this.bbox = rawBox.clone();
+        }
+
+        const finalSize = this.bbox.getSize(new THREE.Vector3());
+        this.grid = new THREE.Vector3(
+            Math.max(1, Math.ceil(finalSize.x / this.voxelSize)),
+            Math.max(1, Math.ceil(finalSize.y / this.voxelSize)),
+            Math.max(1, Math.ceil(finalSize.z / this.voxelSize))
+        );
+    }
+
+    #rustWasmRasterize2D5() {
+        const NX = this.grid.x | 0;
+        const NY = this.grid.y | 0;
+        const NZ = this.grid.z | 0;
+        const total = NX * NY * NZ;
+        const useDense = this.hitStoreMode === 'dense'
+            || (this.hitStoreMode !== 'sparse' && total <= DENSE_HIT_STORE_MAX_VOXELS);
+
+        const rasterStartedAt = nowMs();
+        const packedHits = rasterize_mesh_2d5_packed(
+            this.positions,
+            this.indices,
+            this.bbox.min.x,
+            this.bbox.min.y,
+            this.bbox.min.z,
+            this.voxelSize,
+            NX,
+            NY,
+            NZ,
+            DENSE_HIT_STORE_MAX_VOXELS
+        );
+        const rasterMs = nowMs() - rasterStartedAt;
+
+        let voxelHits;
+        if (useDense) {
+            const triangles = new Int32Array(total);
+            triangles.fill(-1);
+            for (let i = 0; i < packedHits.length; i += 2) {
+                triangles[packedHits[i]] = packedHits[i + 1];
+            }
+            voxelHits = {
+                mode: 'dense',
+                size: packedHits.length / 2,
+                triangles,
+                distances: null,
+            };
+        } else {
+            const map = new Map();
+            for (let i = 0; i < packedHits.length; i += 2) {
+                map.set(packedHits[i], { tri: packedHits[i + 1], dist2: 0 });
+            }
+            voxelHits = {
+                mode: 'sparse',
+                size: map.size,
+                map,
+            };
+        }
+
+        this.filledVoxelCount = packedHits.length / 2;
+        this._rasterResult = { NX, NY, NZ, voxelHits, filledCount: this.filledVoxelCount };
+        return { rasterMs, wasmCalls: 1, batchCount: 1 };
+    }
+
+    #createRuntimeTexture(texData, textureCache) {
+        const cacheKey = [
+            texData.imageUuid,
+            texData.encoding ?? 0,
+            texData.colorSpace ?? '',
+            texData.flipY ? 1 : 0,
+            texData.wrapS ?? 0,
+            texData.wrapT ?? 0,
+            texData.offset?.[0] ?? 0,
+            texData.offset?.[1] ?? 0,
+            texData.repeat?.[0] ?? 1,
+            texData.repeat?.[1] ?? 1,
+            texData.rotation ?? 0,
+            texData.center?.[0] ?? 0,
+            texData.center?.[1] ?? 0,
+        ].join('|');
+        if (textureCache.has(cacheKey)) return textureCache.get(cacheKey);
+
+        const tex = {
+            isTexture: true,
+            source: { uuid: texData.imageUuid },
+            encoding: texData.encoding,
+            colorSpace: texData.colorSpace,
+            flipY: !!texData.flipY,
+            wrapS: texData.wrapS,
+            wrapT: texData.wrapT,
+            offset: new THREE.Vector2().fromArray(texData.offset ?? [0, 0]),
+            repeat: new THREE.Vector2().fromArray(texData.repeat ?? [1, 1]),
+            rotation: texData.rotation ?? 0,
+            center: new THREE.Vector2().fromArray(texData.center ?? [0, 0]),
+        };
+        textureCache.set(cacheKey, tex);
+        return tex;
+    }
+
+    #buildRuntimeMaterialsFromSerialized(modelData) {
+        const textureCache = new Map();
+        const materials = [];
+        const materialIndexByUuid = new Map();
+        const materialByUuid = new Map();
+
+        for (const matData of modelData.materials) {
+            const mat = { uuid: matData.uuid };
+            if (matData.color !== undefined) mat.color = colorFromHex(matData.color, 0xffffff);
+            if (matData.emissive !== undefined) mat.emissive = colorFromHex(matData.emissive, 0x000000);
+
+            for (const key of ['map', 'emissiveMap', 'alphaMap']) {
+                if (matData[key]) {
+                    mat[key] = this.#createRuntimeTexture(matData[key], textureCache);
+                }
+            }
+
+            materialIndexByUuid.set(mat.uuid, materials.length);
+            materialByUuid.set(mat.uuid, mat);
+            materials.push(mat);
+        }
+
+        return { materials, materialIndexByUuid, materialByUuid };
+    }
+
+    #bakeSerializedModel(modelData) {
+        const { materials, materialIndexByUuid, materialByUuid } = this.#buildRuntimeMaterialsFromSerialized(modelData);
+        let totalVertices = 0;
+        let totalIndexCount = 0;
+        let totalTriCount = 0;
+
+        for (const meshData of modelData.meshes) {
+            const positionAttr = meshData.geometry?.attributes?.position;
+            if (!positionAttr?.array?.length) continue;
+            const vertexCount = positionAttr.array.length / 3;
+            totalVertices += vertexCount;
+            const groups = meshData.geometry?.groups?.length
+                ? meshData.geometry.groups
+                : [{ start: 0, count: meshData.geometry?.index?.array?.length ?? vertexCount, materialIndex: 0 }];
+            for (const group of groups) {
+                totalIndexCount += group.count;
+                totalTriCount += (group.count / 3) | 0;
+            }
+        }
+
+        const positions = new Float32Array(totalVertices * 3);
+        const uvs = new Float32Array(totalVertices * 2);
+        const indices = new Uint32Array(totalIndexCount);
+        const triMats = new Uint32Array(totalTriCount);
+
+        const maxPaletteSamples = 4096;
+        const paletteSamples = new Float32Array(maxPaletteSamples * 3);
+        let paletteSampleCount = 0;
+        let paletteSeen = 0;
+        let paletteState = 0x51f2d3a7;
+        const uvTmp = new THREE.Vector2();
+
+        const nextPaletteSlot = (limit) => {
+            paletteState = (1664525 * paletteState + 1013904223) >>> 0;
+            return Math.floor((paletteState / 0x100000000) * limit);
+        };
+
+        const recordPaletteSample = (r, g, b) => {
+            const sampleIndex = paletteSeen++;
+            if (sampleIndex < maxPaletteSamples) {
+                const base = sampleIndex * 3;
+                paletteSamples[base + 0] = r;
+                paletteSamples[base + 1] = g;
+                paletteSamples[base + 2] = b;
+                paletteSampleCount = sampleIndex + 1;
+                return;
+            }
+
+            const slot = nextPaletteSlot(sampleIndex + 1);
+            if (slot >= maxPaletteSamples) return;
+            const base = slot * 3;
+            paletteSamples[base + 0] = r;
+            paletteSamples[base + 1] = g;
+            paletteSamples[base + 2] = b;
+        };
+
+        const sampleMaterialColor = (material, uvArray, vertexIndex) => {
+            let r = material?.color?.r ?? 1;
+            let g = material?.color?.g ?? 1;
+            let b = material?.color?.b ?? 1;
+            let had = false;
+
+            if (uvArray) {
+                uvTmp.set(uvArray[vertexIndex * 2] ?? 0, uvArray[vertexIndex * 2 + 1] ?? 0);
+                const albedo = sampleAlbedoLinear(material, uvTmp, this.imageDatas);
+                if (albedo) {
+                    r *= albedo[0];
+                    g *= albedo[1];
+                    b *= albedo[2];
+                    had = true;
+                }
+                if (material?.emissive) {
+                    r += material.emissive.r;
+                    g += material.emissive.g;
+                    b += material.emissive.b;
+                }
+                if (material?.emissiveMap) {
+                    const eSampler = getSampler(material.emissiveMap, this.imageDatas);
+                    if (eSampler) {
+                        const ec = eSampler(uvTmp, true);
+                        r += ec[0];
+                        g += ec[1];
+                        b += ec[2];
+                    }
+                }
+            } else {
+                if (material?.emissive) {
+                    r += material.emissive.r;
+                    g += material.emissive.g;
+                    b += material.emissive.b;
+                }
+                had = true;
+            }
+
+            if (!(Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b))) {
+                r = g = b = 1;
+            }
+            return had ? [
+                Math.min(1, Math.max(0, r)),
+                Math.min(1, Math.max(0, g)),
+                Math.min(1, Math.max(0, b)),
+            ] : null;
+        };
+
+        let vertexOffset = 0;
+        let indexOffset = 0;
+        let triMatOffset = 0;
+
+        for (const meshData of modelData.meshes) {
+            const positionAttr = meshData.geometry?.attributes?.position;
+            if (!positionAttr?.array?.length) continue;
+
+            const worldPositions = transformPositionsToWorld(positionAttr.array, meshData.matrixWorld);
+            const vertexCount = worldPositions.length / 3;
+            const uvArray = meshData.geometry?.attributes?.uv?.array ?? null;
+            const indexArray = meshData.geometry?.index?.array ?? null;
+            const groups = meshData.geometry?.groups?.length
+                ? meshData.geometry.groups
+                : [{ start: 0, count: indexArray ? indexArray.length : vertexCount, materialIndex: 0 }];
+
+            positions.set(worldPositions, vertexOffset * 3);
+            if (uvArray?.length) uvs.set(uvArray, vertexOffset * 2);
+
+            for (const group of groups) {
+                const materialUuid = meshData.materials[group.materialIndex] ?? meshData.materials[0];
+                const material = materialByUuid.get(materialUuid);
+                if (!material) continue;
+
+                const globalMatIdx = materialIndexByUuid.get(materialUuid) ?? 0;
+                const groupEnd = group.start + group.count;
+
+                if (indexArray) {
+                    for (let i = group.start; i < groupEnd; i += 3) {
+                        indices[indexOffset++] = vertexOffset + indexArray[i];
+                        indices[indexOffset++] = vertexOffset + indexArray[i + 1];
+                        indices[indexOffset++] = vertexOffset + indexArray[i + 2];
+                        triMats[triMatOffset++] = globalMatIdx;
+                    }
+                } else {
+                    for (let i = group.start; i < groupEnd; i += 3) {
+                        indices[indexOffset++] = vertexOffset + i;
+                        indices[indexOffset++] = vertexOffset + i + 1;
+                        indices[indexOffset++] = vertexOffset + i + 2;
+                        triMats[triMatOffset++] = globalMatIdx;
+                    }
+                }
+
+                const sampleBudget = Math.min(group.count, 192);
+                if (!sampleBudget) continue;
+                const sampleStep = Math.max(1, Math.floor(group.count / sampleBudget));
+
+                if (!uvArray && !material.emissive && !material.emissiveMap) {
+                    recordPaletteSample(
+                        material.color?.r ?? 1,
+                        material.color?.g ?? 1,
+                        material.color?.b ?? 1
+                    );
+                    continue;
+                }
+
+                for (let i = group.start; i < groupEnd; i += sampleStep) {
+                    const vertexIndex = indexArray ? indexArray[i] : i;
+                    const sample = sampleMaterialColor(material, uvArray, vertexIndex);
+                    if (sample) recordPaletteSample(sample[0], sample[1], sample[2]);
+                }
+            }
+
+            vertexOffset += vertexCount;
+        }
+
+        const palette = paletteSampleCount
+            ? kMeansPalette(paletteSamples.subarray(0, paletteSampleCount * 3), this.paletteSize).palette
+            : new Float32Array([1, 1, 1]);
+
+        return {
+            positions,
+            uvs,
+            indices: indices.subarray(0, indexOffset),
+            triMats: triMats.subarray(0, triMatOffset),
+            palette,
+            materials
+        };
+    }
+
+    #getWasmTextureCacheKey(matData) {
+        const texData = matData?.map;
+        if (!texData) return '';
+        const offset = texData.offset ?? [0, 0];
+        const repeat = texData.repeat ?? [1, 1];
+        const center = texData.center ?? [0, 0];
+        return [
+            texData.imageUuid ?? '',
+            matData?.color ?? 0xffffff,
+            matData?.emissive ?? 0,
+            offset[0] ?? 0,
+            offset[1] ?? 0,
+            repeat[0] ?? 1,
+            repeat[1] ?? 1,
+            texData.rotation ?? 0,
+            center[0] ?? 0,
+            center[1] ?? 0,
+            texData.flipY ? 1 : 0
+        ].join('|');
+    }
+
+    #prepareWasmTexturePayload(matData) {
+        const texData = matData?.map;
+        if (!texData) return null;
+
+        if (!this._wasmTextureCache) this._wasmTextureCache = new Map();
+        const cacheKey = this.#getWasmTextureCacheKey(matData);
+        if (this._wasmTextureCache.has(cacheKey)) return this._wasmTextureCache.get(cacheKey);
+
+        const imageData = this.imageDatas.get(texData.imageUuid);
+        if (!imageData?.data || !imageData.width || !imageData.height) return null;
+
+        const src = imageData.data;
+        const out = new Uint8Array(src.length);
+        const baseColor = colorFromHex(matData.color, 0xffffff);
+        const emissive = colorFromHex(matData.emissive, 0x000000);
+        const sourceIsSrgb = isSRGBTextureData(texData);
+
+        for (let i = 0; i < src.length; i += 4) {
+            const a = src[i + 3];
+            const srcR = src[i] / 255;
+            const srcG = src[i + 1] / 255;
+            const srcB = src[i + 2] / 255;
+            const texR = sourceIsSrgb ? srgbToLinear(srcR) : srcR;
+            const texG = sourceIsSrgb ? srgbToLinear(srcG) : srcG;
+            const texB = sourceIsSrgb ? srgbToLinear(srcB) : srcB;
+            const rLin = Math.min(1, Math.max(0, texR * baseColor.r + emissive.r));
+            const gLin = Math.min(1, Math.max(0, texG * baseColor.g + emissive.g));
+            const bLin = Math.min(1, Math.max(0, texB * baseColor.b + emissive.b));
+            out[i + 0] = Math.round(Math.min(1, Math.max(0, linearToSrgb(rLin))) * 255);
+            out[i + 1] = Math.round(Math.min(1, Math.max(0, linearToSrgb(gLin))) * 255);
+            out[i + 2] = Math.round(Math.min(1, Math.max(0, linearToSrgb(bLin))) * 255);
+            out[i + 3] = a;
+        }
+
+        const payload = {
+            data: out,
+            width: imageData.width,
+            height: imageData.height,
+            texData
+        };
+        this._wasmTextureCache.set(cacheKey, payload);
+        return payload;
+    }
+
+    #buildVertexColorsForWasm(vertexCount, geometryColorArray, matData) {
+        const out = new Float32Array(vertexCount * 3);
+        const baseColor = colorFromHex(matData?.color, 0xffffff);
+        const emissive = colorFromHex(matData?.emissive, 0x000000);
+        const hasGeomColors = geometryColorArray && geometryColorArray.length >= vertexCount * 3;
+
+        for (let i = 0; i < vertexCount; i++) {
+            const srcBase = i * 3;
+            const srcR = hasGeomColors ? geometryColorArray[srcBase + 0] : 1;
+            const srcG = hasGeomColors ? geometryColorArray[srcBase + 1] : 1;
+            const srcB = hasGeomColors ? geometryColorArray[srcBase + 2] : 1;
+            out[srcBase + 0] = Math.min(1, Math.max(0, srcR * baseColor.r + emissive.r));
+            out[srcBase + 1] = Math.min(1, Math.max(0, srcG * baseColor.g + emissive.g));
+            out[srcBase + 2] = Math.min(1, Math.max(0, srcB * baseColor.b + emissive.b));
+        }
+
+        return out;
+    }
+
+    async #rustWasmVoxelize(modelData) {
+        const NX = this.grid.x | 0;
+        const NY = this.grid.y | 0;
+        const NZ = this.grid.z | 0;
+        const originX = Math.round(this.bbox.min.x / this.voxelSize);
+        const originY = Math.round(this.bbox.min.y / this.voxelSize);
+        const originZ = Math.round(this.bbox.min.z / this.voxelSize);
+        const materialMap = new Map(modelData.materials.map(material => [material.uuid, material]));
+        const colorStore = new ColorChunkStore(NX, NY, NZ, DEFAULT_CHUNK_SIZE);
+        const vertexColorBatch = { positions: [], colors: [], vertexCount: 0 };
+        const texturedBatches = new Map();
+        const timings = {
+            rasterMs: 0,
+            accumulateMs: 0,
+            paletteMs: 0,
+            wasmCalls: 0,
+            batchCount: 0
+        };
+        const maxPaletteSamples = Math.max(this.paletteSize * 8, 1024);
+        const paletteReservoir = new Float32Array(maxPaletteSamples * 3);
+        const texturedPaletteSamples = new Set();
+        let paletteSampleCount = 0;
+        let paletteSamplesSeen = 0;
+        let paletteSampleState = 0x12345678;
+        let triangleCount = 0;
+        let directStoreWrites = false;
+
+        const nextPaletteSampleIndex = (limit) => {
+            paletteSampleState = (1664525 * paletteSampleState + 1013904223) >>> 0;
+            return Math.floor((paletteSampleState / 0x100000000) * limit);
+        };
+
+        const recordPaletteSample = (r, g, b) => {
+            const sampleIndex = paletteSamplesSeen++;
+            if (sampleIndex < maxPaletteSamples) {
+                const base = sampleIndex * 3;
+                paletteReservoir[base + 0] = r;
+                paletteReservoir[base + 1] = g;
+                paletteReservoir[base + 2] = b;
+                paletteSampleCount = sampleIndex + 1;
+                return;
+            }
+
+            const replaceIndex = nextPaletteSampleIndex(sampleIndex + 1);
+            if (replaceIndex >= maxPaletteSamples) return;
+            const base = replaceIndex * 3;
+            paletteReservoir[base + 0] = r;
+            paletteReservoir[base + 1] = g;
+            paletteReservoir[base + 2] = b;
+        };
+
+        const recordTexturePaletteSamples = (cacheKey, texPayload) => {
+            if (!texPayload?.data?.length || texturedPaletteSamples.has(cacheKey)) return;
+            texturedPaletteSamples.add(cacheKey);
+
+            const pixelCount = (texPayload.data.length / 4) | 0;
+            if (!pixelCount) return;
+
+            const targetSamples = Math.min(pixelCount, Math.max(128, Math.floor(maxPaletteSamples / 4)));
+            const stride = Math.max(1, Math.floor(pixelCount / targetSamples));
+            for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += stride) {
+                const base = pixelIndex * 4;
+                if (texPayload.data[base + 3] <= ALPHA_CUTOFF * 255) continue;
+                recordPaletteSample(
+                    srgbToLinear(texPayload.data[base + 0] / 255),
+                    srgbToLinear(texPayload.data[base + 1] / 255),
+                    srgbToLinear(texPayload.data[base + 2] / 255)
+                );
+            }
+        };
+
+        const accumulateWasmOutput = (packed) => {
+            for (let i = 0; i < packed.length; i += 2) {
+                const lin = packed[i];
+                const rgb = packed[i + 1];
+                const gx = lin % NX;
+                const gy = ((lin / NX) | 0) % NY;
+                const gz = (lin / (NX * NY)) | 0;
+                const r = (rgb & 0xff) / 255;
+                const g = ((rgb >>> 8) & 0xff) / 255;
+                const b = ((rgb >>> 16) & 0xff) / 255;
+                if (directStoreWrites) {
+                    colorStore.set(gx, gy, gz, r, g, b, 1);
+                } else {
+                    colorStore.accumulate(gx, gy, gz, r, g, b, 1);
+                }
+            }
+        };
+
+        const appendVertexColorGroup = (batch, worldPositions, triIndices, geometryColorArray, matData) => {
+            const baseColor = colorFromHex(matData?.color, 0xffffff);
+            const emissive = colorFromHex(matData?.emissive, 0x000000);
+            const hasGeomColors = geometryColorArray && geometryColorArray.length >= worldPositions.length;
+
+            for (let i = 0; i < triIndices.length; i++) {
+                const srcIndex = triIndices[i];
+                const posBase = srcIndex * 3;
+                batch.positions.push(
+                    worldPositions[posBase + 0],
+                    worldPositions[posBase + 1],
+                    worldPositions[posBase + 2]
+                );
+
+                const srcR = hasGeomColors ? geometryColorArray[posBase + 0] : 1;
+                const srcG = hasGeomColors ? geometryColorArray[posBase + 1] : 1;
+                const srcB = hasGeomColors ? geometryColorArray[posBase + 2] : 1;
+                const outR = Math.min(1, Math.max(0, srcR * baseColor.r + emissive.r));
+                const outG = Math.min(1, Math.max(0, srcG * baseColor.g + emissive.g));
+                const outB = Math.min(1, Math.max(0, srcB * baseColor.b + emissive.b));
+                batch.colors.push(
+                    outR,
+                    outG,
+                    outB
+                );
+                recordPaletteSample(outR, outG, outB);
+            }
+
+            batch.vertexCount += triIndices.length;
+        };
+
+        const appendTexturedGroup = (batch, worldPositions, triIndices, uvArray) => {
+            for (let i = 0; i < triIndices.length; i++) {
+                const srcIndex = triIndices[i];
+                const posBase = srcIndex * 3;
+                const uvBase = srcIndex * 2;
+                batch.positions.push(
+                    worldPositions[posBase + 0],
+                    worldPositions[posBase + 1],
+                    worldPositions[posBase + 2]
+                );
+                batch.uvs.push(
+                    uvArray[uvBase + 0],
+                    uvArray[uvBase + 1]
+                );
+            }
+
+            batch.vertexCount += triIndices.length;
+        };
+
+        const flushVertexColorBatch = () => {
+            if (!vertexColorBatch.vertexCount) return;
+
+            const positions = new Float32Array(vertexColorBatch.positions);
+            const vertexColors = new Float32Array(vertexColorBatch.colors);
+            const indices = buildSequentialTriangleIndices(0, vertexColorBatch.vertexCount);
+
+            const rasterStartedAt = nowMs();
+            const packed = voxelize_mesh_with_vertex_colors_packed(
+                positions,
+                indices,
+                vertexColors,
+                this.voxelSize,
+                originX,
+                originY,
+                originZ,
+                NX,
+                NY,
+                NZ
+            );
+            timings.rasterMs += nowMs() - rasterStartedAt;
+            timings.wasmCalls += 1;
+            timings.batchCount += 1;
+
+            const accumulateStartedAt = nowMs();
+            accumulateWasmOutput(packed);
+            timings.accumulateMs += nowMs() - accumulateStartedAt;
+
+            vertexColorBatch.positions.length = 0;
+            vertexColorBatch.colors.length = 0;
+            vertexColorBatch.vertexCount = 0;
+        };
+
+        const flushTexturedBatch = (batch) => {
+            if (!batch?.vertexCount) return;
+
+            const positions = new Float32Array(batch.positions);
+            const uvs = new Float32Array(batch.uvs);
+            const indices = buildSequentialTriangleIndices(0, batch.vertexCount);
+
+            const rasterStartedAt = nowMs();
+            const packed = voxelize_mesh_with_uv_and_texture_params_packed(
+                positions,
+                indices,
+                uvs,
+                batch.texPayload.data,
+                batch.texPayload.width,
+                batch.texPayload.height,
+                batch.texPayload.texData.offset[0],
+                batch.texPayload.texData.offset[1],
+                batch.texPayload.texData.repeat[0],
+                batch.texPayload.texData.repeat[1],
+                batch.texPayload.texData.rotation,
+                batch.texPayload.texData.center[0],
+                batch.texPayload.texData.center[1],
+                !!batch.texPayload.texData.flipY,
+                this.voxelSize,
+                originX,
+                originY,
+                originZ,
+                NX,
+                NY,
+                NZ
+            );
+            timings.rasterMs += nowMs() - rasterStartedAt;
+            timings.wasmCalls += 1;
+            timings.batchCount += 1;
+
+            const accumulateStartedAt = nowMs();
+            accumulateWasmOutput(packed);
+            timings.accumulateMs += nowMs() - accumulateStartedAt;
+
+            batch.positions.length = 0;
+            batch.uvs.length = 0;
+            batch.vertexCount = 0;
+        };
+
+        for (const meshData of modelData.meshes) {
+            const positionAttr = meshData.geometry?.attributes?.position;
+            if (!positionAttr?.array?.length) continue;
+
+            const worldPositions = transformPositionsToWorld(positionAttr.array, meshData.matrixWorld);
+            const uvArray = meshData.geometry?.attributes?.uv?.array ?? null;
+            const colorArray = meshData.geometry?.attributes?.color?.array ?? null;
+            const indexArray = meshData.geometry?.index?.array ?? null;
+            const vertexCount = worldPositions.length / 3;
+            const groups = meshData.geometry?.groups?.length
+                ? meshData.geometry.groups
+                : [{ start: 0, count: indexArray ? indexArray.length : vertexCount, materialIndex: 0 }];
+            const meshMaterials = meshData.materials.map(uuid => materialMap.get(uuid));
+
+            for (const group of groups) {
+                const material = meshMaterials[group.materialIndex] ?? meshMaterials[0];
+                if (!material) continue;
+
+                const triIndices = indexArray
+                    ? toUint32Indices(indexArray, group.start, group.count)
+                    : buildSequentialTriangleIndices(group.start, group.count);
+                if (!triIndices.length) continue;
+
+                triangleCount += (triIndices.length / 3) | 0;
+
+                const texPayload = material.map && uvArray
+                    ? this.#prepareWasmTexturePayload(material)
+                    : null;
+
+                if (texPayload) {
+                    const batchKey = this.#getWasmTextureCacheKey(material);
+                    let batch = texturedBatches.get(batchKey);
+                    if (!batch) {
+                        batch = { positions: [], uvs: [], vertexCount: 0, texPayload };
+                        texturedBatches.set(batchKey, batch);
+                        recordTexturePaletteSamples(batchKey, texPayload);
+                    }
+                    appendTexturedGroup(batch, worldPositions, triIndices, uvArray);
+                } else {
+                    appendVertexColorGroup(vertexColorBatch, worldPositions, triIndices, colorArray, material);
+                }
+            }
+        }
+
+        directStoreWrites = ((vertexColorBatch.vertexCount ? 1 : 0) + texturedBatches.size) <= 1;
+        flushVertexColorBatch();
+        for (const batch of texturedBatches.values()) flushTexturedBatch(batch);
+
+        this.filledVoxelCount = colorStore.filledCount;
+        if (!colorStore.filledCount) {
+            this._colorStore = colorStore;
+            return {
+                geometries: [],
+                voxelCount: 0,
+                triangleCount,
+                rasterMs: timings.rasterMs,
+                postprocessMs: timings.accumulateMs,
+                accumulateMs: timings.accumulateMs,
+                paletteMs: 0,
+                meshMs: 0,
+                wasmCalls: timings.wasmCalls,
+                batchCount: timings.batchCount
+            };
+        }
+
+        const paletteStartedAt = nowMs();
+        let paletteSamples = paletteReservoir.subarray(0, paletteSampleCount * 3);
+        if (!paletteSamples.length) {
+            const fallbackTarget = Math.min(colorStore.filledCount, maxPaletteSamples);
+            const fallback = new Float32Array(fallbackTarget * 3);
+            const sampleEvery = Math.max(1, Math.ceil(colorStore.filledCount / Math.max(1, fallbackTarget)));
+            let sampleOffset = 0;
+            let voxelIndex = 0;
+            colorStore.forEachVoxel((_x, _y, _z, sr, sg, sb) => {
+                if ((voxelIndex++ % sampleEvery) !== 0 || sampleOffset >= fallback.length) return;
+                fallback[sampleOffset++] = srgbToLinear(sr);
+                fallback[sampleOffset++] = srgbToLinear(sg);
+                fallback[sampleOffset++] = srgbToLinear(sb);
+            });
+            paletteSamples = fallback.subarray(0, Math.max(3, sampleOffset));
+        }
+        const uniqueSamples = [];
+        const uniqueSampleKeys = new Set();
+        for (let i = 0; i < paletteSamples.length; i += 3) {
+            const qr = Math.max(0, Math.min(63, (paletteSamples[i + 0] * 63) | 0));
+            const qg = Math.max(0, Math.min(63, (paletteSamples[i + 1] * 63) | 0));
+            const qb = Math.max(0, Math.min(63, (paletteSamples[i + 2] * 63) | 0));
+            const key = (qr << 12) | (qg << 6) | qb;
+            if (uniqueSampleKeys.has(key)) continue;
+            uniqueSampleKeys.add(key);
+            uniqueSamples.push(paletteSamples[i + 0], paletteSamples[i + 1], paletteSamples[i + 2]);
+        }
+        if (uniqueSamples.length >= 3 && uniqueSamples.length < paletteSamples.length) {
+            paletteSamples = new Float32Array(uniqueSamples);
+        }
+        const effectivePaletteSize = Math.max(1, Math.min(this.paletteSize, (paletteSamples.length / 3) | 0));
+        this.palette = kMeansPalette(paletteSamples, effectivePaletteSize).palette;
+
+        const paletteStore = new PaletteChunkStore(NX, NY, NZ, DEFAULT_CHUNK_SIZE);
+        const palette = this.palette ?? new Float32Array([1, 1, 1]);
+        const paletteCount = Math.max(1, (palette.length / 3) | 0);
+        const paletteColors8 = new Uint8Array(paletteCount * 4);
+        for (let i = 0; i < paletteCount; i++) {
+            const base = i * 3;
+            const out = i * 4;
+            paletteColors8[out + 0] = Math.max(0, Math.min(255, (palette[base + 0] * 255) | 0));
+            paletteColors8[out + 1] = Math.max(0, Math.min(255, (palette[base + 1] * 255) | 0));
+            paletteColors8[out + 2] = Math.max(0, Math.min(255, (palette[base + 2] * 255) | 0));
+            paletteColors8[out + 3] = 255;
+        }
+
+        colorStore.forEachVoxel((x, y, z, sr, sg, sb) => {
+            const lr = srgbToLinear(sr);
+            const lg = srgbToLinear(sg);
+            const lb = srgbToLinear(sb);
+            let best = 0;
+            let bestD = Infinity;
+            for (let c = 0; c < paletteCount; c++) {
+                const base = c * 3;
+                const dr = lr - palette[base + 0];
+                const dg = lg - palette[base + 1];
+                const db = lb - palette[base + 2];
+                const d2 = dr * dr + dg * dg + db * db;
+                if (d2 < bestD) {
+                    bestD = d2;
+                    best = c;
+                }
+            }
+            paletteStore.set(x, y, z, best + 1);
+        });
+        timings.paletteMs = nowMs() - paletteStartedAt;
+
+        const meshStartedAt = nowMs();
+        const geometries = this.#buildGreedyMeshFromPaletteStore(paletteStore, colorStore, paletteColors8);
+        return {
+            geometries,
+            voxelCount: colorStore.filledCount,
+            triangleCount,
+            rasterMs: timings.rasterMs,
+            postprocessMs: timings.accumulateMs + timings.paletteMs,
+            accumulateMs: timings.accumulateMs,
+            paletteMs: timings.paletteMs,
+            meshMs: nowMs() - meshStartedAt,
+            wasmCalls: timings.wasmCalls,
+            batchCount: timings.batchCount
         };
     }
 
@@ -394,7 +1477,9 @@ class WorkerVoxelizer {
                     const texData = matData[key];
                     if (!textures.has(texData.imageUuid)) {
                         const tex = new THREE.Texture();
-                        tex.source.uuid = texData.imageUuid; tex.encoding = texData.encoding;
+                        tex.source.uuid = texData.imageUuid;
+                        tex.encoding = texData.encoding;
+                        tex.colorSpace = texData.colorSpace;
                         tex.flipY = texData.flipY; tex.wrapS = texData.wrapS; tex.wrapT = texData.wrapT;
                         tex.offset.fromArray(texData.offset); tex.repeat.fromArray(texData.repeat);
                         tex.rotation = texData.rotation; tex.center.fromArray(texData.center);
@@ -495,8 +1580,7 @@ class WorkerVoxelizer {
         const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const total = NX * NY * NZ;
 
-        // Outputs (same as before)
-        const voxelHits = new Map(); // key -> { tri, dist2 }
+        const voxelHits = new VoxelHitStore(total, this.hitStoreMode);
 
         // Helpers
         const index1D = (x,y,z) => x + NX * (y + NY * z);
@@ -613,10 +1697,7 @@ class WorkerVoxelizer {
                             }
 
                             const lin = index1D(x|0, y|0, z|0);
-                            const prev = voxelHits.get(lin);
-                            if (!prev || d2 < prev.dist2) {
-                                voxelHits.set(lin, { tri: t, dist2: d2 });
-                            }
+                            voxelHits.setIfCloser(lin, t, d2);
                         }
 
                         // secondary neighbor if plane crosses near boundary (captures thin surfaces)
@@ -631,10 +1712,7 @@ class WorkerVoxelizer {
                                 const lin2 = index1D(x2|0, y2|0, z2|0);
                                 const d2b = (W - (w2 + 0.5)); // signed
                                 const d2n = d2b*d2b * distScale;
-                                const prev2 = voxelHits.get(lin2);
-                                if (!prev2 || d2n < prev2.dist2) {
-                                    voxelHits.set(lin2, { tri: t, dist2: d2n });
-                                }
+                                voxelHits.setIfCloser(lin2, t, d2n);
                             }
                         }
                     }
@@ -667,7 +1745,7 @@ class WorkerVoxelizer {
         const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const total = NX * NY * NZ;
         const index1D = (x,y,z) => x + NX * (y + NY * z);
-        const voxelHits = new Map();
+        const voxelHits = new VoxelHitStore(total, this.hitStoreMode);
 
         const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
         const triBox = new THREE.Box3();
@@ -737,10 +1815,7 @@ class WorkerVoxelizer {
                         // Record closest triangle
                         const lin = index1D(x,y,z);
                         const dist2 = (n.dot(tv0) * n.dot(tv0)) / nn;
-                        const prev = voxelHits.get(lin);
-                        if (!prev || dist2 < prev.dist2) {
-                            voxelHits.set(lin, { tri: i, dist2 });
-                        }
+                        voxelHits.setIfCloser(lin, i, dist2);
                     }
                 }
             }
@@ -753,16 +1828,59 @@ class WorkerVoxelizer {
     // Greedy meshing + chunked output (à la OptiFine/Sodium)
     #buildGreedyMeshChunks() {
       const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
-      const total = NX * NY * NZ;
 
       // 1) Build sparse chunked stores for palette ids and voxel colors
       const CHUNK = DEFAULT_CHUNK_SIZE;
       const paletteStore = new PaletteChunkStore(NX, NY, NZ, CHUNK);
       const colorStore = new ColorChunkStore(NX, NY, NZ, CHUNK);
       const linToSRGB = (x) => (x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1/2.4) - 0.055);
+      const palette = this.palette ?? new Float32Array([1, 1, 1]);
+      const paletteCount = Math.max(1, (palette.length / 3) | 0);
+      const paletteColors8 = new Uint8Array(paletteCount * 4);
+      for (let i = 0; i < paletteCount; i++) {
+        const base = i * 3;
+        const out = i * 4;
+        paletteColors8[out + 0] = Math.max(0, Math.min(255, (palette[base + 0] * 255) | 0));
+        paletteColors8[out + 1] = Math.max(0, Math.min(255, (palette[base + 1] * 255) | 0));
+        paletteColors8[out + 2] = Math.max(0, Math.min(255, (palette[base + 2] * 255) | 0));
+        paletteColors8[out + 3] = 255;
+      }
+      const bboxMinX = this.bbox.min.x;
+      const bboxMinY = this.bbox.min.y;
+      const bboxMinZ = this.bbox.min.z;
+      const voxelSize = this.voxelSize;
       const v = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
       const uv0 = new THREE.Vector2(), uv1 = new THREE.Vector2(), uv2 = new THREE.Vector2();
+      const uvp = new THREE.Vector2();
       const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(), ep = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      const triangle = new THREE.Triangle();
+      const closestPoint = new THREE.Vector3();
+      const flatMaterialCache = this.materials.map((mat) => {
+        if (!mat || mat.map || mat.emissiveMap) return null;
+        let r = mat.color ? mat.color.r : 1;
+        let g = mat.color ? mat.color.g : 1;
+        let b = mat.color ? mat.color.b : 1;
+        if (mat.emissive) {
+          r += mat.emissive.r;
+          g += mat.emissive.g;
+          b += mat.emissive.b;
+        }
+        r = Math.min(1, Math.max(0, r));
+        g = Math.min(1, Math.max(0, g));
+        b = Math.min(1, Math.max(0, b));
+        const rr = Math.min(1, Math.max(0, linToSRGB(r)));
+        const gg = Math.min(1, Math.max(0, linToSRGB(g)));
+        const bb = Math.min(1, Math.max(0, linToSRGB(b)));
+        let best = 0, bestD = Infinity;
+        for (let c = 0; c < paletteCount; ++c) {
+          const base = c * 3;
+          const dr = r - palette[base], dg = g - palette[base + 1], db = b - palette[base + 2];
+          const d2 = dr*dr + dg*dg + db*db;
+          if (d2 < bestD) { bestD = d2; best = c; }
+        }
+        return { rr, gg, bb, paletteId: best + 1 };
+      });
 
       const { voxelHits } = this._rasterResult;
       if (!voxelHits || voxelHits.size === 0) {
@@ -770,14 +1888,18 @@ class WorkerVoxelizer {
         return { geometries: [] };
       }
 
-      for (const [linKey, hit] of voxelHits.entries()) {
-        const lin = typeof linKey === 'number' ? linKey : Number(linKey);
-        if (!Number.isFinite(lin)) continue;
+      const processVoxelHit = (lin, triId) => {
         const gx = lin % NX;
         const gy = ((lin / NX) | 0) % NY;
         const gz = (lin / (NX*NY)) | 0;
-        const triId = hit?.tri;
-        if (triId == null || triId < 0) continue;
+        if (triId == null || triId < 0) return;
+        const triMatIdx = this.triMats[triId] ?? 0;
+        const flatInfo = flatMaterialCache[triMatIdx];
+        if (flatInfo) {
+          colorStore.accumulate(gx, gy, gz, flatInfo.rr, flatInfo.gg, flatInfo.bb, 1);
+          paletteStore.set(gx, gy, gz, flatInfo.paletteId);
+          return;
+        }
 
         // sample color for voxel center using triangle triId
         const i0 = this.indices[triId*3], i1 = this.indices[triId*3+1], i2 = this.indices[triId*3+2];
@@ -788,10 +1910,10 @@ class WorkerVoxelizer {
         uv1.fromArray(this.uvs, i1*2);
         uv2.fromArray(this.uvs, i2*2);
 
-        const center = new THREE.Vector3(
-          this.bbox.min.x + (gx + 0.5) * this.voxelSize,
-          this.bbox.min.y + (gy + 0.5) * this.voxelSize,
-          this.bbox.min.z + (gz + 0.5) * this.voxelSize
+        center.set(
+          bboxMinX + (gx + 0.5) * voxelSize,
+          bboxMinY + (gy + 0.5) * voxelSize,
+          bboxMinZ + (gz + 0.5) * voxelSize
         );
 
         // barycentric at center (fallback to closest point)
@@ -808,9 +1930,9 @@ class WorkerVoxelizer {
           w_b = (d00 * d21 - d01 * d20) * inv;
           u_b = 1.0 - v_b - w_b;
           if (u_b < 0 || v_b < 0 || w_b < 0) {
-            const tri = new THREE.Triangle(v, v1, v2);
-            const cp = tri.closestPointToPoint(center, new THREE.Vector3());
-            ep.subVectors(cp, v);
+            triangle.set(v, v1, v2);
+            triangle.closestPointToPoint(center, closestPoint);
+            ep.subVectors(closestPoint, v);
             const d20c = ep.dot(e0), d21c = ep.dot(e1);
             v_b = (d11 * d20c - d01 * d21c) * inv;
             w_b = (d00 * d21c - d01 * d20c) * inv;
@@ -818,12 +1940,12 @@ class WorkerVoxelizer {
           }
         }
 
-        const uvp = new THREE.Vector2(0,0)
-          .addScaledVector(uv0, u_b)
-          .addScaledVector(uv1, v_b)
-          .addScaledVector(uv2, w_b);
+        uvp.set(
+          u_b * uv0.x + v_b * uv1.x + w_b * uv2.x,
+          u_b * uv0.y + v_b * uv1.y + w_b * uv2.y
+        );
 
-        const mat = this.materials[this.triMats[triId]] || this.materials[0];
+        const mat = this.materials[triMatIdx] || this.materials[0];
         let r=1, g=1, b=1;
         if (mat && mat.color) { r *= mat.color.r; g *= mat.color.g; b *= mat.color.b; }
         
@@ -861,13 +1983,26 @@ class WorkerVoxelizer {
 
         // choose nearest palette entry (use actual palette length!)
         let best = 0, bestD = Infinity;
-        const K = (this.palette?.length ?? 0) / 3;
-        for (let c = 0; c < K; ++c) {
-          const dr = r - this.palette[c*3], dg = g - this.palette[c*3+1], db = b - this.palette[c*3+2];
+        for (let c = 0; c < paletteCount; ++c) {
+          const base = c * 3;
+          const dr = r - palette[base], dg = g - palette[base + 1], db = b - palette[base + 2];
           const d2 = dr*dr + dg*dg + db*db;
           if (d2 < bestD) { bestD = d2; best = c; }
         }
         paletteStore.set(gx, gy, gz, best + 1); // store +1 to distinguish 0 = empty
+      };
+
+      if (voxelHits.mode === 'dense') {
+        const triangles = voxelHits.triangles;
+        for (let lin = 0; lin < triangles.length; lin++) {
+          const triId = triangles[lin];
+          if (triId === -1) continue;
+          processVoxelHit(lin, triId);
+        }
+      } else {
+        for (const [lin, hit] of voxelHits.map.entries()) {
+          processVoxelHit(lin, hit.tri);
+        }
       }
 
       // 2) Greedy mesh per CHUNK (greatly reduces triangles & allows culling)
@@ -890,17 +2025,16 @@ class WorkerVoxelizer {
           r[0], r[1], r[2],
           s[0], s[1], s[2]
         );
-                // colors (u8 RGBA packed here)
-                const rC = this.palette[(colorIdx)*3+0];
-                const gC = this.palette[(colorIdx)*3+1];
-                const bC = this.palette[(colorIdx)*3+2];
-                const R = Math.max(0,Math.min(255,(rC*255)|0));
-                const G = Math.max(0,Math.min(255,(gC*255)|0));
-                const B = Math.max(0,Math.min(255,(bC*255)|0));
-                const A = 255;
-                out.colors8.push(
-                    R,G,B,A, R,G,B,A, R,G,B,A, R,G,B,A
-                );
+        const colorOffset = colorIdx * 4;
+        const R = paletteColors8[colorOffset + 0];
+        const G = paletteColors8[colorOffset + 1];
+        const B = paletteColors8[colorOffset + 2];
+        out.colors8.push(
+          R, G, B, 255,
+          R, G, B, 255,
+          R, G, B, 255,
+          R, G, B, 255
+        );
         
         // Check winding order and emit triangles with correct CCW orientation
         // Calculate face cross product to determine if we need to flip
@@ -1024,7 +2158,7 @@ class WorkerVoxelizer {
                   if (d === 2) { nrm = [ 0, 0, -side]; }
 
                   // Always emit in consistent order - pushQuad will handle winding correction
-                  pushQuad.call(this, out, P,Q,R,S, nrm, colId);
+                  pushQuad(out, P, Q, R, S, nrm, colId);
 
                   // zero out the mask we just consumed
                   for (let jj = 0; jj < h; jj++) {
@@ -1073,6 +2207,169 @@ class WorkerVoxelizer {
       // expose color store for voxel grid serialization
       this._colorStore = colorStore;
       return { geometries };
+    }
+
+    #buildGreedyMeshFromPaletteStore(paletteStore, colorStore, paletteColors8) {
+      const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
+      const CHUNK = DEFAULT_CHUNK_SIZE;
+      const bx = this.bbox.min.x, by = this.bbox.min.y, bz = this.bbox.min.z;
+      const vs = this.voxelSize;
+      const mask = new Int32Array(CHUNK * CHUNK);
+      const sample = (x, y, z) => paletteStore.get(x, y, z);
+
+      function pushQuad(out, p, q, r, s, nrm, colorIdx) {
+        const base = out.positions.length / 3;
+        out.positions.push(
+          p[0], p[1], p[2],
+          q[0], q[1], q[2],
+          r[0], r[1], r[2],
+          s[0], s[1], s[2]
+        );
+        const colorOffset = colorIdx * 4;
+        const R = paletteColors8[colorOffset + 0];
+        const G = paletteColors8[colorOffset + 1];
+        const B = paletteColors8[colorOffset + 2];
+        out.colors8.push(
+          R, G, B, 255,
+          R, G, B, 255,
+          R, G, B, 255,
+          R, G, B, 255
+        );
+
+        const ax = q[0] - p[0], ay = q[1] - p[1], az = q[2] - p[2];
+        const bx = r[0] - p[0], by = r[1] - p[1], bz = r[2] - p[2];
+        const cx = ay * bz - az * by;
+        const cy = az * bx - ax * bz;
+        const cz = ax * by - ay * bx;
+        const dot = cx * nrm[0] + cy * nrm[1] + cz * nrm[2];
+
+        if (dot >= 0) {
+          out.indices.push(base+0, base+1, base+2, base+0, base+2, base+3);
+        } else {
+          out.indices.push(base+0, base+2, base+1, base+0, base+3, base+2);
+        }
+      }
+
+      const meshChunk = (cx0, cx1, cy0, cy1, cz0, cz1) => {
+        const out = { positions: [], colors8: [], indices: [] };
+
+        for (let d = 0; d < 3; d++) {
+          const u = (d + 1) % 3;
+          const v = (d + 2) % 3;
+          const minD = (d===0?cx0:(d===1?cy0:cz0));
+          const maxD = (d===0?cx1:(d===1?cy1:cz1));
+          const minU = (u===0?cx0:(u===1?cy0:cz0));
+          const maxU = (u===0?cx1:(u===1?cy1:cz1));
+          const minV = (v===0?cx0:(v===1?cy0:cz0));
+          const maxV = (v===0?cx1:(v===1?cy1:cz1));
+
+          for (let x = minD; x <= maxD; x++) {
+            const nu = (maxU - minU);
+            const nv = (maxV - minV);
+            if (nu === 0 || nv === 0) continue;
+
+            let n = 0;
+            for (let j = minV; j < maxV; j++) {
+              for (let i = minU; i < maxU; i++) {
+                const a = (d===0) ? sample(x-1, i, j)
+                          : (d===1) ? sample(j, x-1, i)
+                          : sample(i, j, x-1);
+                const b = (d===0) ? sample(x, i, j)
+                          : (d===1) ? sample(j, x, i)
+                          : sample(i, j, x);
+                let id = 0;
+                if ((a !== 0) !== (b !== 0)) {
+                  id = (b !== 0 ? +1 : -1) * (b !== 0 ? b : a);
+                }
+                mask[n++] = id;
+              }
+            }
+
+            n = 0;
+            for (let j = 0; j < nv; j++) {
+              for (let i = 0; i < nu; ) {
+                const c = mask[n];
+                if (c) {
+                  let w = 1;
+                  while (i + w < nu && mask[n + w] === c) w++;
+
+                  let h = 1, k;
+                  outer: for (; j + h < nv; h++) {
+                    for (k = 0; k < w; k++) {
+                      if (mask[n + k + h * nu] !== c) break outer;
+                    }
+                  }
+
+                  const side = Math.sign(c);
+                  const colId = Math.abs(c) - 1;
+                  const xPlane = x;
+                  const iu0 = minU + i, iu1 = iu0 + w;
+                  const iv0 = minV + j, iv1 = iv0 + h;
+
+                  let p = [0,0,0], q = [0,0,0], r = [0,0,0], s = [0,0,0];
+                  if (d === 0) {
+                    p = [xPlane, iu0, iv0]; q = [xPlane, iu1, iv0];
+                    r = [xPlane, iu1, iv1]; s = [xPlane, iu0, iv1];
+                  } else if (d === 1) {
+                    p = [iv0, xPlane, iu0]; q = [iv1, xPlane, iu0];
+                    r = [iv1, xPlane, iu1]; s = [iv0, xPlane, iu1];
+                  } else {
+                    p = [iu0, iv0, xPlane]; q = [iu1, iv0, xPlane];
+                    r = [iu1, iv1, xPlane]; s = [iu0, iv1, xPlane];
+                  }
+
+                  const P = [bx + p[0]*vs, by + p[1]*vs, bz + p[2]*vs];
+                  const Q = [bx + q[0]*vs, by + q[1]*vs, bz + q[2]*vs];
+                  const R = [bx + r[0]*vs, by + r[1]*vs, bz + r[2]*vs];
+                  const S = [bx + s[0]*vs, by + s[1]*vs, bz + s[2]*vs];
+
+                  let nrm = [0,0,0];
+                  if (d === 0) nrm = [ -side, 0, 0];
+                  if (d === 1) nrm = [ 0, -side, 0];
+                  if (d === 2) nrm = [ 0, 0, -side];
+
+                  pushQuad(out, P, Q, R, S, nrm, colId);
+
+                  for (let jj = 0; jj < h; jj++) {
+                    for (let ii = 0; ii < w; ii++) {
+                      mask[n + ii + jj * nu] = 0;
+                    }
+                  }
+                  i += w; n += w;
+                } else {
+                  i++; n++;
+                }
+              }
+            }
+          }
+        }
+
+        const positions = new Float32Array(out.positions);
+        const colors8 = new Uint8Array(out.colors8);
+        const indices = positions.length/3 >= 65536 ? new Uint32Array(out.indices) : new Uint16Array(out.indices);
+        const bounds = {
+          min: [bx + cx0*vs, by + cy0*vs, bz + cz0*vs],
+          max: [bx + cx1*vs, by + cy1*vs, bz + cz1*vs],
+        };
+
+        return { positions, colors8, indices, bounds };
+      };
+
+      const geometries = [];
+      for (let z0 = 0; z0 < NZ; z0 += CHUNK) {
+        for (let y0 = 0; y0 < NY; y0 += CHUNK) {
+          for (let x0 = 0; x0 < NX; x0 += CHUNK) {
+            const x1 = Math.min(NX, x0 + CHUNK);
+            const y1 = Math.min(NY, y0 + CHUNK);
+            const z1 = Math.min(NZ, z0 + CHUNK);
+            const g = meshChunk(x0, x1, y0, y1, z0, z1);
+            if (g.indices.length) geometries.push(g);
+          }
+        }
+      }
+
+      this._colorStore = colorStore;
+      return geometries;
     }
     
     #getVoxelGridData() {
@@ -1127,42 +2424,50 @@ class WorkerVoxelizer {
 }
 
 // --- Worker Entry Point ---
-self.onmessage = async (event) => {
-    try {
-        const { modelData, resolution, needGrid = false, method = '2.5d-scan' } = event.data;
-        
-        const bbox = new THREE.Box3(
-            new THREE.Vector3().fromArray(modelData.bbox.min),
-            new THREE.Vector3().fromArray(modelData.bbox.max)
-        );
-        const size = new THREE.Vector3();
-        bbox.getSize(size);
-        const maxDim = Math.max(size.x, size.y, size.z);
-        const voxelSize = maxDim / resolution;
+if (typeof self !== 'undefined') {
+    self.onmessage = async (event) => {
+        try {
+            const {
+                modelData,
+                resolution,
+                needGrid = false,
+                method = '2.5d-scan',
+                hitStoreMode = 'auto'
+            } = event.data;
 
-        const voxelizer = new WorkerVoxelizer();
-        const result = await voxelizer.init({ modelData, voxelSize, needGrid, method });
-        
-        const transferList = [];
-        if (result.voxelGrid?.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);
-        if (result.voxelGrid?.voxelCounts) transferList.push(result.voxelGrid.voxelCounts.buffer);
-        if (result.voxelGrid?.chunked?.chunks) {
+            const bbox = new THREE.Box3(
+                new THREE.Vector3().fromArray(modelData.bbox.min),
+                new THREE.Vector3().fromArray(modelData.bbox.max)
+            );
+            const size = new THREE.Vector3();
+            bbox.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const voxelSize = maxDim / resolution;
+
+            const voxelizer = new WorkerVoxelizer();
+            const result = await voxelizer.init({ modelData, voxelSize, needGrid, method, hitStoreMode });
+
+            const transferList = [];
+            if (result.voxelGrid?.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);
+            if (result.voxelGrid?.voxelCounts) transferList.push(result.voxelGrid.voxelCounts.buffer);
+            if (result.voxelGrid?.chunked?.chunks) {
                 for (const chunk of result.voxelGrid.chunked.chunks) {
                     if (chunk.colors) transferList.push(chunk.colors.buffer);
                     if (chunk.alphas) transferList.push(chunk.alphas.buffer);
                     if (chunk.counts) transferList.push(chunk.counts.buffer);
                 }
-        }
-        for (const g of (result.geometries || [])) {
-            if (g?.positions?.buffer) transferList.push(g.positions.buffer);
-            if (g?.colors8?.buffer)   transferList.push(g.colors8.buffer);
-                    if (g?.normals?.buffer)   transferList.push(g.normals.buffer);   // only if present
-                    if (g?.indices?.buffer)   transferList.push(g.indices.buffer);
-                }
+            }
+            for (const g of (result.geometries || [])) {
+                if (g?.positions?.buffer) transferList.push(g.positions.buffer);
+                if (g?.colors8?.buffer) transferList.push(g.colors8.buffer);
+                if (g?.normals?.buffer) transferList.push(g.normals.buffer);
+                if (g?.indices?.buffer) transferList.push(g.indices.buffer);
+            }
 
-        self.postMessage({ status: 'success', result }, transferList);
-    } catch (error) {
-        console.error('Error in voxelizer worker:', error);
-        self.postMessage({ status: 'error', message: error.message, stack: error.stack });
-    }
-};
+            self.postMessage({ status: 'success', result }, transferList);
+        } catch (error) {
+            console.error('Error in voxelizer worker:', error);
+            self.postMessage({ status: 'error', message: error.message, stack: error.stack });
+        }
+    };
+}

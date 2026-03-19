@@ -5,6 +5,9 @@ import { DRACOLoader }  from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { KTX2Loader }   from 'three/examples/jsm/loaders/KTX2Loader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { loadGltfBatch } from './loadGltfBatch.js';
+
+const LEGACY_SRGB_ENCODING = 3001;
 
 export class SingleSceneViewer {
 	constructor() {
@@ -23,8 +26,8 @@ export class SingleSceneViewer {
 				// Use sRGB color space so GLTF colors match expected appearance
 				if (THREE.SRGBColorSpace !== undefined) {
 					renderer.outputColorSpace = THREE.SRGBColorSpace;
-				} else if (THREE.sRGBEncoding !== undefined) {
-					renderer.outputEncoding = THREE.sRGBEncoding;
+				} else if ('outputEncoding' in renderer) {
+					renderer.outputEncoding = LEGACY_SRGB_ENCODING;
 				}
 		document.body.appendChild(renderer.domElement);
 		
@@ -94,21 +97,32 @@ export class SingleSceneViewer {
 			this.tilesContainer = null;
 		}
 		const tilesContainer = new THREE.Object3D();
-		// Fetch individual glTF's (with DRACO/KTX2/Meshopt support) and add them to the scene
-		const gltfArray = [];
-		for (let i = 0; i < urlArray.length; i++) {
-			const url = urlArray[i];
-			if (logFn) logFn(`Fetching glTF ${i + 1}/${urlArray.length}`);
-			try {
-				const gltf = await new Promise((res, rej) => this.gltfLoader.load(url, res, undefined, rej));
-				gltfArray.push(gltf);
-				tilesContainer.add(gltf.scene);
-			} catch (e) {
-				logFn?.(`Skipped one tile (${e?.message ?? 'load error'})`);
-			}
+		// Fetch individual glTFs with bounded parallelism instead of serial network waits
+		const { gltfs: gltfArray, stats } = await loadGltfBatch({
+			urls: urlArray,
+			concurrency: 8,
+			loadOne: (url) => new Promise((res, rej) => this.gltfLoader.load(url, res, undefined, rej)),
+			onProgress: ({ index, total, loaded, ok, error }) => {
+				if (ok) logFn?.(`Fetched glTF ${loaded}/${total} (parallel x${Math.min(8, total)})`);
+				else logFn?.(`Skipped glTF ${index + 1}/${total} (${error?.message ?? 'load error'})`);
+			},
+		});
+		for (const gltf of gltfArray) {
+			tilesContainer.add(gltf.scene);
+		}
+		if (!gltfArray.length) {
+			logFn?.('No glTF tiles loaded successfully.');
+			this.tilesContainer = null;
+			this.gltfArray = [];
+			return;
 		}
 
-		if (logFn) logFn(`Normalizing & stitching together ${gltfArray.length} glTFs`);
+		if (logFn) {
+			logFn(
+				`Normalizing & stitching together ${gltfArray.length} glTFs `
+				+ `(${stats.durationMs.toFixed(1)} ms load, ${stats.failed} failed)`
+			);
+		}
 
 
 		// Re-center & normalize the *whole* container
