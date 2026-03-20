@@ -512,22 +512,22 @@
             </div>
           </label>
 
-          <!-- WebGPU (Coming Soon) -->
-          <div class="flex items-center p-3 rounded-xl bg-white/2 opacity-70 cursor-not-allowed">
-            <div class="w-5 h-5 rounded-full border-2 border-white/30 flex items-center justify-center mr-3">
-              <span class="material-symbols-rounded text-white/30 text-xs">lock</span>
+          <!-- WebGPU Compute -->
+          <label class="flex items-center p-3 rounded-xl hover:bg-white/5 cursor-pointer transition-colors">
+            <input name="voxel-method" type="radio" class="sr-only peer" value="webgpu">
+            <div
+              class="w-5 h-5 rounded-full border-2 border-white/30 peer-checked:border-blue-500 peer-checked:bg-blue-500 flex items-center justify-center mr-3 transition-colors">
+              <span class="material-symbols-rounded text-white text-xs opacity-0 peer-checked:opacity-100">check</span>
             </div>
             <div class="flex-1">
               <div class="flex items-center gap-2 mb-1">
-                <div class="text-sm font-medium text-white/80">WebGPU Compute</div>
-                <div class="px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400/80 text-xs font-medium">~100x
-                </div>
-                <div class="px-2 py-0.5 rounded-full bg-gray-500/20 text-gray-400 text-xs font-medium">COMING SOON</div>
+                <div class="text-sm font-medium">WebGPU Compute</div>
+                <div class="px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-300 text-xs font-medium">GPU</div>
+                <div class="px-2 py-0.5 rounded-full bg-white/10 text-white/70 text-xs font-medium">EXPERIMENTAL</div>
               </div>
-              <div class="text-xs opacity-60 leading-relaxed">GPU-accelerated parallel voxelization with compute
-                shaders.</div>
+              <div class="text-xs opacity-60 leading-relaxed">GPU compute raster path on the main thread. Falls back to JS 2.5D automatically when WebGPU compute is unavailable.</div>
             </div>
-          </div>
+          </label>
         </div>
       </div>
     </div>

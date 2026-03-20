@@ -192,6 +192,10 @@ function toLinear(c) {
   return (c <= 0.04045) ? (c / 12.92) : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
+function linearToSrgb(c) {
+  return (c <= 0.0031308) ? (c * 12.92) : (1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+}
+
 // sRGB (0..1) → OKLab
 function rgbToOKLab(r, g, b) {
   // linearize first
@@ -358,6 +362,10 @@ function iterateVoxelSamples(voxelGrid, fn) {
   const total = NX * NY * NZ;
   const counts = voxelGrid.voxelCounts;
   const colors = voxelGrid.voxelColors;
+  const voxelColorSpace = voxelGrid.colorSpace || 'srgb';
+  const toMatcherSpace = voxelColorSpace === 'linear'
+    ? (c) => Math.min(1, Math.max(0, linearToSrgb(c)))
+    : (c) => c;
   if (counts && colors) {
     const len = Math.min(counts.length, total);
     for (let i = 0; i < len; i++) {
@@ -371,9 +379,9 @@ function iterateVoxelSamples(voxelGrid, fn) {
         x, y, z,
         linearIndex: i,
         count: cnt,
-        r: colors[base + 0],
-        g: colors[base + 1],
-        b: colors[base + 2],
+        r: toMatcherSpace(colors[base + 0]),
+        g: toMatcherSpace(colors[base + 1]),
+        b: toMatcherSpace(colors[base + 2]),
         alpha: colors[base + 3] ?? 1
       });
     }
@@ -413,9 +421,9 @@ function iterateVoxelSamples(voxelGrid, fn) {
         x, y, z,
         linearIndex: linear,
         count: cnt,
-        r: colorsArr[base + 0] / cnt,
-        g: colorsArr[base + 1] / cnt,
-        b: colorsArr[base + 2] / cnt,
+        r: toMatcherSpace(colorsArr[base + 0] / cnt),
+        g: toMatcherSpace(colorsArr[base + 1] / cnt),
+        b: toMatcherSpace(colorsArr[base + 2] / cnt),
         alpha: alphasArr ? (alphasArr[i] / cnt) : 1
       });
     }

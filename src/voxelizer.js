@@ -1,206 +1,383 @@
-/* paletteVoxelizer_fixed.js – fast GPU voxeliser with adaptive palette
- * GPL-3.0 • 2025‑06‑23 (REV‑G7: barycentric bounds check, linear color space)
- */
-
 import * as THREE from 'three';
 import { storage, uniform, instanceIndex, wgslFn } from 'three/tsl';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import StorageBufferAttribute from 'three/src/renderers/common/StorageBufferAttribute.js';
 
-/* tiny 32‑bit popcount */
-function popcnt32(n) {
-  n -= (n >>> 1) & 0x55555555;
-  n  = (n & 0x33333333) + ((n >>> 2) & 0x33333333);
-  return (((n + (n >>> 4)) & 0x0F0F0F0F) * 0x01010101) >>> 24;
+const LEGACY_SRGB_ENCODING = 3001;
+const MAX_GPU_BYTES = 256 * 1024 * 1024;
+const BYTES_PER_VOXEL = 8.2;
+const TILE_EDGE = Math.max(1, Math.floor(Math.cbrt(MAX_GPU_BYTES / BYTES_PER_VOXEL)));
+const MAX_VERTICES_PER_MESH = 65536 * 4;
+const MAIN_THREAD_SLICE_MS = 4;
+
+const CUBE_FACES = [
+  { dir: [1, 0, 0], normal: [127, 0, 0], vertices: [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]] },
+  { dir: [-1, 0, 0], normal: [-127, 0, 0], vertices: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]] },
+  { dir: [0, 1, 0], normal: [0, 127, 0], vertices: [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]] },
+  { dir: [0, -1, 0], normal: [0, -127, 0], vertices: [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]] },
+  { dir: [0, 0, 1], normal: [0, 0, 127], vertices: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]] },
+  { dir: [0, 0, -1], normal: [0, 0, -127], vertices: [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]] },
+];
+
+function isSRGBTexture(tex) {
+  return !!tex && (
+    tex.colorSpace === THREE.SRGBColorSpace
+    || tex.encoding === LEGACY_SRGB_ENCODING
+  );
 }
 
-/* texture-sampler cache - NOW CORRECTLY CONVERTS sRGB TO LINEAR */
+function srgbToLinearChannel(value) {
+  if (value <= 0.04045) return value / 12.92;
+  return Math.pow((value + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgbChannel(value) {
+  if (value <= 0.0031308) return value * 12.92;
+  return 1.055 * Math.pow(value, 1 / 2.4) - 0.055;
+}
+
+function clampByte(value) {
+  const scaled = Math.round(value * 255);
+  if (scaled <= 0) return 0;
+  if (scaled >= 255) return 255;
+  return scaled;
+}
+
+function nowMs() {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+function createYieldState(sliceMs = MAIN_THREAD_SLICE_MS) {
+  return { sliceMs, deadline: nowMs() + sliceMs };
+}
+
+function nextFrame() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => resolve());
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+}
+
+async function maybeYieldToBrowser(yieldState, mainThreadPolicy = null) {
+  if (!yieldState) return;
+  if (mainThreadPolicy?.shouldPause?.()) {
+    await (mainThreadPolicy.waitForIdle?.() ?? nextFrame());
+    yieldState.deadline = nowMs() + yieldState.sliceMs;
+    return;
+  }
+  if (nowMs() < yieldState.deadline) return;
+  await nextFrame();
+  yieldState.deadline = nowMs() + yieldState.sliceMs;
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  if (!items.length) return [];
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const runnerCount = Math.max(1, Math.min(limit, items.length));
+
+  await Promise.all(Array.from({ length: runnerCount }, async () => {
+    while (true) {
+      const current = nextIndex++;
+      if (current >= items.length) break;
+      results[current] = await worker(items[current], current);
+    }
+  }));
+
+  return results;
+}
+
 const _samplers = new WeakMap();
 function getSampler(tex) {
-  if (!tex) return null;
-  if (_samplers.has(tex)) return _samplers.get(tex);
+  if (!tex) return null;
+  if (_samplers.has(tex)) return _samplers.get(tex);
 
-  let sampler = null, img = tex.image;
-  const build = (arr, w, h) => {
-    const { offset: off, repeat: rep, rotation: rot, center: cen, flipY, wrapS, wrapT } = tex;
-    const cosR = Math.cos(rot), sinR = Math.sin(rot);
+  let sampler = null;
+  const img = tex.image;
 
-    return (uv, wantRGBA = false) => {
-      // UV transform + clamp/wrap
-      let u = uv.x * rep.x + off.x, v = uv.y * rep.y + off.y;
-      if (rot !== 0) {
-        u -= cen.x; v -= cen.y;
-        const u2 = u * cosR - v * sinR, v2 = u * sinR + v * cosR;
-        u = u2 + cen.x; v = v2 + cen.y;
-      }
-      u = wrapS === THREE.RepeatWrapping ? ((u % 1) + 1) % 1 : THREE.MathUtils.clamp(u, 0, 1);
-      v = wrapT === THREE.RepeatWrapping ? ((v % 1) + 1) % 1 : THREE.MathUtils.clamp(v, 0, 1);
-      if (flipY) v = 1 - v;
+  const build = (arr, width, height) => {
+    const { offset, repeat, rotation, center, flipY, wrapS, wrapT } = tex;
+    const cosR = Math.cos(rotation);
+    const sinR = Math.sin(rotation);
 
-      // Bilinear against the four surrounding texels
-      const x  = u * (w - 1), y  = v * (h - 1);
-      const x0 = Math.floor(x), x1 = Math.min(w - 1, x0 + 1);
-      const y0 = Math.floor(y), y1 = Math.min(h - 1, y0 + 1);
-      const tx = x - x0, ty = y - y0;
-      const sample = (ix, iy) => {
-        const i = (iy * w + ix) * 4;
-        return {
-          r: arr[i] / 255, g: arr[i + 1] / 255, b: arr[i + 2] / 255, a: arr[i + 3] / 255
-        };
-      };
-      const c00 = sample(x0, y0), c10 = sample(x1, y0),
-            c01 = sample(x0, y1), c11 = sample(x1, y1);
-      const lerp = (a, b, t) => a + (b - a) * t;
+    return (uv, wantRGBA = false, target = null) => {
+      let u = uv.x * repeat.x + offset.x;
+      let v = uv.y * repeat.y + offset.y;
 
-      const r0 = lerp(c00.r, c10.r, tx), g0 = lerp(c00.g, c10.g, tx), b0 = lerp(c00.b, c10.b, tx),
-            r1 = lerp(c01.r, c11.r, tx), g1 = lerp(c01.g, c11.g, tx), b1 = lerp(c01.b, c11.b, tx);
-
-      if (wantRGBA) {
-        const a0 = lerp(c00.a, c10.a, tx), a1 = lerp(c01.a, c11.a, tx), a = lerp(a0, a1, ty);
-        const rgba = { r: lerp(r0, r1, ty), g: lerp(g0, g1, ty), b: lerp(b0, b1, ty), a };
-        // NOTE: Alpha values are not gamma corrected.
-        if (tex.encoding === THREE.sRGBEncoding) {
-          const tempColor = new THREE.Color(rgba.r, rgba.g, rgba.b).convertSRGBToLinear();
-          rgba.r = tempColor.r;
-          rgba.g = tempColor.g;
-          rgba.b = tempColor.b;
-        }
-        return rgba;
-      }
-      
-      const color = new THREE.Color(lerp(r0, r1, ty), lerp(g0, g1, ty), lerp(b0, b1, ty));
-      // **FIX**: If texture is sRGB, convert to linear space for consistent color math.
-      if (tex.encoding === THREE.sRGBEncoding) {
-          color.convertSRGBToLinear();
+      if (rotation !== 0) {
+        u -= center.x;
+        v -= center.y;
+        const rotatedU = u * cosR - v * sinR;
+        const rotatedV = u * sinR + v * cosR;
+        u = rotatedU + center.x;
+        v = rotatedV + center.y;
       }
-      return color;
-    };
-  };
 
-  if (img) {
-    if (img.data && img.width && img.height) {
-      sampler = build(img.data, img.width, img.height);
-    } else if (img.width && img.height) {
-      const cvs = document.createElement('canvas');
-      cvs.width = img.width; cvs.height = img.height;
-      const ctx = cvs.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(img, 0, 0);
-      sampler = build(ctx.getImageData(0, 0, cvs.width, cvs.height).data, cvs.width, cvs.height);
-    }
-  }
+      u = wrapS === THREE.RepeatWrapping ? ((u % 1) + 1) % 1 : THREE.MathUtils.clamp(u, 0, 1);
+      v = wrapT === THREE.RepeatWrapping ? ((v % 1) + 1) % 1 : THREE.MathUtils.clamp(v, 0, 1);
+      if (flipY) v = 1 - v;
 
-  _samplers.set(tex, sampler);
-  return sampler;
+      const x = u * (width - 1);
+      const y = v * (height - 1);
+      const x0 = Math.floor(x);
+      const y0 = Math.floor(y);
+      const x1 = Math.min(width - 1, x0 + 1);
+      const y1 = Math.min(height - 1, y0 + 1);
+      const tx = x - x0;
+      const ty = y - y0;
+
+      const i00 = (y0 * width + x0) * 4;
+      const i10 = (y0 * width + x1) * 4;
+      const i01 = (y1 * width + x0) * 4;
+      const i11 = (y1 * width + x1) * 4;
+      const lerp = (a, b, t) => a + (b - a) * t;
+
+      let r = lerp(lerp(arr[i00], arr[i10], tx), lerp(arr[i01], arr[i11], tx), ty) / 255;
+      let g = lerp(lerp(arr[i00 + 1], arr[i10 + 1], tx), lerp(arr[i01 + 1], arr[i11 + 1], tx), ty) / 255;
+      let b = lerp(lerp(arr[i00 + 2], arr[i10 + 2], tx), lerp(arr[i01 + 2], arr[i11 + 2], tx), ty) / 255;
+
+      if (isSRGBTexture(tex)) {
+        r = srgbToLinearChannel(r);
+        g = srgbToLinearChannel(g);
+        b = srgbToLinearChannel(b);
+      }
+
+      if (wantRGBA) {
+        const rgba = target ?? { r: 0, g: 0, b: 0, a: 1 };
+        rgba.r = r;
+        rgba.g = g;
+        rgba.b = b;
+        rgba.a = lerp(lerp(arr[i00 + 3], arr[i10 + 3], tx), lerp(arr[i01 + 3], arr[i11 + 3], tx), ty) / 255;
+        return rgba;
+      }
+
+      const color = target ?? new THREE.Color();
+      color.r = r;
+      color.g = g;
+      color.b = b;
+      return color;
+    };
+  };
+
+  if (img) {
+    if (img.data && img.width && img.height) {
+      sampler = build(img.data, img.width, img.height);
+    } else if (img.width && img.height && typeof document !== 'undefined') {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0);
+      sampler = build(ctx.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height);
+    }
+  }
+
+  _samplers.set(tex, sampler);
+  return sampler;
 }
 
-/* All color-bearing texture slots from the GLTF spec we care about */
 const COLOR_MAP_KEYS = ['map', 'emissiveMap'];
-function* allTextures(mat) {
-  for (const k of COLOR_MAP_KEYS) {
-    const t = mat[k];
-    if (t && t.isTexture) yield t;
-  }
+function* allTextures(material) {
+  for (const key of COLOR_MAP_KEYS) {
+    const texture = material[key];
+    if (texture && texture.isTexture) yield texture;
+  }
 }
 
-/* K‑means palette generation (operates in linear color space) */
-function kMeansPalette(colors, k = 64, iters = 8) {
-  const n = colors.length / 3;
-  if (n === 0) return { palette: new Float32Array(k * 3) }; // Handle empty case
-  const cent = new Float32Array(k * 3);
-  const idx  = new Uint8Array(n);
-  const sel  = new Set();
-  while (sel.size < k && sel.size < n) sel.add(Math.floor(Math.random() * n));
-  let ci = 0;
-  for (const s of sel) {
-    cent[ci++] = colors[s*3];
-    cent[ci++] = colors[s*3+1];
-    cent[ci++] = colors[s*3+2];
-  }
-  const sums = new Float32Array(k*3), cnts = new Uint32Array(k);
-  for (let it = 0; it < iters; ++it) {
-    sums.fill(0); cnts.fill(0);
-    for (let p = 0; p < n; ++p) {
-      const r = colors[p*3], g = colors[p*3+1], b = colors[p*3+2];
-      let best=0, bestD=1e9;
-      for (let c=0; c<k; ++c) {
-        const dr=r-cent[c*3], dg=g-cent[c*3+1], db=b-cent[c*3+2],
-              d = dr*dr + dg*dg + db*db;
-        if (d < bestD) { bestD = d; best = c; }
-      }
-      idx[p] = best;
-      sums[best*3]   += r;
-      sums[best*3+1] += g;
-      sums[best*3+2] += b;
-      cnts[best]++;
-    }
-    for (let c=0; c<k; ++c) {
-      const ct = Math.max(1, cnts[c]);
-      cent[c*3]   = sums[c*3]   / ct;
-      cent[c*3+1] = sums[c*3+1] / ct;
-      cent[c*3+2] = sums[c*3+2] / ct;
-    }
-  }
-  return { palette: cent };
+function kMeansPalette(colors, k = 64, iterations = 8) {
+  const count = colors.length / 3;
+  if (count === 0) return { palette: new Float32Array(k * 3) };
+
+  const centroids = new Float32Array(k * 3);
+  const assignments = new Uint8Array(count);
+  const selected = new Set();
+
+  while (selected.size < k && selected.size < count) {
+    selected.add(Math.floor(Math.random() * count));
+  }
+
+  let centroidIndex = 0;
+  for (const sample of selected) {
+    centroids[centroidIndex++] = colors[sample * 3];
+    centroids[centroidIndex++] = colors[sample * 3 + 1];
+    centroids[centroidIndex++] = colors[sample * 3 + 2];
+  }
+
+  const sums = new Float32Array(k * 3);
+  const counts = new Uint32Array(k);
+
+  for (let iteration = 0; iteration < iterations; iteration++) {
+    sums.fill(0);
+    counts.fill(0);
+    for (let pixel = 0; pixel < count; pixel++) {
+      const r = colors[pixel * 3];
+      const g = colors[pixel * 3 + 1];
+      const b = colors[pixel * 3 + 2];
+      let best = 0;
+      let bestDistance = Number.POSITIVE_INFINITY;
+      for (let centroid = 0; centroid < k; centroid++) {
+        const dr = r - centroids[centroid * 3];
+        const dg = g - centroids[centroid * 3 + 1];
+        const db = b - centroids[centroid * 3 + 2];
+        const distance = dr * dr + dg * dg + db * db;
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = centroid;
+        }
+      }
+      assignments[pixel] = best;
+      sums[best * 3] += r;
+      sums[best * 3 + 1] += g;
+      sums[best * 3 + 2] += b;
+      counts[best]++;
+    }
+    for (let centroid = 0; centroid < k; centroid++) {
+      const divisor = Math.max(1, counts[centroid]);
+      centroids[centroid * 3] = sums[centroid * 3] / divisor;
+      centroids[centroid * 3 + 1] = sums[centroid * 3 + 1] / divisor;
+      centroids[centroid * 3 + 2] = sums[centroid * 3 + 2] / divisor;
+    }
+  }
+
+  return { palette: centroids };
 }
 
-/* ====================================================================== */
+function nearestPaletteId(r, g, b, palette, paletteCount) {
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < paletteCount; index++) {
+    const base = index * 3;
+    const dr = r - palette[base];
+    const dg = g - palette[base + 1];
+    const db = b - palette[base + 2];
+    const distance = dr * dr + dg * dg + db * db;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex + 1;
+}
+
+function buildMaterialInfo(material, palette, paletteCount) {
+  if (!material) return null;
+
+  let baseR = material.color?.r ?? 1;
+  let baseG = material.color?.g ?? 1;
+  let baseB = material.color?.b ?? 1;
+  if (material.emissive) {
+    baseR += material.emissive.r;
+    baseG += material.emissive.g;
+    baseB += material.emissive.b;
+  }
+
+  const colorSamplers = [];
+  for (const texture of allTextures(material)) {
+    const sampler = getSampler(texture);
+    if (sampler) colorSamplers.push(sampler);
+  }
+
+  const alphaSampler = material.alphaMap ? getSampler(material.alphaMap) : null;
+  const opacity = material.opacity ?? 1;
+  const constantPaletteId = (!colorSamplers.length && !alphaSampler && opacity >= 0.5)
+    ? nearestPaletteId(baseR, baseG, baseB, palette, paletteCount)
+    : 0;
+
+  return {
+    baseR,
+    baseG,
+    baseB,
+    colorSamplers,
+    alphaSampler,
+    opacity,
+    constantPaletteId,
+  };
+}
+
+function createEmptyVoxelMesh() {
+  return new THREE.Mesh(
+    new THREE.BufferGeometry(),
+    new THREE.MeshBasicMaterial({ toneMapped: false })
+  );
+}
+
 export default class PaletteVoxelizer {
+  async init({
+    renderer,
+    model,
+    voxelSize = 0.01,
+    maxGrid = Infinity,
+    paletteSize = 256,
+    needGrid = false,
+  }) {
+    const startedAt = performance.now();
+    this.renderer = renderer;
+    this.voxelSize = voxelSize;
+    this.paletteSize = paletteSize;
+    this.needGrid = needGrid;
+    this._voxelGrid = null;
+    this.voxelCount = 0;
+    this.mainThreadPolicy = null;
 
-  async init({ renderer, model,
-               voxelSize=0.01,
-               maxGrid=Infinity,
-               paletteSize=256 }) {
+    if (!renderer || typeof renderer.computeAsync !== 'function' || typeof renderer.getArrayBufferAsync !== 'function') {
+      throw new Error('WebGPU compute renderer unavailable');
+    }
 
-    this.renderer    = renderer;
-    this.voxelSize   = voxelSize;
-    this.paletteSize = paletteSize;
+    const bakeStartedAt = performance.now();
+    const baked = await this.#bakeAndMerge(model);
+    const bakeMs = performance.now() - bakeStartedAt;
 
-    // 1) Bake + merge: positions, uvs, indices, triMats, palette, materials
-    const baked = this.#bakeAndMerge(model);
-    this.positions = baked.positions;
-    this.uvs       = baked.uvs;
-    this.indices   = baked.indices;
-    this.triMats   = baked.triMats;
-    this.palette   = baked.palette;
-    this.materials = baked.materials;
+    this.positions = baked.positions;
+    this.uvs = baked.uvs;
+    this.indices = baked.indices;
+    this.triMats = baked.triMats;
+    this.palette = baked.palette;
+    this.materials = baked.materials;
+    this.paletteCount = Math.min(this.paletteSize, this.palette.length / 3);
 
-    // 2) GPU buffers
-    this.posBuf = new StorageBufferAttribute(this.positions, 3);
-    this.uvBuf  = new StorageBufferAttribute(this.uvs,       2);
-    this.idxBuf = new StorageBufferAttribute(this.indices,    1);
-    this.matBuf = new StorageBufferAttribute(this.triMats,    1);
+    if (!this.positions.length || !this.indices.length) {
+      this.voxelMesh = createEmptyVoxelMesh();
+      this.stats = {
+        method: 'webgpu',
+        bakeMs,
+        rasterMs: 0,
+        postprocessMs: 0,
+        meshMs: 0,
+        gridExportMs: 0,
+        gpuMs: 0,
+        totalMs: performance.now() - startedAt,
+      };
+      return;
+    }
 
-    // 3) Grid dims
-    this.bbox = new THREE.Box3().setFromObject(model);
-    const size = new THREE.Vector3(); this.bbox.getSize(size);
-    let nx = Math.ceil(size.x/voxelSize),
-        ny = Math.ceil(size.y/voxelSize),
-        nz = Math.ceil(size.z/voxelSize);
-    const m = Math.max(nx,ny,nz),
-          scale = Number.isFinite(maxGrid) && m>maxGrid ? maxGrid/m : 1;
-    this.grid = new THREE.Vector3(
-      Math.ceil(nx*scale),
-      Math.ceil(ny*scale),
-      Math.ceil(nz*scale)
-    );
-    this.voxelSize  /= scale;
-    this.voxelCount  = this.grid.x * this.grid.y * this.grid.z;
+    this.posBuf = new StorageBufferAttribute(this.positions, 3);
+    this.uvBuf = new StorageBufferAttribute(this.uvs, 2);
+    this.idxBuf = new StorageBufferAttribute(this.indices, 1);
+    this.matBuf = new StorageBufferAttribute(this.triMats, 1);
 
-    // 4) Allocate bit, tri & distance grids
-//     const bitWords = Math.ceil(this.voxelCount/32),
-//           triWords = this.voxelCount;
-//     this.bitGrid  = new StorageBufferAttribute(new Uint32Array(bitWords),1);
-//     this.triGrid  = new StorageBufferAttribute(new Uint32Array(triWords),1);
-//     const distInit = new Uint32Array(triWords);
-//     distInit.fill(0x7f800000); // +Infinity for f32
-//     this.distGrid = new StorageBufferAttribute(distInit,1);
+    this.bbox = new THREE.Box3().setFromObject(model);
+    const size = this.bbox.getSize(new THREE.Vector3());
+    const nx = Math.ceil(size.x / voxelSize);
+    const ny = Math.ceil(size.y / voxelSize);
+    const nz = Math.ceil(size.z / voxelSize);
+    const maxDim = Math.max(nx, ny, nz);
+    const scale = Number.isFinite(maxGrid) && maxDim > maxGrid ? maxGrid / maxDim : 1;
 
+    this.grid = new THREE.Vector3(
+      Math.ceil(nx * scale),
+      Math.ceil(ny * scale),
+      Math.ceil(nz * scale)
+    );
+    this.voxelSize /= scale;
+    this.totalGridVoxelCount = this.grid.x * this.grid.y * this.grid.z;
 
- this.bitGrid = this.triGrid = this.distGrid =
-   new StorageBufferAttribute(new Uint32Array(0), 1);
+    this.bitGrid = this.triGrid = this.distGrid = new StorageBufferAttribute(new Uint32Array(0), 1);
 
-    // 5) Clear grids
-    const clearWGSL = wgslFn(`
+    this._clearWGSL = wgslFn(`
       fn compute(
         bits : ptr<storage, array<atomic<u32>>, read_write>,
         tris : ptr<storage, array<u32>, read_write>,
@@ -211,17 +388,8 @@ export default class PaletteVoxelizer {
         if (id < arrayLength(&*tris)) { tris[id] = 0u; }
         if (id < arrayLength(&*dists)) { atomicStore(&dists[id], 0x7f800000u); }
       }`);
-//     await renderer.computeAsync(
-//       clearWGSL({
-//         bits: storage(this.bitGrid, 'atomic<u32>', this.bitGrid.count),
-//         tris: storage(this.triGrid, 'u32', this.triGrid.count),
-//         dists: storage(this.distGrid, 'atomic<u32>', this.distGrid.count),
-//         id: instanceIndex
-//       }).compute(Math.max(bitWords,triWords))
-//     );
 
-    // 6) Raster kernel – keeps closest triangle per voxel (race‑free)
-    const rasterWGSL = wgslFn(/* wgsl */`
+    this._rasterWGSL = wgslFn(`
 fn compute(
   pos  : ptr<storage, array<vec3<f32>>,  read>,
   ind  : ptr<storage, array<u32>,        read>,
@@ -230,722 +398,1185 @@ fn compute(
   dists: ptr<storage, array<atomic<u32>>, read_write>,
   gDim : vec3<u32>, bMin : vec3<f32>, vSz : f32, triId : u32
 ) -> void {
-  let i0 = ind[triId*3u];
-  let i1 = ind[triId*3u+1u];
-  let i2 = ind[triId*3u+2u];
+  let i0 = ind[triId * 3u];
+  let i1 = ind[triId * 3u + 1u];
+  let i2 = ind[triId * 3u + 2u];
 
   let v0 = pos[i0];
   let v1 = pos[i1];
   let v2 = pos[i2];
 
-  // triangle AABB in voxel space
-  let tMin = min(min(v0,v1), v2);
-  let tMax = max(max(v0,v1), v2);
-  var vMin = max(vec3<u32>(0u),       vec3<u32>((tMin-bMin)/vSz));
-  var vMax = min(gDim-vec3<u32>(1u),  vec3<u32>((tMax-bMin)/vSz));
+  let tMin = min(min(v0, v1), v2);
+  let tMax = max(max(v0, v1), v2);
+  var vMin = max(vec3<u32>(0u), vec3<u32>((tMin - bMin) / vSz));
+  var vMax = min(gDim - vec3<u32>(1u), vec3<u32>((tMax - bMin) / vSz));
 
-  let half = vSz*0.5;
-  let nx   = gDim.x;
-  let ny   = gDim.y;
+  let half = vSz * 0.5;
+  let nx = gDim.x;
+  let ny = gDim.y;
 
-  let n    = cross(v1-v0, v2-v0);
+  let n = cross(v1 - v0, v2 - v0);
   let absN = abs(n);
-  let nn   = dot(n,n);
+  let nn = dot(n, n);
 
-  for (var z=vMin.z; z<=vMax.z; z=z+1u) {
-    for (var y=vMin.y; y<=vMax.y; y=y+1u) {
-      for (var x=vMin.x; x<=vMax.x; x=x+1u) {
-
-        let c   = bMin + (vec3<f32>(f32(x),f32(y),f32(z)) + vec3<f32>(0.5)) * vSz;
+  for (var z = vMin.z; z <= vMax.z; z = z + 1u) {
+    for (var y = vMin.y; y <= vMax.y; y = y + 1u) {
+      for (var x = vMin.x; x <= vMax.x; x = x + 1u) {
+        let c = bMin + (vec3<f32>(f32(x), f32(y), f32(z)) + vec3<f32>(0.5)) * vSz;
         let tv0 = v0 - c;
         let tv1 = v1 - c;
         let tv2 = v2 - c;
-        let rP  = half*(absN.x + absN.y + absN.z);
+        let rP = half * (absN.x + absN.y + absN.z);
         if (abs(dot(n, tv0)) > rP) { continue; }
 
-          /* 2) edge × axis tests (9 in total) */
-          let e0 = tv1 - tv0;
-          let e1 = tv2 - tv1;
-          let e2 = tv0 - tv2;
+        let e0 = tv1 - tv0;
+        let e1 = tv2 - tv1;
+        let e2 = tv0 - tv2;
 
-          /* macro to run one test inline */
-          {
-              let axis = cross(e0, vec3<f32>(1.0,0.0,0.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.y) + abs(axis.z));
-              if (mn > r || mx < -r) { continue; }
-          }
-          {
-              let axis = cross(e0, vec3<f32>(0.0,1.0,0.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.x) + abs(axis.z));
-              if (mn > r || mx < -r) { continue; }
-          }
-          {
-              let axis = cross(e0, vec3<f32>(0.0,0.0,1.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.x) + abs(axis.y));
-              if (mn > r || mx < -r) { continue; }
-          }
+        {
+          let axis = cross(e0, vec3<f32>(1.0, 0.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.y) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e0, vec3<f32>(0.0, 1.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e0, vec3<f32>(0.0, 0.0, 1.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.y));
+          if (mn > r || mx < -r) { continue; }
+        }
 
-          {
-              let axis = cross(e1, vec3<f32>(1.0,0.0,0.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.y) + abs(axis.z));
-              if (mn > r || mx < -r) { continue; }
-          }
-          {
-              let axis = cross(e1, vec3<f32>(0.0,1.0,0.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.x) + abs(axis.z));
-              if (mn > r || mx < -r) { continue; }
-          }
-          {
-              let axis = cross(e1, vec3<f32>(0.0,0.0,1.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.x) + abs(axis.y));
-              if (mn > r || mx < -r) { continue; }
-          }
+        {
+          let axis = cross(e1, vec3<f32>(1.0, 0.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.y) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e1, vec3<f32>(0.0, 1.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e1, vec3<f32>(0.0, 0.0, 1.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.y));
+          if (mn > r || mx < -r) { continue; }
+        }
 
-          {
-              let axis = cross(e2, vec3<f32>(1.0,0.0,0.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.y) + abs(axis.z));
-              if (mn > r || mx < -r) { continue; }
-          }
-          {
-              let axis = cross(e2, vec3<f32>(0.0,1.0,0.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.x) + abs(axis.z));
-              if (mn > r || mx < -r) { continue; }
-          }
-          {
-              let axis = cross(e2, vec3<f32>(0.0,0.0,1.0));
-              let p0   = dot(axis, tv0);
-              let p1   = dot(axis, tv1);
-              let p2   = dot(axis, tv2);
-              let mn   = min(p0, min(p1, p2));
-              let mx   = max(p0, max(p1, p2));
-              let r    = half * (abs(axis.x) + abs(axis.y));
-              if (mn > r || mx < -r) { continue; }
-          }
+        {
+          let axis = cross(e2, vec3<f32>(1.0, 0.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.y) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e2, vec3<f32>(0.0, 1.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e2, vec3<f32>(0.0, 0.0, 1.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.y));
+          if (mn > r || mx < -r) { continue; }
+        }
 
+        let flat = x + y * nx + z * nx * ny;
+        let bw = flat >> 5u;
+        let bm = 1u << (flat & 31u);
 
-        // voxel index helpers
-        let flat = x + y*nx + z*nx*ny;
-        let bw   = flat >> 5u;
-        let bm   = 1u << (flat & 31u);
-
-        // compute squared dist of voxel centre to triangle plane
         let dist2 = (dot(n, tv0) * dot(n, tv0)) / nn;
         let dBits = bitcast<u32>(dist2);
-        let prev  = atomicMin(&dists[flat], dBits);
+        let prev = atomicMin(&dists[flat], dBits);
 
-        // if we are closer than previous, we own this voxel’s colour
         if (dBits < prev) {
           tris[flat] = triId + 1u;
         }
-        // mark occupancy regardless (any triangle touching sets bit)
+
         atomicOr(&bits[bw], bm);
       }
     }
   }
-}`); // WGSL
+}`);
 
+    await nextFrame();
 
-    const triCount = this.indices.length / 3;
-//     await renderer.computeAsync(
-//       rasterWGSL({
-//         pos:   storage(this.posBuf, 'vec3', this.posBuf.count).toReadOnly(),
-//         ind:   storage(this.idxBuf, 'u32', this.idxBuf.count).toReadOnly(),
-//         bits:  storage(this.bitGrid, 'atomic<u32>', this.bitGrid.count),
-//         tris:  storage(this.triGrid, 'u32', this.triGrid.count),
-//         dists: storage(this.distGrid, 'atomic<u32>', this.distGrid.count),
-//         gDim:  uniform(this.grid),
-//         bMin:  uniform(this.bbox.min),
-//         vSz:   uniform(this.voxelSize),
-//         triId: instanceIndex
-//       }).compute(triCount)
-//     );
+    const buildStartedAt = performance.now();
+    const buildStats = await this.#buildInstancedMesh();
+    const gpuMs = performance.now() - buildStartedAt;
 
-// keep them so the tiled CPU stage can re-use the same pipelines
-this._clearWGSL  = clearWGSL;
-this._rasterWGSL = rasterWGSL;
+    this.stats = {
+      method: 'webgpu',
+      bakeMs,
+      rasterMs: buildStats.rasterMs,
+      postprocessMs: buildStats.postprocessMs,
+      meshMs: buildStats.meshMs,
+      gridExportMs: buildStats.gridExportMs,
+      gpuMs,
+      totalMs: performance.now() - startedAt,
+    };
+  }
 
+  async prepareWorkerPayload({
+    renderer,
+    model,
+    voxelSize = 0.01,
+    maxGrid = Infinity,
+    paletteSize = 256,
+    needGrid = false,
+    mainThreadPolicy = null,
+  }) {
+    const startedAt = performance.now();
+    this.renderer = renderer;
+    this.voxelSize = voxelSize;
+    this.paletteSize = paletteSize;
+    this.needGrid = needGrid;
+    this.mainThreadPolicy = mainThreadPolicy;
+    this._voxelGrid = null;
+    this.voxelCount = 0;
 
-    // 7) CPU sample & build instanced mesh with affine UV + palette lookup
-    await this.#buildInstancedMesh();
-  }
-
-
-
-
-// Replace the #buildInstancedMesh method with this more efficient approach
-// Replace the #buildInstancedMesh method with this more efficient and scalable approach
-async #buildInstancedMesh() {
-  const MAX_GPU_BYTES   = 256 * 1024 * 1024;
-  const BYTES_PER_VOXEL = 8.2;
-  const TILE_EDGE       = Math.floor(Math.cbrt(MAX_GPU_BYTES / BYTES_PER_VOXEL));
-  const MAX_VERTICES_PER_MESH = 65536 * 4; // Stay well below array limits
-
-  const { grid, voxelSize: voxSz, bbox } = this;
-  const { x: NX, y: NY, z: NZ } = grid;
-  const rend      = this.renderer;
-  const clearWGSL = this._clearWGSL;
-  const rastWGSL  = this._rasterWGSL;
-  const posBuf    = storage(this.posBuf, 'vec3', this.posBuf.count).toReadOnly();
-  const idxBuf    = storage(this.idxBuf, 'u32',  this.idxBuf.count).toReadOnly();
-  const { positions:posA, uvs:uvA, indices:idxA, triMats, palette, materials:mats } = this;
-
-  // Scratch vectors for color sampling
-  const v0=new THREE.Vector3(), v1=new THREE.Vector3(), v2=new THREE.Vector3();
-  const uv0=new THREE.Vector2(), uv1=new THREE.Vector2(), uv2=new THREE.Vector2();
-  const p = new THREE.Vector3(), e0=new THREE.Vector3(), e1=new THREE.Vector3(), ep=new THREE.Vector3();
-
-  // Face definitions for a cube
-  const faces = [
-    { // +X face
-      dir: [1, 0, 0],
-      vertices: [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]],
-      normal: [1, 0, 0]
-    },
-    { // -X face
-      dir: [-1, 0, 0],
-      vertices: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
-      normal: [-1, 0, 0]
-    },
-    { // +Y face
-      dir: [0, 1, 0],
-      vertices: [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]],
-      normal: [0, 1, 0]
-    },
-    { // -Y face
-      dir: [0, -1, 0],
-      vertices: [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
-      normal: [0, -1, 0]
-    },
-    { // +Z face
-      dir: [0, 0, 1],
-      vertices: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
-      normal: [0, 0, 1]
-    },
-    { // -Z face
-      dir: [0, 0, -1],
-      vertices: [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
-      normal: [0, 0, -1]
+    if (!renderer || typeof renderer.computeAsync !== 'function' || typeof renderer.getArrayBufferAsync !== 'function') {
+      throw new Error('WebGPU compute renderer unavailable');
     }
-  ];
 
-  // Collect all voxel data first
-  const voxelMap = new Map(); // key: "x,y,z" -> {color: THREE.Color}
-  const tileTasks = [];
+    const bakeStartedAt = performance.now();
+    const baked = await this.#bakeAndMerge(model);
+    const bakeMs = performance.now() - bakeStartedAt;
 
-  // Process tiles in parallel
-  for (let oz = 0; oz < NZ; oz += TILE_EDGE) {
-    const tz = Math.min(TILE_EDGE, NZ - oz);
-    for (let oy = 0; oy < NY; oy += TILE_EDGE) {
-      const ty = Math.min(TILE_EDGE, NY - oy);
-      for (let ox = 0; ox < NX; ox += TILE_EDGE) {
-        const tx = Math.min(TILE_EDGE, NX - ox);
-        const tileVox  = tx * ty * tz;
-        const bitWords = Math.ceil(tileVox / 32);
+    this.positions = baked.positions;
+    this.uvs = baked.uvs;
+    this.indices = baked.indices;
+    this.triMats = baked.triMats;
+    this.palette = baked.palette;
+    this.materials = baked.materials;
+    this.paletteCount = Math.min(this.paletteSize, this.palette.length / 3);
 
-        // Allocate buffers
-        const bitBuf  = new StorageBufferAttribute(new Uint32Array(bitWords), 1);
-        const triBuf  = new StorageBufferAttribute(new Uint32Array(tileVox), 1);
-        const distArr = new Uint32Array(tileVox); distArr.fill(0x7f800000);
-        const distBuf = new StorageBufferAttribute(distArr, 1);
+    if (!this.positions.length || !this.indices.length) {
+      return {
+        bakedData: {
+          positions: this.positions,
+          uvs: this.uvs,
+          indices: this.indices,
+          triMats: this.triMats,
+          palette: this.palette,
+          materialUuids: [],
+          bbox: { min: [0, 0, 0], max: [0, 0, 0] },
+          grid: { x: 0, y: 0, z: 0 },
+          voxelSize: this.voxelSize,
+          stats: {
+            bakeMs,
+            rasterMs: 0,
+            totalMs: performance.now() - startedAt,
+          },
+        },
+        rasterTiles: [],
+      };
+    }
 
-        // Clear
-        rend.computeAsync(
-          clearWGSL({
-            bits : storage(bitBuf, 'atomic<u32>', bitBuf.count),
-            tris : storage(triBuf, 'u32', triBuf.count),
-            dists: storage(distBuf,'atomic<u32>', distBuf.count),
-            id   : instanceIndex
-          }).compute(Math.max(bitWords, tileVox))
-        );
+    this.posBuf = new StorageBufferAttribute(this.positions, 3);
+    this.uvBuf = new StorageBufferAttribute(this.uvs, 2);
+    this.idxBuf = new StorageBufferAttribute(this.indices, 1);
+    this.matBuf = new StorageBufferAttribute(this.triMats, 1);
 
-        // Raster
-        const tileMin = new THREE.Vector3(
-          bbox.min.x + ox * voxSz,
-          bbox.min.y + oy * voxSz,
-          bbox.min.z + oz * voxSz
-        );
-        const gDim = new THREE.Vector3(tx, ty, tz);
-        const rasterPromise = rend.computeAsync(
-          rastWGSL({
-            pos  : posBuf,
-            ind  : idxBuf,
-            bits : storage(bitBuf, 'atomic<u32>', bitBuf.count),
-            tris : storage(triBuf, 'u32', triBuf.count),
-            dists: storage(distBuf,'atomic<u32>', distBuf.count),
-            gDim : uniform(gDim),
-            bMin : uniform(tileMin),
-            vSz  : uniform(voxSz),
-            triId: instanceIndex
-          }).compute(this.indices.length / 3)
-        );
+    this.bbox = new THREE.Box3().setFromObject(model);
+    const size = this.bbox.getSize(new THREE.Vector3());
+    const nx = Math.ceil(size.x / voxelSize);
+    const ny = Math.ceil(size.y / voxelSize);
+    const nz = Math.ceil(size.z / voxelSize);
+    const maxDim = Math.max(nx, ny, nz);
+    const scale = Number.isFinite(maxGrid) && maxDim > maxGrid ? maxGrid / maxDim : 1;
 
-        // Read back and process
-        const tileTask = rasterPromise.then(() => Promise.all([
-          rend.getArrayBufferAsync(bitBuf),
-          rend.getArrayBufferAsync(triBuf)
-        ])).then(([bitsBuffer, trisBuffer]) => {
-          const bitsCPU = new Uint32Array(bitsBuffer);
-          const trisCPU = new Uint32Array(trisBuffer);
-          let flat = 0;
+    this.grid = new THREE.Vector3(
+      Math.ceil(nx * scale),
+      Math.ceil(ny * scale),
+      Math.ceil(nz * scale)
+    );
+    this.voxelSize /= scale;
+    this.totalGridVoxelCount = this.grid.x * this.grid.y * this.grid.z;
 
-          const localVoxels = [];
+    this.bitGrid = this.triGrid = this.distGrid = new StorageBufferAttribute(new Uint32Array(0), 1);
 
-          for (let wi = 0; wi < bitsCPU.length; ++wi) {
-            let word = bitsCPU[wi];
-            if (!word) { flat += 32; continue; }
-            for (let b = 0; b < 32 && flat < tileVox; ++b, ++flat) {
-              if ((word & 1) === 0) { word >>>= 1; continue; }
-              word >>>= 1;
+    this._clearWGSL = wgslFn(`
+      fn compute(
+        bits : ptr<storage, array<atomic<u32>>, read_write>,
+        tris : ptr<storage, array<u32>, read_write>,
+        dists: ptr<storage, array<atomic<u32>>, read_write>,
+        id: u32
+      ) -> void {
+        if (id < arrayLength(&*bits)) { atomicStore(&bits[id], 0u); }
+        if (id < arrayLength(&*tris)) { tris[id] = 0u; }
+        if (id < arrayLength(&*dists)) { atomicStore(&dists[id], 0x7f800000u); }
+      }`);
 
-              const raw = trisCPU[flat];
-              if (!raw) continue;
-              const tId = raw - 1;
+    this._rasterWGSL = wgslFn(`
+fn compute(
+  pos  : ptr<storage, array<vec3<f32>>,  read>,
+  ind  : ptr<storage, array<u32>,        read>,
+  bits : ptr<storage, array<atomic<u32>>, read_write>,
+  tris : ptr<storage, array<u32>,         read_write>,
+  dists: ptr<storage, array<atomic<u32>>, read_write>,
+  gDim : vec3<u32>, bMin : vec3<f32>, vSz : f32, triId : u32
+) -> void {
+  let i0 = ind[triId * 3u];
+  let i1 = ind[triId * 3u + 1u];
+  let i2 = ind[triId * 3u + 2u];
 
-              // Convert to global coordinates
-              const lz = (flat / (tx * ty)) | 0;
-              const rem = flat % (tx * ty);
-              const ly = (rem / tx) | 0;
-              const lx = rem % tx;
-              const gx = ox + lx, gy = oy + ly, gz = oz + lz;
+  let v0 = pos[i0];
+  let v1 = pos[i1];
+  let v2 = pos[i2];
 
-              // Sample color
-              const cx = bbox.min.x + (gx + 0.5) * voxSz;
-              const cy = bbox.min.y + (gy + 0.5) * voxSz;
-              const cz = bbox.min.z + (gz + 0.5) * voxSz;
+  let tMin = min(min(v0, v1), v2);
+  let tMax = max(max(v0, v1), v2);
+  var vMin = max(vec3<u32>(0u), vec3<u32>((tMin - bMin) / vSz));
+  var vMax = min(gDim - vec3<u32>(1u), vec3<u32>((tMax - bMin) / vSz));
 
-              v0.fromArray(posA, idxA[tId*3+0]*3);
-              v1.fromArray(posA, idxA[tId*3+1]*3);
-              v2.fromArray(posA, idxA[tId*3+2]*3);
+  let half = vSz * 0.5;
+  let nx = gDim.x;
+  let ny = gDim.y;
 
-              uv0.fromArray(uvA, idxA[tId*3+0]*2);
-              uv1.fromArray(uvA, idxA[tId*3+1]*2);
-              uv2.fromArray(uvA, idxA[tId*3+2]*2);
+  let n = cross(v1 - v0, v2 - v0);
+  let absN = abs(n);
+  let nn = dot(n, n);
 
-              e0.subVectors(v1, v0);
-              e1.subVectors(v2, v0);
-              ep.set(cx, cy, cz).sub(v0);
+  for (var z = vMin.z; z <= vMax.z; z = z + 1u) {
+    for (var y = vMin.y; y <= vMax.y; y = y + 1u) {
+      for (var x = vMin.x; x <= vMax.x; x = x + 1u) {
+        let c = bMin + (vec3<f32>(f32(x), f32(y), f32(z)) + vec3<f32>(0.5)) * vSz;
+        let tv0 = v0 - c;
+        let tv1 = v1 - c;
+        let tv2 = v2 - c;
+        let rP = half * (absN.x + absN.y + absN.z);
+        if (abs(dot(n, tv0)) > rP) { continue; }
 
-              const d00 = e0.dot(e0), d01 = e0.dot(e1), d11 = e1.dot(e1);
-              const d20 = ep.dot(e0), d21 = ep.dot(e1);
-              const inv = 1 / (d00*d11 - d01*d01);
+        let e0 = tv1 - tv0;
+        let e1 = tv2 - tv1;
+        let e2 = tv0 - tv2;
 
-              let vv = (d11*d20 - d01*d21) * inv;
-              let ww = (d00*d21 - d01*d20) * inv;
-              let uu = 1 - vv - ww;
-              if (uu<0||vv<0||ww<0) {
-                const tri = new THREE.Triangle(v0, v1, v2);
-                const cp  = new THREE.Vector3();
-                tri.closestPointToPoint(ep.add(v0), cp);
-                ep.copy(cp).sub(v0);
-                const d20c = ep.dot(e0), d21c = ep.dot(e1);
-                vv = (d11*d20c - d01*d21c)*inv;
-                ww = (d00*d21c - d01*d20c)*inv;
-                uu = 1 - vv - ww;
-              }
-              const uvp = new THREE.Vector2(
-                uu*uv0.x + vv*uv1.x + ww*uv2.x,
-                uu*uv0.y + vv*uv1.y + ww*uv2.y
-              );
+        {
+          let axis = cross(e0, vec3<f32>(1.0, 0.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.y) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e0, vec3<f32>(0.0, 1.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e0, vec3<f32>(0.0, 0.0, 1.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.y));
+          if (mn > r || mx < -r) { continue; }
+        }
 
-              const mat = mats[triMats[tId]] || mats[0];
-              if (!mat) continue;
-              let col = mat.color?.clone() ?? new THREE.Color(1,1,1);
-              if (mat.emissive && mat.emissive.getHex()) col.add(mat.emissive);
-              for (const tex of allTextures(mat)) {
-                const s = getSampler(tex);
-                if (s) col.multiply(s(uvp));
-              }
-              let alpha = mat.opacity ?? 1;
-              if (mat.alphaMap) {
-                const s = getSampler(mat.alphaMap);
-                if (s) alpha *= s(uvp, true).a;
-              }
-              if (alpha < 0.5) continue;
+        {
+          let axis = cross(e1, vec3<f32>(1.0, 0.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.y) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e1, vec3<f32>(0.0, 1.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e1, vec3<f32>(0.0, 0.0, 1.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.y));
+          if (mn > r || mx < -r) { continue; }
+        }
 
-              // Find nearest palette color
-              let best=0, bestD=Infinity;
-              for (let c=0; c<this.paletteSize; ++c) {
-                const dr = col.r - palette[c*3],
-                      dg = col.g - palette[c*3+1],
-                      db = col.b - palette[c*3+2],
-                      d  = dr*dr + dg*dg + db*db;
-                if (d < bestD) { bestD = d; best = c; }
-              }
+        {
+          let axis = cross(e2, vec3<f32>(1.0, 0.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.y) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e2, vec3<f32>(0.0, 1.0, 0.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.z));
+          if (mn > r || mx < -r) { continue; }
+        }
+        {
+          let axis = cross(e2, vec3<f32>(0.0, 0.0, 1.0));
+          let p0 = dot(axis, tv0);
+          let p1 = dot(axis, tv1);
+          let p2 = dot(axis, tv2);
+          let mn = min(p0, min(p1, p2));
+          let mx = max(p0, max(p1, p2));
+          let r = half * (abs(axis.x) + abs(axis.y));
+          if (mn > r || mx < -r) { continue; }
+        }
 
-              localVoxels.push({
-                x: gx, y: gy, z: gz,
-                r: palette[best*3],
-                g: palette[best*3+1], 
-                b: palette[best*3+2]
-              });
+        let flat = x + y * nx + z * nx * ny;
+        let bw = flat >> 5u;
+        let bm = 1u << (flat & 31u);
+
+        let dist2 = (dot(n, tv0) * dot(n, tv0)) / nn;
+        let dBits = bitcast<u32>(dist2);
+        let prev = atomicMin(&dists[flat], dBits);
+
+        if (dBits < prev) {
+          tris[flat] = triId + 1u;
+        }
+
+        atomicOr(&bits[bw], bm);
+      }
+    }
+  }
+}`);
+
+    await nextFrame();
+    const rasterStartedAt = performance.now();
+    const rasterTiles = await this.#rasterizeTilesForWorker();
+    const rasterMs = performance.now() - rasterStartedAt;
+
+    return {
+      bakedData: {
+        positions: this.positions,
+        uvs: this.uvs,
+        indices: this.indices,
+        triMats: this.triMats,
+        palette: this.palette,
+        materialUuids: this.materials.map((material) => material?.uuid ?? ''),
+        bbox: {
+          min: [this.bbox.min.x, this.bbox.min.y, this.bbox.min.z],
+          max: [this.bbox.max.x, this.bbox.max.y, this.bbox.max.z],
+        },
+        grid: {
+          x: this.grid.x | 0,
+          y: this.grid.y | 0,
+          z: this.grid.z | 0,
+        },
+        voxelSize: this.voxelSize,
+        stats: {
+          bakeMs,
+          rasterMs,
+          totalMs: performance.now() - startedAt,
+        },
+      },
+      rasterTiles,
+    };
+  }
+
+  async #rasterizeTilesForWorker() {
+    const { grid, voxelSize, bbox } = this;
+    const NX = grid.x;
+    const NY = grid.y;
+    const NZ = grid.z;
+    const renderer = this.renderer;
+    const posBuf = storage(this.posBuf, 'vec3', this.posBuf.count).toReadOnly();
+    const idxBuf = storage(this.idxBuf, 'u32', this.idxBuf.count).toReadOnly();
+
+    const tileDescriptors = [];
+    for (let oz = 0; oz < NZ; oz += TILE_EDGE) {
+      const tz = Math.min(TILE_EDGE, NZ - oz);
+      for (let oy = 0; oy < NY; oy += TILE_EDGE) {
+        const ty = Math.min(TILE_EDGE, NY - oy);
+        for (let ox = 0; ox < NX; ox += TILE_EDGE) {
+          const tx = Math.min(TILE_EDGE, NX - ox);
+          tileDescriptors.push({ ox, oy, oz, tx, ty, tz });
+        }
+      }
+    }
+
+    const concurrency = Math.max(
+      1,
+      Math.min(
+        typeof window !== 'undefined' ? 1 : 4,
+        Math.floor((globalThis.navigator?.hardwareConcurrency ?? 4) / 2) || 1
+      )
+    );
+
+    return runWithConcurrency(tileDescriptors, concurrency, async ({ ox, oy, oz, tx, ty, tz }) => {
+      const tileVoxelCount = tx * ty * tz;
+      const bitWords = Math.ceil(tileVoxelCount / 32);
+      const bitBuf = new StorageBufferAttribute(new Uint32Array(bitWords), 1);
+      const triBuf = new StorageBufferAttribute(new Uint32Array(tileVoxelCount), 1);
+      const distInit = new Uint32Array(tileVoxelCount);
+      distInit.fill(0x7f800000);
+      const distBuf = new StorageBufferAttribute(distInit, 1);
+
+      await renderer.computeAsync(
+        this._clearWGSL({
+          bits: storage(bitBuf, 'atomic<u32>', bitBuf.count),
+          tris: storage(triBuf, 'u32', triBuf.count),
+          dists: storage(distBuf, 'atomic<u32>', distBuf.count),
+          id: instanceIndex,
+        }).compute(Math.max(bitWords, tileVoxelCount))
+      );
+
+      const tileMin = new THREE.Vector3(
+        bbox.min.x + ox * voxelSize,
+        bbox.min.y + oy * voxelSize,
+        bbox.min.z + oz * voxelSize
+      );
+
+      await renderer.computeAsync(
+        this._rasterWGSL({
+          pos: posBuf,
+          ind: idxBuf,
+          bits: storage(bitBuf, 'atomic<u32>', bitBuf.count),
+          tris: storage(triBuf, 'u32', triBuf.count),
+          dists: storage(distBuf, 'atomic<u32>', distBuf.count),
+          gDim: uniform(new THREE.Vector3(tx, ty, tz)),
+          bMin: uniform(tileMin),
+          vSz: uniform(voxelSize),
+          triId: instanceIndex,
+        }).compute(this.indices.length / 3)
+      );
+
+      return {
+        ox,
+        oy,
+        oz,
+        tx,
+        ty,
+        tz,
+        tris: new Uint32Array(await renderer.getArrayBufferAsync(triBuf)),
+      };
+    });
+  }
+
+  async #buildInstancedMesh() {
+    const { grid, voxelSize, bbox } = this;
+    const NX = grid.x;
+    const NY = grid.y;
+    const NZ = grid.z;
+    const sliceStride = NX * NY;
+    const renderer = this.renderer;
+    const posBuf = storage(this.posBuf, 'vec3', this.posBuf.count).toReadOnly();
+    const idxBuf = storage(this.idxBuf, 'u32', this.idxBuf.count).toReadOnly();
+    const paletteIds = new Uint16Array(this.totalGridVoxelCount);
+    const materialInfos = this.materials.map(material => buildMaterialInfo(material, this.palette, this.paletteCount));
+
+    const tileDescriptors = [];
+    for (let oz = 0; oz < NZ; oz += TILE_EDGE) {
+      const tz = Math.min(TILE_EDGE, NZ - oz);
+      for (let oy = 0; oy < NY; oy += TILE_EDGE) {
+        const ty = Math.min(TILE_EDGE, NY - oy);
+        for (let ox = 0; ox < NX; ox += TILE_EDGE) {
+          const tx = Math.min(TILE_EDGE, NX - ox);
+          tileDescriptors.push({ ox, oy, oz, tx, ty, tz });
+        }
+      }
+    }
+
+    const concurrency = Math.max(
+      1,
+      Math.min(
+        typeof window !== 'undefined' ? 1 : 4,
+        Math.floor((globalThis.navigator?.hardwareConcurrency ?? 4) / 2) || 1
+      )
+    );
+
+    const rasterStartedAt = performance.now();
+    const tileResults = await runWithConcurrency(tileDescriptors, concurrency, async ({ ox, oy, oz, tx, ty, tz }) => {
+      const tileVoxelCount = tx * ty * tz;
+      const bitWords = Math.ceil(tileVoxelCount / 32);
+      const bitBuf = new StorageBufferAttribute(new Uint32Array(bitWords), 1);
+      const triBuf = new StorageBufferAttribute(new Uint32Array(tileVoxelCount), 1);
+      const distInit = new Uint32Array(tileVoxelCount);
+      distInit.fill(0x7f800000);
+      const distBuf = new StorageBufferAttribute(distInit, 1);
+
+      await renderer.computeAsync(
+        this._clearWGSL({
+          bits: storage(bitBuf, 'atomic<u32>', bitBuf.count),
+          tris: storage(triBuf, 'u32', triBuf.count),
+          dists: storage(distBuf, 'atomic<u32>', distBuf.count),
+          id: instanceIndex,
+        }).compute(Math.max(bitWords, tileVoxelCount))
+      );
+
+      const tileMin = new THREE.Vector3(
+        bbox.min.x + ox * voxelSize,
+        bbox.min.y + oy * voxelSize,
+        bbox.min.z + oz * voxelSize
+      );
+
+      await renderer.computeAsync(
+        this._rasterWGSL({
+          pos: posBuf,
+          ind: idxBuf,
+          bits: storage(bitBuf, 'atomic<u32>', bitBuf.count),
+          tris: storage(triBuf, 'u32', triBuf.count),
+          dists: storage(distBuf, 'atomic<u32>', distBuf.count),
+          gDim: uniform(new THREE.Vector3(tx, ty, tz)),
+          bMin: uniform(tileMin),
+          vSz: uniform(voxelSize),
+          triId: instanceIndex,
+        }).compute(this.indices.length / 3)
+      );
+
+      const [bitsBuffer, trisBuffer] = await Promise.all([
+        renderer.getArrayBufferAsync(bitBuf),
+        renderer.getArrayBufferAsync(triBuf),
+      ]);
+
+      const postprocessStartedAt = performance.now();
+      const postprocessYieldState = createYieldState();
+      const bitsCPU = new Uint32Array(bitsBuffer);
+      const trisCPU = new Uint32Array(trisBuffer);
+      const occupied = [];
+
+      const v0 = new THREE.Vector3();
+      const v1 = new THREE.Vector3();
+      const v2 = new THREE.Vector3();
+      const e0 = new THREE.Vector3();
+      const e1 = new THREE.Vector3();
+      const ep = new THREE.Vector3();
+      const closest = new THREE.Vector3();
+      const triangle = new THREE.Triangle(v0, v1, v2);
+      const uv0 = new THREE.Vector2();
+      const uv1 = new THREE.Vector2();
+      const uv2 = new THREE.Vector2();
+      const uvPoint = new THREE.Vector2();
+      const sampledColor = new THREE.Color();
+      const textureColor = new THREE.Color();
+      const sampledAlpha = { r: 0, g: 0, b: 0, a: 1 };
+
+      let flat = 0;
+      for (let wordIndex = 0; wordIndex < bitsCPU.length; wordIndex++) {
+        if ((wordIndex & 255) === 255) await maybeYieldToBrowser(postprocessYieldState, this.mainThreadPolicy);
+        let word = bitsCPU[wordIndex];
+        if (!word) {
+          flat += 32;
+          continue;
+        }
+
+        for (let bit = 0; bit < 32 && flat < tileVoxelCount; bit++, flat++) {
+          if ((word & 1) === 0) {
+            word >>>= 1;
+            continue;
+          }
+          word >>>= 1;
+
+          const rawTriangle = trisCPU[flat];
+          if (!rawTriangle) continue;
+          const triangleId = rawTriangle - 1;
+          const materialInfo = materialInfos[this.triMats[triangleId]] ?? materialInfos[0];
+          if (!materialInfo) continue;
+
+          const localZ = (flat / (tx * ty)) | 0;
+          const rem = flat - localZ * tx * ty;
+          const localY = (rem / tx) | 0;
+          const localX = rem - localY * tx;
+          const x = ox + localX;
+          const y = oy + localY;
+          const z = oz + localZ;
+          const globalFlat = x + y * NX + z * sliceStride;
+
+          let paletteId = materialInfo.constantPaletteId;
+          if (!paletteId) {
+            const cx = bbox.min.x + (x + 0.5) * voxelSize;
+            const cy = bbox.min.y + (y + 0.5) * voxelSize;
+            const cz = bbox.min.z + (z + 0.5) * voxelSize;
+
+            v0.fromArray(this.positions, this.indices[triangleId * 3] * 3);
+            v1.fromArray(this.positions, this.indices[triangleId * 3 + 1] * 3);
+            v2.fromArray(this.positions, this.indices[triangleId * 3 + 2] * 3);
+
+            uv0.fromArray(this.uvs, this.indices[triangleId * 3] * 2);
+            uv1.fromArray(this.uvs, this.indices[triangleId * 3 + 1] * 2);
+            uv2.fromArray(this.uvs, this.indices[triangleId * 3 + 2] * 2);
+
+            e0.subVectors(v1, v0);
+            e1.subVectors(v2, v0);
+            ep.set(cx, cy, cz).sub(v0);
+
+            const d00 = e0.dot(e0);
+            const d01 = e0.dot(e1);
+            const d11 = e1.dot(e1);
+            const d20 = ep.dot(e0);
+            const d21 = ep.dot(e1);
+            const denom = d00 * d11 - d01 * d01;
+
+            let vv = 0;
+            let ww = 0;
+            let uu = 1;
+
+            if (Math.abs(denom) > 1e-12) {
+              const inv = 1 / denom;
+              vv = (d11 * d20 - d01 * d21) * inv;
+              ww = (d00 * d21 - d01 * d20) * inv;
+              uu = 1 - vv - ww;
             }
+
+            if (uu < 0 || vv < 0 || ww < 0) {
+              triangle.closestPointToPoint(closest.copy(ep).add(v0), closest);
+              ep.copy(closest).sub(v0);
+              const d20c = ep.dot(e0);
+              const d21c = ep.dot(e1);
+              const safeDenom = Math.abs(denom) > 1e-12 ? denom : 1;
+              const inv = 1 / safeDenom;
+              vv = (d11 * d20c - d01 * d21c) * inv;
+              ww = (d00 * d21c - d01 * d20c) * inv;
+              uu = 1 - vv - ww;
+            }
+
+            uvPoint.set(
+              uu * uv0.x + vv * uv1.x + ww * uv2.x,
+              uu * uv0.y + vv * uv1.y + ww * uv2.y
+            );
+
+            sampledColor.r = materialInfo.baseR;
+            sampledColor.g = materialInfo.baseG;
+            sampledColor.b = materialInfo.baseB;
+
+            for (const sampler of materialInfo.colorSamplers) {
+              sampler(uvPoint, false, textureColor);
+              sampledColor.r *= textureColor.r;
+              sampledColor.g *= textureColor.g;
+              sampledColor.b *= textureColor.b;
+            }
+
+            let alpha = materialInfo.opacity;
+            if (materialInfo.alphaSampler) {
+              materialInfo.alphaSampler(uvPoint, true, sampledAlpha);
+              alpha *= sampledAlpha.a;
+            }
+            if (alpha < 0.5) continue;
+
+            paletteId = nearestPaletteId(
+              sampledColor.r,
+              sampledColor.g,
+              sampledColor.b,
+              this.palette,
+              this.paletteCount
+            );
           }
 
-          return localVoxels;
-        });
-
-        tileTasks.push(tileTask);
+          paletteIds[globalFlat] = paletteId;
+          occupied.push(globalFlat);
+        }
       }
+
+      return {
+        occupied,
+        postprocessMs: performance.now() - postprocessStartedAt,
+      };
+    });
+
+    const rasterWallMs = performance.now() - rasterStartedAt;
+    let postprocessMs = 0;
+    let occupiedCount = 0;
+    for (const tile of tileResults) {
+      postprocessMs += tile.postprocessMs;
+      occupiedCount += tile.occupied.length;
     }
+
+    if (!occupiedCount) {
+      this.voxelCount = 0;
+      this.voxelMesh = createEmptyVoxelMesh();
+      this._voxelGrid = null;
+      return {
+        rasterMs: Math.max(0, rasterWallMs - postprocessMs),
+        postprocessMs,
+        meshMs: 0,
+        gridExportMs: 0,
+      };
+    }
+
+    const occupiedIndices = new Uint32Array(occupiedCount);
+    let occupiedOffset = 0;
+    const mergeYieldState = createYieldState();
+    for (const tile of tileResults) {
+      occupiedIndices.set(tile.occupied, occupiedOffset);
+      occupiedOffset += tile.occupied.length;
+      await maybeYieldToBrowser(mergeYieldState, this.mainThreadPolicy);
+    }
+    this.voxelCount = occupiedIndices.length;
+
+    const meshStartedAt = performance.now();
+    const totalFaces = await this.#countVisibleFaces(occupiedIndices, paletteIds, NX, NY, NZ);
+    this.voxelMesh = await this.#buildVoxelMesh(occupiedIndices, paletteIds, totalFaces, NX, NY, NZ, voxelSize, bbox);
+    const meshMs = performance.now() - meshStartedAt;
+
+    let gridExportMs = 0;
+    if (this.needGrid) {
+      const gridStartedAt = performance.now();
+      this._voxelGrid = await this.#buildVoxelGrid(occupiedIndices, paletteIds, voxelSize);
+      gridExportMs = performance.now() - gridStartedAt;
+    } else {
+      this._voxelGrid = null;
+    }
+
+    return {
+      rasterMs: Math.max(0, rasterWallMs - postprocessMs),
+      postprocessMs,
+      meshMs,
+      gridExportMs,
+    };
   }
 
-  // Wait for all tiles and collect voxels
-  const allVoxelArrays = await Promise.all(tileTasks);
-  
-  // Build voxel map for fast neighbor lookup
-  for (const voxelArray of allVoxelArrays) {
-    for (const voxel of voxelArray) {
-      voxelMap.set(`${voxel.x},${voxel.y},${voxel.z}`, voxel);
+  async #countVisibleFaces(occupiedIndices, paletteIds, NX, NY, NZ) {
+    const sliceStride = NX * NY;
+    let faceCount = 0;
+    const yieldState = createYieldState();
+
+    for (let i = 0; i < occupiedIndices.length; i++) {
+      if ((i & 4095) === 4095) await maybeYieldToBrowser(yieldState, this.mainThreadPolicy);
+      const flat = occupiedIndices[i];
+      const x = flat % NX;
+      const yz = (flat - x) / NX;
+      const y = yz % NY;
+      const z = (yz - y) / NY;
+
+      if (x === 0 || paletteIds[flat - 1] === 0) faceCount++;
+      if (x === NX - 1 || paletteIds[flat + 1] === 0) faceCount++;
+      if (y === 0 || paletteIds[flat - NX] === 0) faceCount++;
+      if (y === NY - 1 || paletteIds[flat + NX] === 0) faceCount++;
+      if (z === 0 || paletteIds[flat - sliceStride] === 0) faceCount++;
+      if (z === NZ - 1 || paletteIds[flat + sliceStride] === 0) faceCount++;
     }
+
+    return faceCount;
   }
 
-  if (voxelMap.size === 0) {
-    this.voxelMesh = new THREE.Mesh(
-      new THREE.BufferGeometry(),
-      new THREE.MeshBasicMaterial()
-    );
-    return;
-  }
+  async #buildVoxelMesh(occupiedIndices, paletteIds, totalFaces, NX, NY, NZ, voxelSize, bbox) {
+    if (!totalFaces) return createEmptyVoxelMesh();
 
-  // Helper function to check if a voxel exists at given position
-  const hasVoxel = (x, y, z) => {
-    // Boundary check to avoid out-of-bounds lookups
-    if (x < 0 || x >= NX || y < 0 || y >= NY || z < 0 || z >= NZ) return false;
-    return voxelMap.has(`${x},${y},${z}`);
-  };
-
-  // Pre-count visible faces for memory allocation
-  let totalFaces = 0;
-  for (const [key, voxel] of voxelMap) {
-    for (const face of faces) {
-      const nx = voxel.x + face.dir[0];
-      const ny = voxel.y + face.dir[1];
-      const nz = voxel.z + face.dir[2];
-      if (!hasVoxel(nx, ny, nz)) {
-        totalFaces++;
-      }
+    const totalVertices = totalFaces * 4;
+    if (totalVertices <= MAX_VERTICES_PER_MESH) {
+      return this.#buildMeshFromRange(occupiedIndices, 0, occupiedIndices.length, paletteIds, NX, NY, NZ, voxelSize, bbox);
     }
-  }
 
-  const verticesPerFace = 4;
-  const indicesPerFace = 6;
-  const totalVertices = totalFaces * verticesPerFace;
-  const totalIndices = totalFaces * indicesPerFace;
-
-  console.log(`Building mesh with ${totalFaces} faces, ${totalVertices} vertices`);
-
-  // Check if we need to split into multiple meshes
-  const meshes = [];
-  
-  if (totalVertices > MAX_VERTICES_PER_MESH) {
-    // Split voxels into chunks
-    const voxelEntries = Array.from(voxelMap.entries());
-    const chunksNeeded = Math.ceil(totalVertices / MAX_VERTICES_PER_MESH);
-    const voxelsPerChunk = Math.ceil(voxelEntries.length / chunksNeeded);
-    
-    for (let chunk = 0; chunk < chunksNeeded; chunk++) {
-      const start = chunk * voxelsPerChunk;
-      const end = Math.min(start + voxelsPerChunk, voxelEntries.length);
-      const chunkVoxels = new Map(voxelEntries.slice(start, end));
-      
-      const mesh = this.#buildMeshFromVoxels(chunkVoxels, voxelMap, hasVoxel, faces, voxSz, bbox);
-      if (mesh) meshes.push(mesh);
-    }
-    
-    // Create a group to hold all meshes
+    const chunkCount = Math.ceil(totalVertices / MAX_VERTICES_PER_MESH);
+    const voxelsPerChunk = Math.ceil(occupiedIndices.length / chunkCount);
     const group = new THREE.Group();
-    meshes.forEach(mesh => group.add(mesh));
-    this.voxelMesh = group;
 
-    /* -----------------------------------------------
-   *  Back-channel data for assignToBlocksForGLB.js
-   * --------------------------------------------- */
-  const tot = NX * NY * NZ;
-  const voxelColors = new Float32Array(tot * 4);  // r,g,b,a
-  const voxelCounts = new Uint32Array(tot);       // hit count per voxel
-
-  const idxXYZ = (x, y, z) => x + NX * (y + NY * z);
-
-  for (const voxel of voxelMap.values()) {
-    const i = idxXYZ(voxel.x, voxel.y, voxel.z);
-
-    voxelCounts[i] = 1;          // just one sample – fast & small
-    voxelColors[i * 4 + 0] = voxel.r;
-    voxelColors[i * 4 + 1] = voxel.g;
-    voxelColors[i * 4 + 2] = voxel.b;
-    voxelColors[i * 4 + 3] = 1;  // opaque
-  }
-
-  /* expose everything assignToBlocksForGLB needs */
-  this._voxelGrid = {
-    gridSize: this.grid.clone ? this.grid.clone() : this.grid,
-    unit    : new THREE.Vector3(voxSz, voxSz, voxSz),
-    bbox    : this.bbox.clone ? this.bbox.clone() : this.bbox,
-    voxelColors,
-    voxelCounts
-  };
-
-
-  } else {
-    // Build single mesh
-    const mesh = this.#buildMeshFromVoxels(voxelMap, voxelMap, hasVoxel, faces, voxSz, bbox);
-    this.voxelMesh = mesh;
-
-    /* -----------------------------------------------
-   *  Back-channel data for assignToBlocksForGLB.js
-   * --------------------------------------------- */
-  const tot = NX * NY * NZ;
-  const voxelColors = new Float32Array(tot * 4);  // r,g,b,a
-  const voxelCounts = new Uint32Array(tot);       // hit count per voxel
-
-  const idxXYZ = (x, y, z) => x + NX * (y + NY * z);
-
-  for (const voxel of voxelMap.values()) {
-    const i = idxXYZ(voxel.x, voxel.y, voxel.z);
-
-    voxelCounts[i] = 1;          // just one sample – fast & small
-    voxelColors[i * 4 + 0] = voxel.r;
-    voxelColors[i * 4 + 1] = voxel.g;
-    voxelColors[i * 4 + 2] = voxel.b;
-    voxelColors[i * 4 + 3] = 1;  // opaque
-  }
-
-  /* expose everything assignToBlocksForGLB needs */
-  this._voxelGrid = {
-    gridSize: this.grid.clone ? this.grid.clone() : this.grid,
-    unit    : new THREE.Vector3(voxSz, voxSz, voxSz),
-    bbox    : this.bbox.clone ? this.bbox.clone() : this.bbox,
-    voxelColors,
-    voxelCounts
-  };
-
-
-  }
-}
-
-// Helper method to build a mesh from a subset of voxels
-#buildMeshFromVoxels(voxelSubset, fullVoxelMap, hasVoxel, faces, voxSz, bbox) {
-  // Pre-count faces for this subset
-  let faceCount = 0;
-  for (const [key, voxel] of voxelSubset) {
-    for (const face of faces) {
-      const nx = voxel.x + face.dir[0];
-      const ny = voxel.y + face.dir[1];
-      const nz = voxel.z + face.dir[2];
-      if (!hasVoxel(nx, ny, nz)) {
-        faceCount++;
-      }
+    for (let chunk = 0; chunk < chunkCount; chunk++) {
+      const start = chunk * voxelsPerChunk;
+      const end = Math.min(start + voxelsPerChunk, occupiedIndices.length);
+      const mesh = await this.#buildMeshFromRange(occupiedIndices, start, end, paletteIds, NX, NY, NZ, voxelSize, bbox);
+      if (mesh) group.add(mesh);
+      await nextFrame();
     }
+
+    return group.children.length ? group : createEmptyVoxelMesh();
   }
 
-  if (faceCount === 0) return null;
+  async #buildMeshFromRange(occupiedIndices, start, end, paletteIds, NX, NY, NZ, voxelSize, bbox) {
+    const sliceStride = NX * NY;
+    let faceCount = 0;
+    const countYieldState = createYieldState();
 
-  // Pre-allocate typed arrays
-  const vertices = new Float32Array(faceCount * 4 * 3); // 4 vertices per face, 3 coords each
-  const colors = new Float32Array(faceCount * 4 * 3);   // 4 vertices per face, 3 color components
-  const normals = new Float32Array(faceCount * 4 * 3);  // 4 vertices per face, 3 normal components
-  const indices = new Uint32Array(faceCount * 6);       // 6 indices per face (2 triangles)
+    for (let i = start; i < end; i++) {
+      if (((i - start) & 4095) === 4095) await maybeYieldToBrowser(countYieldState, this.mainThreadPolicy);
+      const flat = occupiedIndices[i];
+      const x = flat % NX;
+      const yz = (flat - x) / NX;
+      const y = yz % NY;
+      const z = (yz - y) / NY;
 
-  let vertexOffset = 0;
-  let indexOffset = 0;
-  let vertexIndex = 0;
+      if (x === 0 || paletteIds[flat - 1] === 0) faceCount++;
+      if (x === NX - 1 || paletteIds[flat + 1] === 0) faceCount++;
+      if (y === 0 || paletteIds[flat - NX] === 0) faceCount++;
+      if (y === NY - 1 || paletteIds[flat + NX] === 0) faceCount++;
+      if (z === 0 || paletteIds[flat - sliceStride] === 0) faceCount++;
+      if (z === NZ - 1 || paletteIds[flat + sliceStride] === 0) faceCount++;
+    }
 
-  // Build geometry with face culling
-  for (const [key, voxel] of voxelSubset) {
-    const baseX = bbox.min.x + voxel.x * voxSz;
-    const baseY = bbox.min.y + voxel.y * voxSz;
-    const baseZ = bbox.min.z + voxel.z * voxSz;
+    if (!faceCount) return null;
 
-    // Check each face
-    for (const face of faces) {
-      // Check if there's a neighbor in this direction
-      const neighborX = voxel.x + face.dir[0];
-      const neighborY = voxel.y + face.dir[1];
-      const neighborZ = voxel.z + face.dir[2];
-      
-      // Only create face if there's no neighbor
-      if (!hasVoxel(neighborX, neighborY, neighborZ)) {
-        // Add vertices for this face
-        for (let v = 0; v < 4; v++) {
-          const vertex = face.vertices[v];
-          const vIdx = vertexOffset * 3;
-          
-          vertices[vIdx] = baseX + vertex[0] * voxSz;
-          vertices[vIdx + 1] = baseY + vertex[1] * voxSz;
-          vertices[vIdx + 2] = baseZ + vertex[2] * voxSz;
-          
-          colors[vIdx] = voxel.r;
-          colors[vIdx + 1] = voxel.g;
-          colors[vIdx + 2] = voxel.b;
-          
-          normals[vIdx] = face.normal[0];
-          normals[vIdx + 1] = face.normal[1];
-          normals[vIdx + 2] = face.normal[2];
-          
+    const vertexCount = faceCount * 4;
+    const positions = new Float32Array(vertexCount * 3);
+    const colors = new Uint8Array(vertexCount * 4);
+    const normals = new Int8Array(vertexCount * 3);
+    const indices = vertexCount > 65535 ? new Uint32Array(faceCount * 6) : new Uint16Array(faceCount * 6);
+
+    let vertexOffset = 0;
+    let indexOffset = 0;
+    let vertexIndex = 0;
+    const fillYieldState = createYieldState();
+
+    for (let i = start; i < end; i++) {
+      if (((i - start) & 2047) === 2047) await maybeYieldToBrowser(fillYieldState, this.mainThreadPolicy);
+      const flat = occupiedIndices[i];
+      const paletteBase = (paletteIds[flat] - 1) * 3;
+      if (paletteBase < 0) continue;
+
+      const x = flat % NX;
+      const yz = (flat - x) / NX;
+      const y = yz % NY;
+      const z = (yz - y) / NY;
+
+      const baseX = bbox.min.x + x * voxelSize;
+      const baseY = bbox.min.y + y * voxelSize;
+      const baseZ = bbox.min.z + z * voxelSize;
+
+      const colorR = clampByte(this.palette[paletteBase]);
+      const colorG = clampByte(this.palette[paletteBase + 1]);
+      const colorB = clampByte(this.palette[paletteBase + 2]);
+
+      for (const face of CUBE_FACES) {
+        const nx = x + face.dir[0];
+        const ny = y + face.dir[1];
+        const nz = z + face.dir[2];
+        if (
+          nx >= 0 && nx < NX
+          && ny >= 0 && ny < NY
+          && nz >= 0 && nz < NZ
+          && paletteIds[nx + ny * NX + nz * sliceStride] !== 0
+        ) {
+          continue;
+        }
+
+        for (let vertex = 0; vertex < 4; vertex++) {
+          const vertexBase = vertexOffset * 3;
+          const colorBase = vertexOffset * 4;
+          const point = face.vertices[vertex];
+
+          positions[vertexBase] = baseX + point[0] * voxelSize;
+          positions[vertexBase + 1] = baseY + point[1] * voxelSize;
+          positions[vertexBase + 2] = baseZ + point[2] * voxelSize;
+
+          normals[vertexBase] = face.normal[0];
+          normals[vertexBase + 1] = face.normal[1];
+          normals[vertexBase + 2] = face.normal[2];
+
+          colors[colorBase] = colorR;
+          colors[colorBase + 1] = colorG;
+          colors[colorBase + 2] = colorB;
+          colors[colorBase + 3] = 255;
           vertexOffset++;
         }
 
-        // Add indices (two triangles per face)
         indices[indexOffset++] = vertexIndex;
         indices[indexOffset++] = vertexIndex + 1;
         indices[indexOffset++] = vertexIndex + 2;
         indices[indexOffset++] = vertexIndex;
         indices[indexOffset++] = vertexIndex + 2;
         indices[indexOffset++] = vertexIndex + 3;
-        
         vertexIndex += 4;
       }
     }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 4, true));
+    geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3, true));
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    geometry.computeBoundingSphere();
+
+    const mesh = new THREE.Mesh(
+      geometry,
+      new THREE.MeshBasicMaterial({
+        vertexColors: true,
+        toneMapped: false,
+        side: THREE.FrontSide,
+      })
+    );
+    mesh.frustumCulled = true;
+    return mesh;
   }
 
-  // Create geometry from typed arrays
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-  geometry.computeBoundingSphere();
+  async #buildVoxelGrid(occupiedIndices, paletteIds, voxelSize) {
+    const total = this.totalGridVoxelCount;
+    const voxelColors = new Float32Array(total * 4);
+    const voxelCounts = new Uint32Array(total);
+    const yieldState = createYieldState();
 
-  const material = new THREE.MeshBasicMaterial({ 
-    vertexColors: true,
-    side: THREE.FrontSide
-  });
+    for (let i = 0; i < occupiedIndices.length; i++) {
+      if ((i & 4095) === 4095) await maybeYieldToBrowser(yieldState, this.mainThreadPolicy);
+      const flat = occupiedIndices[i];
+      const paletteBase = (paletteIds[flat] - 1) * 3;
+      if (paletteBase < 0) continue;
 
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.frustumCulled = true;
-  
-  return mesh;
-}
+      voxelCounts[flat] = 1;
+      voxelColors[flat * 4] = Math.min(1, Math.max(0, linearToSrgbChannel(this.palette[paletteBase])));
+      voxelColors[flat * 4 + 1] = Math.min(1, Math.max(0, linearToSrgbChannel(this.palette[paletteBase + 1])));
+      voxelColors[flat * 4 + 2] = Math.min(1, Math.max(0, linearToSrgbChannel(this.palette[paletteBase + 2])));
+      voxelColors[flat * 4 + 3] = 1;
+    }
 
+    return {
+      colorSpace: 'srgb',
+      gridSize: this.grid.clone(),
+      unit: new THREE.Vector3(voxelSize, voxelSize, voxelSize),
+      bbox: this.bbox.clone(),
+      voxelColors,
+      voxelCounts,
+    };
+  }
 
+  async #bakeAndMerge(root) {
+    const meshes = [];
+    root.traverse(object => {
+      if (object.isMesh && object.geometry?.getAttribute('position')) meshes.push(object);
+    });
 
+    const positionChunks = [];
+    const uvChunks = [];
+    const indices = [];
+    const triMats = [];
+    const materials = [];
+    const materialMap = new Map();
+    let totalVertexCount = 0;
+    const maxPaletteSamples = 4096;
+    const paletteSamples = new Float32Array(maxPaletteSamples * 3);
+    let paletteSampleCount = 0;
+    let paletteSeen = 0;
+    let paletteState = 0x51f2d3a7;
 
-  /* bake+merge → positions, uvs, indices, triMats, palette, materials */
-  #bakeAndMerge(root) {
-    const geoms = [], indices = [], allRGB = [], triMats = [], uvs = [], materials = [];
-    const matMap = new Map();
-    let offset = 0;
+    const nextPaletteSlot = (limit) => {
+      paletteState = (1664525 * paletteState + 1013904223) >>> 0;
+      return Math.floor((paletteState / 0x100000000) * limit);
+    };
 
-    root.traverse(o => {
-      if (!o.isMesh || !o.geometry.getAttribute('position')) return;
-      
-      o.updateWorldMatrix(true, false);
-      let g = o.geometry.clone().applyMatrix4(o.matrixWorld).toNonIndexed();
-      const posA = g.getAttribute('position');
-      if (!posA) return;
+    const recordPaletteSample = (r, g, b) => {
+      const sampleIndex = paletteSeen++;
+      if (sampleIndex < maxPaletteSamples) {
+        const base = sampleIndex * 3;
+        paletteSamples[base] = r;
+        paletteSamples[base + 1] = g;
+        paletteSamples[base + 2] = b;
+        paletteSampleCount = sampleIndex + 1;
+        return;
+      }
 
-      const meshMats = Array.isArray(o.material) ? o.material : [o.material];
-      for (const m of meshMats) {
-        if (m && !matMap.has(m)) {
-          matMap.set(m, materials.length);
-          materials.push(m);
-        }
-      }
+      const slot = nextPaletteSlot(sampleIndex + 1);
+      if (slot >= maxPaletteSamples) return;
+      const base = slot * 3;
+      paletteSamples[base] = r;
+      paletteSamples[base + 1] = g;
+      paletteSamples[base + 2] = b;
+    };
 
-      for (const m of materials) {
-        for (const key of ['map', 'emissiveMap', 'alphaMap']) {
-          const t = m[key];
-          if (t && t.isTexture) {
-            t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-            t.needsUpdate = true;
+    const meshYieldState = createYieldState();
+    for (let meshIndex = 0; meshIndex < meshes.length; meshIndex++) {
+      await maybeYieldToBrowser(meshYieldState, this.mainThreadPolicy);
+      const object = meshes[meshIndex];
+      object.updateWorldMatrix(true, false);
+      const geometry = object.geometry.clone().applyMatrix4(object.matrixWorld);
+      const positionAttribute = geometry.getAttribute('position');
+      if (!positionAttribute) continue;
+      const indexArray = geometry.index ? geometry.index.array : null;
+
+      const meshMaterials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of meshMaterials) {
+        if (material && !materialMap.has(material)) {
+          materialMap.set(material, materials.length);
+          materials.push(material);
+          for (const key of ['map', 'emissiveMap', 'alphaMap']) {
+            const texture = material[key];
+            if (texture && texture.isTexture) {
+              texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
+              texture.needsUpdate = true;
+            }
           }
         }
       }
 
+      const groups = geometry.groups.length
+        ? geometry.groups
+        : [{ start: 0, count: indexArray ? indexArray.length : positionAttribute.count, materialIndex: 0 }];
+      const uvAttribute = geometry.getAttribute('uv');
+      const uvPoint = new THREE.Vector2();
+      const sampled = new THREE.Color();
+      const texColor = new THREE.Color();
+      const sampleYieldState = createYieldState();
 
-      const groups = g.groups.length ? g.groups : [{ start:0, count:posA.count, materialIndex:0 }];
-      const uvA  = g.getAttribute('uv');
+      for (const group of groups) {
+        const material = meshMaterials[group.materialIndex];
+        if (!material) continue;
 
-      for (const grp of groups) {
-        const m = meshMats[grp.materialIndex];
-        if (!m) continue;
-        for (let vi=grp.start; vi<grp.start+grp.count; ++vi) {
-          // This loop collects ALL colors from the original model to build the palette
-          // It now correctly uses the linear-space sampler
-          let col = (m.color ? m.color.clone() : new THREE.Color(1,1,1));
-          if (m.emissive && m.emissive.getHSL({h:0,s:0,l:0}) > 0) {
-            col.add(m.emissive);
+        const sampleBudget = Math.min(group.count, 192);
+        if (!sampleBudget) continue;
+
+        if (!uvAttribute && !material.emissive && !material.emissiveMap) {
+          recordPaletteSample(
+            material.color?.r ?? 1,
+            material.color?.g ?? 1,
+            material.color?.b ?? 1
+          );
+          continue;
+        }
+
+        const sampleStep = Math.max(1, Math.floor(group.count / sampleBudget));
+        for (let groupIndex = group.start; groupIndex < group.start + group.count; groupIndex += sampleStep) {
+          if (((groupIndex - group.start) & 255) === 255) await maybeYieldToBrowser(sampleYieldState, this.mainThreadPolicy);
+          const vertexIndex = indexArray ? indexArray[groupIndex] : groupIndex;
+          sampled.r = material.color?.r ?? 1;
+          sampled.g = material.color?.g ?? 1;
+          sampled.b = material.color?.b ?? 1;
+
+          if (material.emissive) {
+            sampled.r += material.emissive.r;
+            sampled.g += material.emissive.g;
+            sampled.b += material.emissive.b;
           }
-          if (uvA) {
-            const uvv = new THREE.Vector2(uvA.getX(vi), uvA.getY(vi));
-            for (const tex of allTextures(m)) {
-              const samp = getSampler(tex);
-              if (samp) col.multiply(samp(uvv));
-            }
-          }
-          allRGB.push(col.r, col.g, col.b);
-        }
-      }
 
-      if (uvA) { for (let i=0; i<posA.count; ++i) uvs.push(uvA.getX(i), uvA.getY(i)); }
-      else { for (let i=0; i<posA.count; ++i) uvs.push(0,0); }
+          if (uvAttribute) {
+            uvPoint.set(uvAttribute.getX(vertexIndex), uvAttribute.getY(vertexIndex));
+            for (const texture of allTextures(material)) {
+              const sampler = getSampler(texture);
+              if (!sampler) continue;
+              sampler(uvPoint, false, texColor);
+              sampled.r *= texColor.r;
+              sampled.g *= texColor.g;
+              sampled.b *= texColor.b;
+            }
+          }
 
-      for (const grp of groups) {
-        const m = meshMats[grp.materialIndex]
-        if (!m) continue;
-        const globalMatIdx = matMap.get(m);
-        for (let i=grp.start; i<grp.start+grp.count; i+=3) {
-          indices.push(offset + i, offset + i + 1, offset + i + 2);
-          triMats.push(globalMatIdx);
-        }
-      }
+          if (
+            Number.isFinite(sampled.r)
+            && Number.isFinite(sampled.g)
+            && Number.isFinite(sampled.b)
+          ) {
+            recordPaletteSample(
+              Math.min(1, Math.max(0, sampled.r)),
+              Math.min(1, Math.max(0, sampled.g)),
+              Math.min(1, Math.max(0, sampled.b))
+            );
+          }
+        }
+      }
 
-      offset += posA.count;
-      geoms.push(g);
-    });
+      positionChunks.push(positionAttribute.array);
 
-    if (geoms.length === 0) {
-      return { positions: new Float32Array(), uvs: new Float32Array(), indices: new Uint32Array(), triMats: new Uint32Array(), palette: new Float32Array(), materials: [] };
+      if (uvAttribute?.array) {
+        uvChunks.push(uvAttribute.array);
+      } else {
+        uvChunks.push(new Float32Array(positionAttribute.count * 2));
+      }
+
+      for (const group of groups) {
+        const material = meshMaterials[group.materialIndex];
+        if (!material) continue;
+
+        const globalMaterialIndex = materialMap.get(material);
+        for (let i = group.start; i < group.start + group.count; i += 3) {
+          if (((i - group.start) & 1023) === 1023) await maybeYieldToBrowser(sampleYieldState, this.mainThreadPolicy);
+          const a = indexArray ? indexArray[i] : i;
+          const b = indexArray ? indexArray[i + 1] : i + 1;
+          const c = indexArray ? indexArray[i + 2] : i + 2;
+          indices.push(totalVertexCount + a, totalVertexCount + b, totalVertexCount + c);
+          triMats.push(globalMaterialIndex);
+        }
+      }
+
+      totalVertexCount += positionAttribute.count;
+      geometry.dispose();
     }
-    const merged = mergeGeometries(geoms, false);
-    return {
-      positions: merged.attributes.position.array,
-      uvs: new Float32Array(uvs),
-      indices: new Uint32Array(indices),
-      triMats: new Uint32Array(triMats),
-      palette: kMeansPalette(new Float32Array(allRGB), this.paletteSize).palette,
-      materials
-    };
-  }
 
+    if (!positionChunks.length) {
+      return {
+        positions: new Float32Array(),
+        uvs: new Float32Array(),
+        indices: new Uint32Array(),
+        triMats: new Uint32Array(),
+        palette: new Float32Array(),
+        materials: [],
+      };
+    }
+
+    const positions = new Float32Array(totalVertexCount * 3);
+    const uvs = new Float32Array(totalVertexCount * 2);
+    let positionOffset = 0;
+    let uvOffset = 0;
+    const copyYieldState = createYieldState();
+
+    for (let i = 0; i < positionChunks.length; i++) {
+      await maybeYieldToBrowser(copyYieldState, this.mainThreadPolicy);
+      positions.set(positionChunks[i], positionOffset);
+      uvs.set(uvChunks[i], uvOffset);
+      positionOffset += positionChunks[i].length;
+      uvOffset += uvChunks[i].length;
+    }
+
+    return {
+      positions,
+      uvs,
+      indices: new Uint32Array(indices),
+      triMats: new Uint32Array(triMats),
+      palette: paletteSampleCount
+        ? kMeansPalette(paletteSamples.subarray(0, paletteSampleCount * 3), this.paletteSize).palette
+        : new Float32Array([1, 1, 1]),
+      materials,
+    };
+  }
 }

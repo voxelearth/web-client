@@ -131,6 +131,7 @@ async function buildVoxels(res) {
       if (vox.stats.wasmCalls) parts.push(`wasm calls ${vox.stats.wasmCalls}`);
       ui.log(`↳ ${parts.join(' | ')}`);
       if (vox.stats.fallbackReason) ui.log(`↳ ${vox.stats.fallbackReason}`);
+      if (vox.stats.dispatchReason) ui.log(`↳ ${vox.stats.dispatchReason}`);
     }
 
     /* if MC toggle already on – regenerate block mesh */

@@ -14,7 +14,7 @@ import {
 } from '3d-tiles-renderer/plugins';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 
-import { voxelizeModel } from './voxelize-model.js';
+import { voxelizeModel, WEBGPU_WORKER_POOL_SIZE } from './voxelize-model.js';
 import {
   initBlockData,
   assignVoxelsToBlocks,
@@ -966,6 +966,13 @@ class HUD {
       return;
     }
 
+    if (vox?.stats?.fallbackReason) {
+      this._logSingleScene(`? ${vox.stats.fallbackReason}`);
+    }
+    if (vox?.stats?.dispatchReason) {
+      this._logSingleScene(vox.stats.dispatchReason);
+    }
+
     if (myVersion !== this._ssVoxVersion) {
       // stale
       vox?.voxelMesh?.traverse(n => {
@@ -1810,6 +1817,8 @@ if (document.readyState === 'loading') {
 /* ───────────────────────────────  Three.js set-up ─────────────────── */
 let scene, camera, controls, renderer, tiles = null;
 let isInteracting = false;
+let lastInteractionAt = 0;
+let interactionIdleTimer = null;
 let __desiredView = null; // populated by HUD._goTo
 let freecamUpdateFn = null; // Will be set by camera controls
 let hasFramedOnce = false; // gate initial auto-framing
@@ -1820,6 +1829,37 @@ const LAYER_VOXELS = 1;   // Our voxel meshes / MC
 
 const state = { resolution: 64, vox: true, mc: false, debugImagery: false };
 let lastVoxelUpdateTime = 0;
+const INTERACTION_SETTLE_MS = 180;
+
+function noteInteraction() {
+  lastInteractionAt = performance.now();
+  isInteracting = true;
+  if (interactionIdleTimer) clearTimeout(interactionIdleTimer);
+  interactionIdleTimer = setTimeout(() => {
+    if (performance.now() - lastInteractionAt >= INTERACTION_SETTLE_MS - 4) {
+      isInteracting = false;
+      flushPendingVoxelAttachments();
+    }
+  }, INTERACTION_SETTLE_MS);
+}
+
+function isInteractionBusy() {
+  return isInteracting || (performance.now() - lastInteractionAt) < INTERACTION_SETTLE_MS;
+}
+
+function waitForInteractionIdle() {
+  if (!isInteractionBusy()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (!isInteractionBusy()) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 40);
+    };
+    tick();
+  });
+}
 
 (() => {
   // Stable, zero-stutter baseline: WebGL. Re-enable WebGPU later if desired.
@@ -1849,15 +1889,9 @@ let lastVoxelUpdateTime = 0;
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true; controls.maxDistance = 3e4;
 
-  controls.addEventListener('start', () => {
-    isInteracting = true;
-    // Keep consistent LOD while moving - voxel caching handles performance now
-  });
-
-  controls.addEventListener('end', () => {
-    isInteracting = false;
-    // No need to restore errorTarget since we don't change it
-  });
+  controls.addEventListener('start', noteInteraction);
+  controls.addEventListener('change', noteInteraction);
+  controls.addEventListener('end', noteInteraction);
 
   window.addEventListener('resize', resize); resize();
 
@@ -1961,17 +1995,20 @@ function ensureTiles(root, key) {
   tiles.addEventListener('load-model', onTileLoad);
   tiles.addEventListener('dispose-model', onTileDispose);
   // LOD visibility management
-  tiles.addEventListener('tile-visibility-change', ({ tile, visible }) => {
-    const tileGroup = tile.cached.scene;
+  tiles.addEventListener('tile-visibility-change', ({ tile, scene: tileGroup, visible }) => {
     if (!tileGroup) return;
     tileGroup.userData.rendererVisible = visible;
     if (visible) {
-      if (state.vox && !isInteracting && !tileGroup._voxMesh && !tileGroup._mcMesh && !voxelizingTiles.has(tileGroup) && !disposingTiles.has(tileGroup)) {
-        buildVoxelFor(tileGroup);
+      const needsVoxel = !tileGroup._voxMesh;
+      if (state.vox && !isInteractionBusy() && getVoxelizerBudget() > 0 && needsVoxel && !tileGroup._mcMesh && !voxelizingTiles.has(tileGroup) && !disposingTiles.has(tileGroup)) {
+        scheduleVoxel(() => buildVoxelFor(tileGroup));
       }
     } else {
       try { tileGroup._voxWorker?.terminate?.(); } catch { }
       voxelizingTiles.delete(tileGroup);
+      const pending = pendingVoxelAttachments.get(tileGroup);
+      if (pending?.voxelMesh) dispose(pending.voxelMesh);
+      pendingVoxelAttachments.delete(tileGroup);
       if (tileGroup._voxMesh) tileGroup._voxMesh.visible = false;
       if (tileGroup._mcMesh) tileGroup._mcMesh.visible = false;
     }
@@ -1979,6 +2016,7 @@ function ensureTiles(root, key) {
   });
 
   scene.add(tiles.group);
+  window.tiles = tiles;
 }
 
 function retargetTiles(latDeg, lonDeg) {
@@ -2049,11 +2087,13 @@ function dispose(o) {
 
 const voxelizingTiles = new Set();
 const disposingTiles = new Set();
+const pendingVoxelAttachments = new Map();
+let pendingVoxelFlushScheduled = false;
 
 // --- New: distance-aware resolution & concurrency budget ---
 const CPU = (navigator.hardwareConcurrency || 4);
 const MAX_CONCURRENT_VOXELIZERS = Math.max(1, Math.min(4, Math.floor(CPU / 2)));
-const MOVING_BUDGET = 1; // keep UI smooth while the camera is in motion
+const WEBGPU_CONCURRENT_VOXELIZERS = WEBGPU_WORKER_POOL_SIZE;
 const TARGET_PX_PER_VOXEL = 3;     // tweak to taste (2..4 is a good band)
 
 function screenRadiusForObject(obj) {
@@ -2084,16 +2124,137 @@ function isWorthVoxelizing(tile) {
   }
 }
 
-// Yield voxel starts to idle frames when possible (with a small timeout)
-const scheduleVoxel = (cb) => ('requestIdleCallback' in window)
-  ? requestIdleCallback(cb, { timeout: 120 })
-  : setTimeout(cb, 0);
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
 
-async function buildVoxelFor(tile) {
+function getActiveVoxelMethod() {
+  try {
+    return ui?.getVoxelizationMethod?.() ?? '2.5d-scan';
+  } catch {
+    return '2.5d-scan';
+  }
+}
+
+function getVoxelizerBudget() {
+  const method = getActiveVoxelMethod();
+  const maxConcurrent = method === 'webgpu'
+    ? WEBGPU_CONCURRENT_VOXELIZERS
+    : MAX_CONCURRENT_VOXELIZERS;
+  return Math.max(0, maxConcurrent - voxelizingTiles.size);
+}
+
+function scheduleVoxel(cb) {
+  const run = () => {
+    if (isInteractionBusy()) {
+      const waitMs = Math.max(40, INTERACTION_SETTLE_MS - (performance.now() - lastInteractionAt));
+      setTimeout(run, waitMs);
+      return;
+    }
+    if ('requestIdleCallback' in window) {
+      requestIdleCallback(() => {
+        if (isInteractionBusy()) {
+          scheduleVoxel(cb);
+          return;
+        }
+        cb();
+      }, { timeout: 120 });
+      return;
+    }
+    setTimeout(() => {
+      if (isInteractionBusy()) {
+        scheduleVoxel(cb);
+        return;
+      }
+      cb();
+    }, 0);
+  };
+
+  run();
+}
+
+async function finalizeVoxelAttach(tile, vox, { quality = 'final' } = {}) {
+  if (!tile || !vox) return;
+  if (isInteractionBusy()) {
+    pendingVoxelAttachments.set(tile, { vox, quality });
+    schedulePendingVoxelFlush();
+    return;
+  }
+  if (!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
+    dispose(vox.voxelMesh);
+    return;
+  }
+
+  const vMesh = vox.voxelMesh;
+  vMesh.matrixAutoUpdate = false;
+  vMesh.userData.sourceTile = tile;
+
+  vMesh.traverse(m => {
+    if (!m.isMesh) return;
+    const bb = m.geometry.boundingBox;
+    if (bb) {
+      const c = bb.getCenter(new THREE.Vector3());
+      m.renderOrder = -camera.position.distanceToSquared(c);
+    }
+  });
+
+  vMesh.traverse(n => n.layers.set(LAYER_VOXELS));
+  if (quality === 'final' && tile._voxMesh && tile._voxMesh !== vMesh) {
+    dispose(tile._voxMesh);
+  }
+  scene.add(vMesh);
+
+  tile._voxMesh = vMesh;
+  tile._voxQuality = quality;
+  if (quality === 'final') {
+    tile._voxelizer = vox;
+  } else {
+    delete tile._voxelizer;
+    tile._mcApplied = false;
+  }
+  delete tile._voxWorker;
+  vMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
+
+  if (quality === 'final' && state.mc && vox._voxelGrid) {
+    vMesh.userData.__mcAllowApply = true;
+    await buildMinecraftFor(tile);
+  }
+  applyVis(tile);
+}
+
+function schedulePendingVoxelFlush() {
+  if (pendingVoxelFlushScheduled) return;
+  pendingVoxelFlushScheduled = true;
+  setTimeout(async () => {
+    pendingVoxelFlushScheduled = false;
+    await flushPendingVoxelAttachments();
+  }, 0);
+}
+
+async function flushPendingVoxelAttachments() {
+  if (isInteractionBusy() || !pendingVoxelAttachments.size) return;
+  const entries = Array.from(pendingVoxelAttachments.entries());
+  for (const [tile, pending] of entries) {
+    if (isInteractionBusy()) {
+      schedulePendingVoxelFlush();
+      return;
+    }
+    pendingVoxelAttachments.delete(tile);
+    await finalizeVoxelAttach(tile, pending.vox, pending);
+    await nextFrame();
+  }
+}
+
+async function buildVoxelFor(tile, { quality = null } = {}) {
   const rendererVisible = tile?.userData?.rendererVisible;
-  if (!tile || tile._voxMesh || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile)) return;
+  const activeMethod = getActiveVoxelMethod();
+  const requestedQuality = quality ?? 'final';
+  if (!tile || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile)) return;
   if (rendererVisible === false) return; // only skip when we know it's hidden
   if (!tile.parent || tile.parent !== tiles.group) return;
+  if (getVoxelizerBudget() <= 0) return;
+  if (tile._voxPendingQuality === requestedQuality) return;
+  if (requestedQuality === 'final' && tile._voxQuality === 'final') return;
 
   let hasMeshes = false;
   tile.traverse(n => { if (n.isMesh && n.geometry) hasMeshes = true; });
@@ -2108,56 +2269,39 @@ async function buildVoxelFor(tile) {
   if (approxRadius * approxRadius > dist2 * 0.3) return;
 
   voxelizingTiles.add(tile);
+  tile._voxPendingQuality = requestedQuality;
   try {
     const perTileResolution = resolutionForTile(tile);
     let workerRef = null;
     const vox = await voxelizeModel({
       model: tile,
+      renderer,
       resolution: perTileResolution,
-      needGrid: true,   // always build voxelGrid so MC toggle is instant
-      method: ui.getVoxelizationMethod(),
-      onStart: w => { workerRef = w; tile._voxWorker = w; }
+      needGrid: !!state.mc,
+      method: activeMethod,
+      renderMode: activeMethod === 'webgpu' && !state.mc ? 'instances' : 'mesh',
+      onStart: w => { workerRef = w; tile._voxWorker = w; },
+      mainThreadPolicy: {
+        shouldPause: () => isInteractionBusy(),
+        waitForIdle: waitForInteractionIdle,
+      }
     });
 
+    if (vox?.stats?.fallbackReason) {
+      console.warn(vox.stats.fallbackReason);
+    }
     if (!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
       try { workerRef?.terminate?.(); } catch { }
       dispose(vox.voxelMesh);
       return;
     }
-
-    const vMesh = vox.voxelMesh;
-    vMesh.matrixAutoUpdate = false;
-    vMesh.userData.sourceTile = tile;
-
-    // assign smaller renderOrder for nearer chunks (better early-Z)
-    vMesh.traverse(m => {
-      if (!m.isMesh) return;
-      const bb = m.geometry.boundingBox;
-      if (bb) {
-        const c = bb.getCenter(new THREE.Vector3());
-        m.renderOrder = -camera.position.distanceToSquared(c);
-      }
-    });
-
-    // Put voxels on the voxel layer
-    vMesh.traverse(n => n.layers.set(LAYER_VOXELS));
-    scene.add(vMesh);
-
-    tile._voxMesh = vMesh;
-    tile._voxelizer = vox;
-    // Remember original materials for MC toggle
-    vMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
-
-    if (state.mc && vox._voxelGrid) {
-      vMesh.userData.__mcAllowApply = true; // allow MC material application
-      await applyAtlasToExistingVoxelMesh(vMesh, vox._voxelGrid);
-      tile._mcApplied = true;
-    }
-    applyVis(tile);
+    await finalizeVoxelAttach(tile, vox, { quality: requestedQuality });
   } catch (e) {
+    if (e?.message === 'Voxelization cancelled') return;
     console.warn('voxelise failed', e);
     tile._voxError = true; // prevent infinite retry spam this session
   } finally {
+    if (tile._voxPendingQuality === requestedQuality) delete tile._voxPendingQuality;
     voxelizingTiles.delete(tile);
   }
 }
@@ -2166,8 +2310,21 @@ async function buildMinecraftFor(tile) {
   // Backwards-compat helper: apply atlas material if not already applied
   if (!tile || !tile._voxMesh || !tile._voxelizer || disposingTiles.has(tile)) return;
   if (tile._mcApplied) return;
+  if (isInteractionBusy()) {
+    scheduleVoxel(() => buildMinecraftFor(tile));
+    return;
+  }
+  if (tile._voxMesh.userData?.renderMode === 'instanced-voxels') {
+    cleanupTileVoxels(tile);
+    await buildVoxelFor(tile);
+    return;
+  }
+  if (!tile._voxelizer._voxelGrid) {
+    cleanupTileVoxels(tile);
+    await buildVoxelFor(tile);
+    return;
+  }
   try {
-    if (!tile._voxelizer._voxelGrid) return; // needGrid must be true during voxelization when MC enabled
     await applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid);
     tile._mcApplied = true;
     applyVis(tile);
@@ -2191,10 +2348,12 @@ function onTileLoad({ scene: tile }) {
 
   // Automatically voxelize if vox mode is on.
   const rendererVisible = tile?.userData?.rendererVisible;
-  if (state.vox && !isInteracting && rendererVisible !== false && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile)) {
+  const needsVoxel = !tile._voxMesh;
+  if (state.vox && !isInteractionBusy() && getVoxelizerBudget() > 0 && rendererVisible !== false && needsVoxel && !tile._voxError && !voxelizingTiles.has(tile)) {
     scheduleVoxel(() => {
       const stillVisible = tile?.userData?.rendererVisible;
-      if (!isInteracting && tile.parent && stillVisible !== false && !tile._voxMesh && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile) && isWorthVoxelizing(tile)) {
+      const stillNeedsVoxel = !tile._voxMesh;
+      if (!isInteractionBusy() && tile.parent && stillVisible !== false && stillNeedsVoxel && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile) && isWorthVoxelizing(tile)) {
         buildVoxelFor(tile);
       }
     });
@@ -2218,10 +2377,15 @@ function cleanupTileVoxels(tile) {
     try { tile._voxWorker?.terminate?.(); } catch { }
     dispose(tile._voxMesh);
     dispose(tile._tempContainer);
+    const pending = pendingVoxelAttachments.get(tile);
+    if (pending?.vox?.voxelMesh) dispose(pending.vox.voxelMesh);
+    pendingVoxelAttachments.delete(tile);
 
     voxelizingTiles.delete(tile);
 
     delete tile._voxMesh;
+    delete tile._voxQuality;
+    delete tile._voxPendingQuality;
     delete tile._voxelizer;
     delete tile._tempContainer;
     delete tile._voxError;  // allow retry after cleanup
@@ -2248,6 +2412,7 @@ function applyVis(tile) {
     camera.layers.enable(LAYER_IMAGERY);
     if (state.vox) camera.layers.enable(LAYER_VOXELS); else camera.layers.disable(LAYER_VOXELS);
   }
+  tile.visible = tile.userData.rendererVisible !== false;
 
   if (tile._voxMesh) tile._voxMesh.visible = !!showVoxels;
   if (tile._voxMesh) tile._voxMesh.userData.__mcAllowApply = !!useMinecraft; // set gating flag
@@ -2332,21 +2497,25 @@ function loop() {
   if (tiles) {
     camera.updateMatrixWorld();
     tiles.update();
+    if (!isInteractionBusy()) {
+      flushPendingVoxelAttachments();
+    }
 
     // This periodic check is a good fallback to catch any visible tiles
     // that slipped through the event-based voxelization.
     const now = performance.now();
-    if (state.vox && !isInteracting && now - lastVoxelUpdateTime > VOXEL_UPDATE_INTERVAL) {
+    if (state.vox && !isInteractionBusy() && now - lastVoxelUpdateTime > VOXEL_UPDATE_INTERVAL) {
       lastVoxelUpdateTime = now;
 
       if (tiles.group && tiles.group.children) {
         const tilesToVoxelize = [];
         tiles.group.children.forEach(tile => {
           const rendererVisible = tile?.userData?.rendererVisible;
+          const needsVoxel = !tile._voxMesh;
           if (tile && tile.type === 'Group'
             && rendererVisible !== false
             && isWorthVoxelizing(tile)
-            && !tile._voxMesh && !tile._voxError
+            && needsVoxel && !tile._voxError
             && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
             tilesToVoxelize.push(tile);
           }
@@ -2362,9 +2531,7 @@ function loop() {
             return aPos.distanceToSquared(camPos) - bPos.distanceToSquared(camPos);
           });
 
-          const budget = Math.max(
-            0, (isInteracting ? MOVING_BUDGET : MAX_CONCURRENT_VOXELIZERS) - voxelizingTiles.size
-          );
+          const budget = getVoxelizerBudget();
           tilesToVoxelize.slice(0, budget).forEach(tile => scheduleVoxel(() => buildVoxelFor(tile)));
         }
       }

@@ -12,10 +12,210 @@ const ALPHA_CUTOFF = 0.08; // skip texels with alpha below this to avoid black b
 const MAX_GRID_VOXELS = 40_000_000; // ~80MB worst case for counts+colors; adjust to taste
 const ALPHA_EPS = 1e-3; // minimum alpha for palette inclusion
 const DEFAULT_CHUNK_SIZE = 32;
+const DIRECT_INSTANCE_CHUNK_SIZE = 64;
 const DENSE_HIT_STORE_MAX_VOXELS = 8_000_000;
 const LEGACY_SRGB_ENCODING = 3001;
+const MAX_GPU_BYTES = 256 * 1024 * 1024;
+const BYTES_PER_VOXEL = 8.0;
+const WEBGPU_TILE_EDGE = Math.max(1, Math.floor(Math.cbrt(MAX_GPU_BYTES / BYTES_PER_VOXEL)));
+const WEBGPU_WORKGROUP_SIZE = 64;
+
+const WEBGPU_CLEAR_WGSL = `
+@group(0) @binding(0) var<storage, read_write> tris : array<u32>;
+@group(0) @binding(1) var<storage, read_write> dists : array<atomic<u32>>;
+
+@compute @workgroup_size(${WEBGPU_WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let idx = gid.x;
+    if (idx < arrayLength(&tris)) {
+        tris[idx] = 0u;
+        atomicStore(&dists[idx], 0x7f800000u);
+    }
+}
+`;
+
+const WEBGPU_RASTER_WGSL = `
+struct Params {
+    gDim : vec3<u32>,
+    _pad0 : u32,
+    bMin : vec3<f32>,
+    voxelSize : f32,
+};
+
+@group(0) @binding(0) var<storage, read> positions : array<f32>;
+@group(0) @binding(1) var<storage, read> indices : array<u32>;
+@group(0) @binding(2) var<storage, read_write> tris : array<u32>;
+@group(0) @binding(3) var<storage, read_write> dists : array<atomic<u32>>;
+@group(0) @binding(4) var<uniform> params : Params;
+
+fn loadPosition(vertexIndex : u32) -> vec3<f32> {
+    let base = vertexIndex * 3u;
+    return vec3<f32>(
+        positions[base],
+        positions[base + 1u],
+        positions[base + 2u]
+    );
+}
+
+@compute @workgroup_size(${WEBGPU_WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let triId = gid.x;
+    if (triId * 3u + 2u >= arrayLength(&indices)) {
+        return;
+    }
+
+    let i0 = indices[triId * 3u];
+    let i1 = indices[triId * 3u + 1u];
+    let i2 = indices[triId * 3u + 2u];
+
+    let v0 = loadPosition(i0);
+    let v1 = loadPosition(i1);
+    let v2 = loadPosition(i2);
+
+    let tMin = min(min(v0, v1), v2);
+    let tMax = max(max(v0, v1), v2);
+    let gridMax = vec3<i32>(params.gDim) - vec3<i32>(1, 1, 1);
+    let rawMin = vec3<i32>(vec3<f32>((tMin - params.bMin) / params.voxelSize));
+    let rawMax = vec3<i32>(vec3<f32>((tMax - params.bMin) / params.voxelSize));
+    let vMin = vec3<u32>(max(vec3<i32>(0, 0, 0), rawMin));
+    let vMax = vec3<u32>(min(gridMax, rawMax));
+
+    let half = params.voxelSize * 0.5;
+    let nx = params.gDim.x;
+    let ny = params.gDim.y;
+
+    let n = cross(v1 - v0, v2 - v0);
+    let absN = abs(n);
+    let nn = dot(n, n);
+    if (nn <= 1e-20) {
+        return;
+    }
+
+    for (var z = vMin.z; z <= vMax.z; z = z + 1u) {
+        for (var y = vMin.y; y <= vMax.y; y = y + 1u) {
+            for (var x = vMin.x; x <= vMax.x; x = x + 1u) {
+                let c = params.bMin + (vec3<f32>(f32(x), f32(y), f32(z)) + vec3<f32>(0.5, 0.5, 0.5)) * params.voxelSize;
+                let tv0 = v0 - c;
+                let tv1 = v1 - c;
+                let tv2 = v2 - c;
+                let rP = half * (absN.x + absN.y + absN.z);
+                if (abs(dot(n, tv0)) > rP) {
+                    continue;
+                }
+
+                let e0 = tv1 - tv0;
+                let e1 = tv2 - tv1;
+                let e2 = tv0 - tv2;
+
+                {
+                    let axis = cross(e0, vec3<f32>(1.0, 0.0, 0.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.y) + abs(axis.z));
+                    if (mn > r || mx < -r) { continue; }
+                }
+                {
+                    let axis = cross(e0, vec3<f32>(0.0, 1.0, 0.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.x) + abs(axis.z));
+                    if (mn > r || mx < -r) { continue; }
+                }
+                {
+                    let axis = cross(e0, vec3<f32>(0.0, 0.0, 1.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.x) + abs(axis.y));
+                    if (mn > r || mx < -r) { continue; }
+                }
+
+                {
+                    let axis = cross(e1, vec3<f32>(1.0, 0.0, 0.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.y) + abs(axis.z));
+                    if (mn > r || mx < -r) { continue; }
+                }
+                {
+                    let axis = cross(e1, vec3<f32>(0.0, 1.0, 0.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.x) + abs(axis.z));
+                    if (mn > r || mx < -r) { continue; }
+                }
+                {
+                    let axis = cross(e1, vec3<f32>(0.0, 0.0, 1.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.x) + abs(axis.y));
+                    if (mn > r || mx < -r) { continue; }
+                }
+
+                {
+                    let axis = cross(e2, vec3<f32>(1.0, 0.0, 0.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.y) + abs(axis.z));
+                    if (mn > r || mx < -r) { continue; }
+                }
+                {
+                    let axis = cross(e2, vec3<f32>(0.0, 1.0, 0.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.x) + abs(axis.z));
+                    if (mn > r || mx < -r) { continue; }
+                }
+                {
+                    let axis = cross(e2, vec3<f32>(0.0, 0.0, 1.0));
+                    let p0 = dot(axis, tv0);
+                    let p1 = dot(axis, tv1);
+                    let p2 = dot(axis, tv2);
+                    let mn = min(p0, min(p1, p2));
+                    let mx = max(p0, max(p1, p2));
+                    let r = half * (abs(axis.x) + abs(axis.y));
+                    if (mn > r || mx < -r) { continue; }
+                }
+
+                let flat = x + y * nx + z * nx * ny;
+                let planeDist = dot(n, tv0);
+                let dist2 = (planeDist * planeDist) / nn;
+                let distBits = bitcast<u32>(dist2);
+                let prev = atomicMin(&dists[flat], distBits);
+                if (distBits < prev) {
+                    tris[flat] = triId + 1u;
+                }
+            }
+        }
+    }
+}
+`;
 
 let ddaWasmInitPromise = null;
+let workerWebGpuPromise = null;
 
 function nowMs() {
     if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -104,6 +304,83 @@ function isSRGBTextureData(texData) {
 async function ensureDdaWasm() {
     if (!ddaWasmInitPromise) ddaWasmInitPromise = initDdaVoxelizeWasm();
     return ddaWasmInitPromise;
+}
+
+function alignGpuSize(size, alignment = 4) {
+    return Math.ceil(size / alignment) * alignment;
+}
+
+function createGpuStorageBuffer(device, typedArray, usage) {
+    const byteLength = alignGpuSize(typedArray.byteLength || 0, 4);
+    const buffer = device.createBuffer({
+        size: Math.max(4, byteLength),
+        usage,
+        mappedAtCreation: false,
+    });
+    if (typedArray.byteLength) {
+        device.queue.writeBuffer(
+            buffer,
+            0,
+            typedArray.buffer,
+            typedArray.byteOffset,
+            typedArray.byteLength
+        );
+    }
+    return buffer;
+}
+
+async function ensureWorkerWebGpu() {
+    if (!globalThis.navigator?.gpu) return null;
+    if (!workerWebGpuPromise) {
+        workerWebGpuPromise = (async () => {
+            const adapter = await globalThis.navigator.gpu.requestAdapter();
+            if (!adapter) return null;
+            const device = await adapter.requestDevice();
+            device.lost?.then(() => {
+                workerWebGpuPromise = null;
+            }).catch(() => {
+                workerWebGpuPromise = null;
+            });
+
+            const clearModule = device.createShaderModule({ code: WEBGPU_CLEAR_WGSL });
+            const rasterModule = device.createShaderModule({ code: WEBGPU_RASTER_WGSL });
+            const clearPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: {
+                    module: clearModule,
+                    entryPoint: 'main',
+                },
+            });
+            const rasterPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: {
+                    module: rasterModule,
+                    entryPoint: 'main',
+                },
+            });
+
+            return { device, clearPipeline, rasterPipeline };
+        })().catch((error) => {
+            workerWebGpuPromise = null;
+            throw error;
+        });
+    }
+    return workerWebGpuPromise;
+}
+
+async function readGpuBuffer(device, source, byteLength) {
+    const readBuffer = device.createBuffer({
+        size: Math.max(4, alignGpuSize(byteLength, 4)),
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(source, 0, readBuffer, 0, byteLength);
+    device.queue.submit([encoder.finish()]);
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const copy = readBuffer.getMappedRange(0, byteLength).slice(0);
+    readBuffer.unmap();
+    readBuffer.destroy();
+    return copy;
 }
 
 function srgbToLinear(x) {
@@ -553,6 +830,7 @@ export class WorkerVoxelizer {
         paletteSize = 256,
         needGrid = false,
         method = '2.5d-scan',
+        renderMode = 'mesh',
         hitStoreMode = 'auto'
     }) {
         const startedAt = nowMs();
@@ -560,6 +838,7 @@ export class WorkerVoxelizer {
         this.paletteSize = paletteSize;
         this.needGrid = needGrid;
         this.method = method;
+        this.renderMode = renderMode;
         const requestedMethod = method;
         this.hitStoreMode = hitStoreMode;
         this.imageDatas = new Map(modelData.imageDatas);
@@ -579,7 +858,45 @@ export class WorkerVoxelizer {
         let fallbackReason = null;
         let result = { geometries: [] };
         let voxelGridData = null;
-        let rustCompleted = false;
+        let acceleratedCompleted = false;
+
+        if (requestedMethod === 'webgpu') {
+            try {
+                this.bbox = new THREE.Box3(
+                    new THREE.Vector3().fromArray(modelData.bbox.min),
+                    new THREE.Vector3().fromArray(modelData.bbox.max)
+                );
+                this.#configureGridFromBox(this.bbox, maxGrid, false);
+
+                const bakeStartedAt = nowMs();
+                const baked = this.#bakeSerializedModel(modelData);
+                bakeMs = nowMs() - bakeStartedAt;
+                this.positions = baked.positions; this.uvs = baked.uvs;
+                this.indices = baked.indices; this.triMats = baked.triMats;
+                this.palette = baked.palette; this.materials = baked.materials;
+
+                const rasterResult = await this.#webGpuRasterizeInWorker();
+                rasterMs = rasterResult.rasterMs ?? 0;
+                batchCount = rasterResult.batchCount ?? 0;
+                this.filledVoxelCount = this._rasterResult?.filledCount ?? 0;
+                triangleCount = (this.indices.length / 3) | 0;
+                const meshStartedAt = nowMs();
+                result = this.renderMode === 'instances'
+                    ? this.#buildGreedyMeshChunks({ directInstances: true })
+                    : this.#buildGreedyMeshChunks();
+                meshMs = nowMs() - meshStartedAt;
+                const gridStartedAt = nowMs();
+                voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
+                gridExportMs = nowMs() - gridStartedAt;
+                acceleratedCompleted = true;
+            } catch (error) {
+                fallbackReason = error?.message
+                    ? `WebGPU unavailable, fell back to 2.5d-scan: ${error.message}`
+                    : 'WebGPU unavailable, fell back to 2.5d-scan';
+                this.method = '2.5d-scan';
+                console.warn(fallbackReason, error);
+            }
+        }
 
         if (requestedMethod === 'rust-wasm') {
             try {
@@ -606,12 +923,14 @@ export class WorkerVoxelizer {
                 this.filledVoxelCount = this._rasterResult?.filledCount ?? 0;
                 triangleCount = (this.indices.length / 3) | 0;
                 const meshStartedAt = nowMs();
-                result = this.#buildGreedyMeshChunks();
+                result = this.renderMode === 'instances'
+                    ? this.#buildGreedyMeshChunks({ directInstances: true })
+                    : this.#buildGreedyMeshChunks();
                 meshMs = nowMs() - meshStartedAt;
                 const gridStartedAt = nowMs();
                 voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
                 gridExportMs = nowMs() - gridStartedAt;
-                rustCompleted = true;
+                acceleratedCompleted = true;
             } catch (error) {
                 fallbackReason = error?.message
                     ? `Rust WASM unavailable, fell back to 2.5d-scan: ${error.message}`
@@ -621,19 +940,18 @@ export class WorkerVoxelizer {
             }
         }
 
-        if (!rustCompleted) {
-            const reconstructStartedAt = nowMs();
-            const model = this.#reconstructModel(modelData);
-            reconstructMs = nowMs() - reconstructStartedAt;
-
+        if (!acceleratedCompleted) {
             const bakeStartedAt = nowMs();
-            const baked = this.#bakeAndMerge(model);
+            const baked = this.#bakeSerializedModel(modelData);
             bakeMs = nowMs() - bakeStartedAt;
             this.positions = baked.positions; this.uvs = baked.uvs;
             this.indices = baked.indices; this.triMats = baked.triMats;
             this.palette = baked.palette; this.materials = baked.materials;
 
-            this.bbox = new THREE.Box3().setFromObject(model);
+            this.bbox = new THREE.Box3(
+                new THREE.Vector3().fromArray(modelData.bbox.min),
+                new THREE.Vector3().fromArray(modelData.bbox.max)
+            );
             this.#configureGridFromBox(this.bbox, maxGrid, false);
 
             // Choose rasterization method
@@ -648,7 +966,9 @@ export class WorkerVoxelizer {
             this.filledVoxelCount = this._rasterResult?.filledCount ?? 0;
             triangleCount = (this.indices.length / 3) | 0;
             const meshStartedAt = nowMs();
-            result = this.#buildGreedyMeshChunks();
+            result = this.renderMode === 'instances'
+                ? this.#buildGreedyMeshChunks({ directInstances: true })
+                : this.#buildGreedyMeshChunks();
             meshMs = nowMs() - meshStartedAt;
             const gridStartedAt = nowMs();
             voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
@@ -656,7 +976,8 @@ export class WorkerVoxelizer {
         }
 
         return {
-            geometries: result.geometries,
+            geometries: result.geometries ?? [],
+            instanceChunks: result.instanceChunks ?? [],
             voxelCount: this.filledVoxelCount,
             voxelGrid: voxelGridData,
             stats: {
@@ -671,6 +992,7 @@ export class WorkerVoxelizer {
                 totalMs: nowMs() - startedAt,
                 method: this.method,
                 requestedMethod,
+                renderMode: this.renderMode,
                 fallbackReason,
                 hitStoreMode: this._rasterResult?.voxelHits?.mode ?? hitStoreMode,
                 wasmInitMs,
@@ -678,6 +1000,124 @@ export class WorkerVoxelizer {
                 batchCount,
                 triangleCount,
                 gridSize: { x: this.grid.x | 0, y: this.grid.y | 0, z: this.grid.z | 0 }
+            }
+        };
+    }
+
+    async initWebGpuPostprocess({
+        modelData,
+        bakedData,
+        rasterTiles = [],
+        needGrid = false,
+        hitStoreMode = 'auto'
+    }) {
+        const startedAt = nowMs();
+        this.needGrid = needGrid;
+        this.method = 'webgpu';
+        this.hitStoreMode = hitStoreMode;
+        this.imageDatas = new Map(modelData?.imageDatas ?? []);
+
+        this.voxelSize = bakedData?.voxelSize ?? 0;
+        this.positions = bakedData?.positions ?? new Float32Array(0);
+        this.uvs = bakedData?.uvs ?? new Float32Array(0);
+        this.indices = bakedData?.indices ?? new Uint32Array(0);
+        this.triMats = bakedData?.triMats ?? new Uint32Array(0);
+        this.palette = bakedData?.palette ?? new Float32Array(0);
+        this.paletteSize = Math.max(1, (this.palette.length / 3) | 0);
+        this.bbox = new THREE.Box3(
+            new THREE.Vector3().fromArray(bakedData?.bbox?.min ?? [0, 0, 0]),
+            new THREE.Vector3().fromArray(bakedData?.bbox?.max ?? [0, 0, 0])
+        );
+        this.grid = new THREE.Vector3(
+            bakedData?.grid?.x | 0,
+            bakedData?.grid?.y | 0,
+            bakedData?.grid?.z | 0
+        );
+
+        const reconstructStartedAt = nowMs();
+        const { materials, materialByUuid } = this.#buildRuntimeMaterialsFromSerialized({
+            materials: modelData?.materials ?? []
+        });
+        const defaultMaterial = materials[0] ?? { uuid: '__default__', color: new THREE.Color(1, 1, 1) };
+        const orderedMaterialUuids = bakedData?.materialUuids ?? [];
+        this.materials = orderedMaterialUuids.length
+            ? orderedMaterialUuids.map((uuid) => materialByUuid.get(uuid) ?? defaultMaterial)
+            : (materials.length ? materials : [defaultMaterial]);
+        const reconstructMs = nowMs() - reconstructStartedAt;
+
+        const NX = this.grid.x | 0;
+        const NY = this.grid.y | 0;
+        const NZ = this.grid.z | 0;
+        const total = Math.max(0, NX * NY * NZ);
+        const accumulateStartedAt = nowMs();
+        const voxelHits = new VoxelHitStore(total, hitStoreMode);
+
+        for (const tile of rasterTiles) {
+            const ox = tile?.ox | 0;
+            const oy = tile?.oy | 0;
+            const oz = tile?.oz | 0;
+            const tx = tile?.tx | 0;
+            const ty = tile?.ty | 0;
+            const tz = tile?.tz | 0;
+            const tris = tile?.tris ?? new Uint32Array(0);
+            if (!tx || !ty || !tz || !tris.length) continue;
+
+            const layerSize = tx * ty;
+            for (let flat = 0; flat < tris.length; flat++) {
+                const rawTriangle = tris[flat];
+                if (!rawTriangle) continue;
+                const localZ = (flat / layerSize) | 0;
+                const rem = flat - localZ * layerSize;
+                const localY = (rem / tx) | 0;
+                const localX = rem - localY * tx;
+                const gx = ox + localX;
+                const gy = oy + localY;
+                const gz = oz + localZ;
+                if (gx < 0 || gy < 0 || gz < 0 || gx >= NX || gy >= NY || gz >= NZ) continue;
+                const globalFlat = gx + NX * (gy + NY * gz);
+                voxelHits.setIfCloser(globalFlat, rawTriangle - 1, 0);
+            }
+        }
+
+        const accumulateMs = nowMs() - accumulateStartedAt;
+        this._rasterResult = {
+            voxelHits,
+            filledCount: voxelHits.size,
+        };
+        this.filledVoxelCount = voxelHits.size;
+
+        const meshStartedAt = nowMs();
+        const result = this.#buildGreedyMeshChunks();
+        const meshMs = nowMs() - meshStartedAt;
+
+        const gridStartedAt = nowMs();
+        const voxelGridData = this.needGrid ? this.#getVoxelGridData() : null;
+        const gridExportMs = nowMs() - gridStartedAt;
+
+        return {
+            geometries: result.geometries ?? [],
+            instanceChunks: result.instanceChunks ?? [],
+            voxelCount: this.filledVoxelCount,
+            voxelGrid: voxelGridData,
+            stats: {
+                reconstructMs,
+                bakeMs: bakedData?.stats?.bakeMs ?? 0,
+                rasterMs: bakedData?.stats?.rasterMs ?? 0,
+                postprocessMs: accumulateMs,
+                accumulateMs,
+                paletteMs: 0,
+                meshMs: result.meshMs ?? meshMs,
+                gridExportMs,
+                totalMs: nowMs() - startedAt,
+                method: 'webgpu',
+                requestedMethod: 'webgpu',
+                fallbackReason: null,
+                hitStoreMode: voxelHits.mode,
+                wasmInitMs: 0,
+                wasmCalls: 0,
+                batchCount: rasterTiles.length,
+                triangleCount: (this.indices.length / 3) | 0,
+                gridSize: { x: NX, y: NY, z: NZ }
             }
         };
     }
@@ -713,6 +1153,151 @@ export class WorkerVoxelizer {
             Math.max(1, Math.ceil(finalSize.y / this.voxelSize)),
             Math.max(1, Math.ceil(finalSize.z / this.voxelSize))
         );
+    }
+
+    async #webGpuRasterizeInWorker() {
+        const webgpu = await ensureWorkerWebGpu();
+        if (!webgpu) {
+            throw new Error('WebGPU is unavailable in worker context');
+        }
+
+        const { device, clearPipeline, rasterPipeline } = webgpu;
+        const NX = this.grid.x | 0;
+        const NY = this.grid.y | 0;
+        const NZ = this.grid.z | 0;
+        const total = NX * NY * NZ;
+        const voxelHits = new VoxelHitStore(total, this.hitStoreMode);
+        const triangleCount = (this.indices.length / 3) | 0;
+
+        if (!triangleCount || !this.positions.length) {
+            this._rasterResult = { voxelHits, filledCount: 0 };
+            return { rasterMs: 0, batchCount: 0 };
+        }
+
+        const tileDescriptors = [];
+        for (let oz = 0; oz < NZ; oz += WEBGPU_TILE_EDGE) {
+            const tz = Math.min(WEBGPU_TILE_EDGE, NZ - oz);
+            for (let oy = 0; oy < NY; oy += WEBGPU_TILE_EDGE) {
+                const ty = Math.min(WEBGPU_TILE_EDGE, NY - oy);
+                for (let ox = 0; ox < NX; ox += WEBGPU_TILE_EDGE) {
+                    const tx = Math.min(WEBGPU_TILE_EDGE, NX - ox);
+                    tileDescriptors.push({ ox, oy, oz, tx, ty, tz });
+                }
+            }
+        }
+
+        const posBuffer = createGpuStorageBuffer(
+            device,
+            this.positions,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        );
+        const idxBuffer = createGpuStorageBuffer(
+            device,
+            this.indices,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        );
+        const paramsBuffer = device.createBuffer({
+            size: 32,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        const clearBindGroupLayout = clearPipeline.getBindGroupLayout(0);
+        const rasterBindGroupLayout = rasterPipeline.getBindGroupLayout(0);
+        const rasterStartedAt = nowMs();
+
+        try {
+            for (const { ox, oy, oz, tx, ty, tz } of tileDescriptors) {
+                const tileVoxelCount = tx * ty * tz;
+                const triByteLength = tileVoxelCount * Uint32Array.BYTES_PER_ELEMENT;
+                const triBuffer = device.createBuffer({
+                    size: Math.max(4, alignGpuSize(triByteLength, 4)),
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+                });
+                const distBuffer = device.createBuffer({
+                    size: Math.max(4, alignGpuSize(triByteLength, 4)),
+                    usage: GPUBufferUsage.STORAGE,
+                });
+
+                const tileMinX = this.bbox.min.x + ox * this.voxelSize;
+                const tileMinY = this.bbox.min.y + oy * this.voxelSize;
+                const tileMinZ = this.bbox.min.z + oz * this.voxelSize;
+                const paramsArrayBuffer = new ArrayBuffer(32);
+                const paramsU32 = new Uint32Array(paramsArrayBuffer);
+                const paramsF32 = new Float32Array(paramsArrayBuffer);
+                paramsU32[0] = tx;
+                paramsU32[1] = ty;
+                paramsU32[2] = tz;
+                paramsU32[3] = 0;
+                paramsF32[4] = tileMinX;
+                paramsF32[5] = tileMinY;
+                paramsF32[6] = tileMinZ;
+                paramsF32[7] = this.voxelSize;
+                device.queue.writeBuffer(paramsBuffer, 0, paramsArrayBuffer);
+
+                const clearBindGroup = device.createBindGroup({
+                    layout: clearBindGroupLayout,
+                    entries: [
+                        { binding: 0, resource: { buffer: triBuffer } },
+                        { binding: 1, resource: { buffer: distBuffer } },
+                    ],
+                });
+                const rasterBindGroup = device.createBindGroup({
+                    layout: rasterBindGroupLayout,
+                    entries: [
+                        { binding: 0, resource: { buffer: posBuffer } },
+                        { binding: 1, resource: { buffer: idxBuffer } },
+                        { binding: 2, resource: { buffer: triBuffer } },
+                        { binding: 3, resource: { buffer: distBuffer } },
+                        { binding: 4, resource: { buffer: paramsBuffer } },
+                    ],
+                });
+
+                const encoder = device.createCommandEncoder();
+                const pass = encoder.beginComputePass();
+                pass.setPipeline(clearPipeline);
+                pass.setBindGroup(0, clearBindGroup);
+                pass.dispatchWorkgroups(Math.max(1, Math.ceil(tileVoxelCount / WEBGPU_WORKGROUP_SIZE)));
+                pass.setPipeline(rasterPipeline);
+                pass.setBindGroup(0, rasterBindGroup);
+                pass.dispatchWorkgroups(Math.max(1, Math.ceil(triangleCount / WEBGPU_WORKGROUP_SIZE)));
+                pass.end();
+                device.queue.submit([encoder.finish()]);
+
+                const trisBuffer = await readGpuBuffer(device, triBuffer, triByteLength);
+                const tris = new Uint32Array(trisBuffer);
+                const layerSize = tx * ty;
+                for (let flat = 0; flat < tris.length; flat++) {
+                    const rawTriangle = tris[flat];
+                    if (!rawTriangle) continue;
+                    const localZ = (flat / layerSize) | 0;
+                    const rem = flat - localZ * layerSize;
+                    const localY = (rem / tx) | 0;
+                    const localX = rem - localY * tx;
+                    const gx = ox + localX;
+                    const gy = oy + localY;
+                    const gz = oz + localZ;
+                    const globalFlat = gx + NX * (gy + NY * gz);
+                    voxelHits.setIfCloser(globalFlat, rawTriangle - 1, 0);
+                }
+
+                triBuffer.destroy();
+                distBuffer.destroy();
+            }
+        } finally {
+            posBuffer.destroy();
+            idxBuffer.destroy();
+            paramsBuffer.destroy();
+        }
+
+        this._rasterResult = {
+            voxelHits,
+            filledCount: voxelHits.size,
+        };
+
+        return {
+            rasterMs: nowMs() - rasterStartedAt,
+            batchCount: tileDescriptors.length,
+        };
     }
 
     #rustWasmRasterize2D5() {
@@ -1826,11 +2411,11 @@ export class WorkerVoxelizer {
     }
 
     // Greedy meshing + chunked output (à la OptiFine/Sodium)
-    #buildGreedyMeshChunks() {
+    #buildGreedyMeshChunks({ directInstances = false } = {}) {
       const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
 
       // 1) Build sparse chunked stores for palette ids and voxel colors
-      const CHUNK = DEFAULT_CHUNK_SIZE;
+      const CHUNK = directInstances ? DIRECT_INSTANCE_CHUNK_SIZE : DEFAULT_CHUNK_SIZE;
       const paletteStore = new PaletteChunkStore(NX, NY, NZ, CHUNK);
       const colorStore = new ColorChunkStore(NX, NY, NZ, CHUNK);
       const linToSRGB = (x) => (x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1/2.4) - 0.055);
@@ -2003,6 +2588,14 @@ export class WorkerVoxelizer {
         for (const [lin, hit] of voxelHits.map.entries()) {
           processVoxelHit(lin, hit.tri);
         }
+      }
+
+      if (directInstances) {
+        this._colorStore = colorStore;
+        return {
+          geometries: [],
+          instanceChunks: this.#buildDirectVoxelInstanceChunksFromColorStore(colorStore),
+        };
       }
 
       // 2) Greedy mesh per CHUNK (greatly reduces triangles & allows culling)
@@ -2209,6 +2802,44 @@ export class WorkerVoxelizer {
       return { geometries };
     }
 
+    #buildDirectVoxelInstanceChunksFromColorStore(colorStore) {
+      const NX = this.grid.x | 0;
+      const NY = this.grid.y | 0;
+      const NZ = this.grid.z | 0;
+      const maxDim = Math.max(NX, NY, NZ);
+      const voxelSize = this.voxelSize;
+      const coordArrayCtor = maxDim <= 255 ? Uint8Array : Uint16Array;
+      const sRGBToLinear = (x) => (x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4));
+      const count = colorStore.filledCount | 0;
+      if (!count) return [];
+      const instanceCoords = new coordArrayCtor(count * 3);
+      const colors8 = new Uint8Array(count * 3);
+      let writeIndex = 0;
+
+      colorStore.forEachVoxel((gx, gy, gz, r, g, b) => {
+        const coordWriteBase = writeIndex * 3;
+        const colorWriteBase = writeIndex * 3;
+        instanceCoords[coordWriteBase + 0] = gx;
+        instanceCoords[coordWriteBase + 1] = gy;
+        instanceCoords[coordWriteBase + 2] = gz;
+        colors8[colorWriteBase + 0] = Math.max(0, Math.min(255, Math.round(sRGBToLinear(Math.max(0, Math.min(1, r))) * 255)));
+        colors8[colorWriteBase + 1] = Math.max(0, Math.min(255, Math.round(sRGBToLinear(Math.max(0, Math.min(1, g))) * 255)));
+        colors8[colorWriteBase + 2] = Math.max(0, Math.min(255, Math.round(sRGBToLinear(Math.max(0, Math.min(1, b))) * 255)));
+        writeIndex += 1;
+      });
+
+      return [{
+        count: writeIndex,
+        instanceCoords,
+        colors8,
+        voxelSize,
+        bounds: {
+          min: [this.bbox.min.x, this.bbox.min.y, this.bbox.min.z],
+          max: [this.bbox.max.x, this.bbox.max.y, this.bbox.max.z],
+        },
+      }];
+    }
+
     #buildGreedyMeshFromPaletteStore(paletteStore, colorStore, paletteColors8) {
       const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
       const CHUNK = DEFAULT_CHUNK_SIZE;
@@ -2376,6 +3007,7 @@ export class WorkerVoxelizer {
         const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const tot = NX * NY * NZ;
         const base = {
+            colorSpace: 'srgb',
             gridSize: { x: NX, y: NY, z: NZ },
             unit: { x: this.voxelSize, y: this.voxelSize, z: this.voxelSize },
             bbox: { 
@@ -2428,24 +3060,38 @@ if (typeof self !== 'undefined') {
     self.onmessage = async (event) => {
         try {
             const {
+                task = 'voxelize',
                 modelData,
+                bakedData,
+                rasterTiles,
                 resolution,
                 needGrid = false,
                 method = '2.5d-scan',
+                renderMode = 'mesh',
                 hitStoreMode = 'auto'
             } = event.data;
 
-            const bbox = new THREE.Box3(
-                new THREE.Vector3().fromArray(modelData.bbox.min),
-                new THREE.Vector3().fromArray(modelData.bbox.max)
-            );
-            const size = new THREE.Vector3();
-            bbox.getSize(size);
-            const maxDim = Math.max(size.x, size.y, size.z);
-            const voxelSize = maxDim / resolution;
-
             const voxelizer = new WorkerVoxelizer();
-            const result = await voxelizer.init({ modelData, voxelSize, needGrid, method, hitStoreMode });
+            let result;
+            if (task === 'webgpu-postprocess') {
+                result = await voxelizer.initWebGpuPostprocess({
+                    modelData,
+                    bakedData,
+                    rasterTiles,
+                    needGrid,
+                    hitStoreMode
+                });
+            } else {
+                const bbox = new THREE.Box3(
+                    new THREE.Vector3().fromArray(modelData.bbox.min),
+                    new THREE.Vector3().fromArray(modelData.bbox.max)
+                );
+                const size = new THREE.Vector3();
+                bbox.getSize(size);
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const voxelSize = maxDim / resolution;
+                result = await voxelizer.init({ modelData, voxelSize, needGrid, method, renderMode, hitStoreMode });
+            }
 
             const transferList = [];
             if (result.voxelGrid?.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);
@@ -2462,6 +3108,10 @@ if (typeof self !== 'undefined') {
                 if (g?.colors8?.buffer) transferList.push(g.colors8.buffer);
                 if (g?.normals?.buffer) transferList.push(g.normals.buffer);
                 if (g?.indices?.buffer) transferList.push(g.indices.buffer);
+            }
+            for (const chunk of (result.instanceChunks || [])) {
+                if (chunk?.instanceCoords?.buffer) transferList.push(chunk.instanceCoords.buffer);
+                if (chunk?.colors8?.buffer) transferList.push(chunk.colors8.buffer);
             }
 
             self.postMessage({ status: 'success', result }, transferList);
